@@ -33,13 +33,18 @@ on:
         description: Signed DeadZone build-event endpoint
         required: true
         type: string
-    secrets:
-      GH_TOKEN:
-        required: true
-      SOURCEFORGE_SSH_PRIVATE_KEY:
-        required: true
-      PIXELDRAIN_API_KEY:
-        required: true
+    # DEADZONE: temporary single-destination upload.
+#
+# As of the 2026-09-30 disablement, Google Drive (rclone) is the only
+# active upload destination. SourceForge/PixelDrain upload steps are
+# skipped via `DeadZone-File/upload-mirrors.sh` (which honors
+# `DEADZONE_ENABLE_SECONDARY_MIRRORS`); the SSH/API secrets are no
+# longer required by this workflow. The credentials, mirror helper, and
+# website-publisher remain in tree so this can be reverted by removing
+# the feature-flag guard.
+secrets:
+  GH_TOKEN:
+    required: true
 
 permissions:
   contents: read
@@ -58,6 +63,9 @@ jobs:
       DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
       DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
       DEADZONE_SOURCE_REPOSITORY: ${{ github.repository }}
+      # Temporary: keep secondary mirrors disabled while Google Drive is
+      # the only active upload destination. Flip to "1" to re-enable.
+      DEADZONE_ENABLE_SECONDARY_MIRRORS: "0"
 
     steps:
       - name: Validate controlled request
@@ -84,11 +92,9 @@ jobs:
       - name: Validate launcher credentials
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          SOURCEFORGE_SSH_PRIVATE_KEY: ${{ secrets.SOURCEFORGE_SSH_PRIVATE_KEY }}
-          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -euo pipefail
-          required=(GH_TOKEN SOURCEFORGE_SSH_PRIVATE_KEY PIXELDRAIN_API_KEY)
+          required=(GH_TOKEN)
           for variable_name in "${required[@]}"; do
             if [[ -z "${!variable_name:-}" ]]; then
               echo "::error::Missing required repository secret: ${variable_name}"
@@ -343,24 +349,14 @@ jobs:
 
       - name: Upload SourceForge and PixelDrain
         working-directory: toolbuild
+        # DEADZONE: secondary mirrors are temporarily disabled. The shared
+        # helper (DeadZone-File/upload-mirrors.sh) no-ops when
+        # DEADZONE_ENABLE_SECONDARY_MIRRORS != "1" while still publishing
+        # the documented DEADZONE_*_URL env vars for downstream consumers.
         env:
-          SOURCEFORGE_SSH_PRIVATE_KEY: ${{ secrets.SOURCEFORGE_SSH_PRIVATE_KEY }}
-          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+          DEADZONE_ENABLE_SECONDARY_MIRRORS: "0"
         run: |
           set -Eeuo pipefail
-          set -a
-          # shellcheck disable=SC1091
-          source "$GITHUB_WORKSPACE/runtime/upload.env"
-          set +a
-
-          required_mirror_values=(SOURCEFORGE_USERNAME SOURCEFORGE_PROJECT SOURCEFORGE_SSH_PRIVATE_KEY PIXELDRAIN_API_KEY)
-          for variable_name in "${required_mirror_values[@]}"; do
-            if [[ -z "${!variable_name:-}" ]]; then
-              echo "::error::Mirror runtime value is missing: ${variable_name}"
-              exit 1
-            fi
-          done
-
           mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Lite_*.zip' -print 2>/dev/null)
           (( ${#final_zips[@]} == 1 )) || {
             echo "::error::Final Lite ZIP is unavailable for mirror upload"
@@ -393,10 +389,14 @@ jobs:
           if (( google_status == 0 )) && [[ -n "$drive_url" ]]; then
             export DEADZONE_SET_RESULT_URL=0
           else
-            echo "::warning::Google Drive is unavailable as a final public link; secondary mirrors may rescue the release"
+            echo "::warning::Google Drive is unavailable as a final public link"
             export DEADZONE_SET_RESULT_URL=1
           fi
 
+          # Delegate to the central helper. While secondary mirrors are
+          # disabled the script is a no-op success; it still records the
+          # final ZIP name and zero mirror URLs so downstream consumers
+          # behave identically to the previous flow.
           set +e
           bash "$GITHUB_WORKSPACE/runtime/upload-mirrors.sh" \
             "Lite" "$codename" "$os_folder" "$final_zip" "$final_name" \
@@ -404,12 +404,16 @@ jobs:
           mirror_status=${PIPESTATUS[0]}
           set -e
 
-          if (( google_status != 0 && mirror_status != 0 )); then
-            echo "::error::Google Drive and all secondary ROM mirrors failed"
+          # With Drive as the only destination, only a Drive failure is fatal.
+          if (( google_status != 0 )); then
+            echo "::error::Google Drive upload failed and no secondary mirrors are enabled"
             exit 1
           fi
+          # mirror_status is informational here: the helper exits 0 when
+          # mirrors are disabled, so any non-zero value would indicate a
+          # helper script regression rather than a missing credential.
           if (( mirror_status != 0 )); then
-            echo "::warning::Secondary mirrors failed, but Google Drive upload succeeded"
+            echo "::warning::upload-mirrors.sh exited with status ${mirror_status}; continuing because Google Drive succeeded"
           fi
 
       - name: Send success notification
