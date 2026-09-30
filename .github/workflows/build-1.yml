@@ -1,0 +1,56 @@
+name: DeadZone-Home Lite 1
+
+run-name: DeadZone Home Lite 1 - ${{ inputs.request_id }} - ${{ inputs.builder_name || github.actor }}
+
+# DeadZone-Home public dispatcher (Lite engine, worker 1 of 5).
+#
+# Mirrors DeadZone-MEZO/.github/workflows/build-1.yml but targets the
+# DeadZone-Offical organization: this launcher repository is public,
+# while the engine it checks out (`DeadZone-Offical/DeadZone-xiaomi_Lite`)
+# remains private. Inputs are byte-compatible with the legacy MEZO
+# dispatch contract; the bot must keep dispatching `lite_*` requests to
+# us with `input_url`, `builder_name`, `builder_id`, `request_id`, and
+# `callback_url`.
+
+concurrency:
+  group: deadzone-home-lite-build-1
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_url:
+        description: ROM download URL
+        required: true
+        type: string
+      builder_name:
+        description: Builder name
+        required: false
+        type: string
+      builder_id:
+        description: Telegram user ID
+        required: false
+        type: string
+      request_id:
+        description: DeadZone controlled build request ID
+        required: true
+        type: string
+      callback_url:
+        description: Signed DeadZone build-event endpoint
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Lite Worker 1
+    uses: ./.github/workflows/lite-core.yml
+    with:
+      input_url: ${{ inputs.input_url }}
+      builder_name: ${{ inputs.builder_name }}
+      builder_id: ${{ inputs.builder_id }}
+      request_id: ${{ inputs.request_id }}
+      callback_url: ${{ inputs.callback_url }}
+    secrets: inherit
