@@ -1,7 +1,0 @@
-# Workflow artifacts and logs
-.github/workflows/*.log
-.github/workflows/.cache/
-
-# OS files
-.DS_Store
-Thumbs.db

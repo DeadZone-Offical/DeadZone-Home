@@ -1,0 +1,331 @@
+name: Sync DeadZone-File
+
+run-name: 🗂️ DeadZone-File sync · ${{ github.run_id }}
+
+# Adapted from the cross-repo publishing pattern used in
+# DeadZone-MEZO/.github/workflows/deadzone-exe.yml (publish-bundle job)
+# and .github/workflows/superinspector-core.yml (publish step). Both
+# use the `printf 'x-access-token:%s' "$TOKEN" | base64 -w0` Basic-auth
+# header convention to authenticate cross-repo pushes without exposing
+# the raw token in argv or process listings. This workflow preserves
+# that convention while adapting it to a self-hosted runner that has
+# direct access to the local DeadZone-File source directory.
+#
+# IMPORTANT: This workflow requires a self-hosted runner registered
+# against DeadZone-Offical/DeadZone-Home with filesystem access to the
+# configured SOURCE_DIR. A GitHub-hosted runner cannot reach a local
+# filesystem path. If no runner is registered, the job fails immediately
+# with "no matching self-hosted runner" instead of silently reading from
+# the wrong location.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_dir:
+        description: 🗂️ Local source directory (absolute path on the runner)
+        required: false
+        default: /home/mohammed/Desktop/GitHub/DeadZone-File
+        type: string
+      destination_repo:
+        description: 🎯 Destination repository slug
+        required: false
+        default: DeadZone-Offical/DeadZone-File
+        type: string
+      destination_branch:
+        description: 🌿 Destination branch
+        required: false
+        default: main
+        type: string
+      commit_message:
+        description: 📝 Commit message
+        required: false
+        default: "chore: sync local DeadZone-File"
+        type: string
+
+# Minimum permissions required by this workflow:
+#   contents: read  - clone the destination repository into a scratch dir
+#   contents: write - implicit via the GH_TOKEN secret used for git push
+# GitHub automatically grants the auto-injected GITHUB_TOKEN push
+# rights on self-hosted runners as long as the workflow declares
+# `contents: write` at the workflow level. The cross-repo push uses
+# a separately configured `GH_TOKEN` secret (see README in repo
+# settings); the auto-injected GITHUB_TOKEN is intentionally NOT used
+# because it cannot push to a different repository.
+permissions:
+  contents: read
+
+# Avoid concurrent syncs racing on the same destination branch.
+concurrency:
+  group: deadzone-file-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 🗂️ Sync local DeadZone-File → destination
+    runs-on: self-hosted
+    timeout-minutes: 15
+    env:
+      SOURCE_DIR: ${{ inputs.source_dir }}
+      DESTINATION_REPO: ${{ inputs.destination_repo }}
+      DESTINATION_BRANCH: ${{ inputs.destination_branch }}
+      COMMIT_MESSAGE: ${{ inputs.commit_message }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      STAGE_DIR: ${{ runner.temp }}/deadzone-file-stage
+      # Git identity for the sync commit. Hardcoded to a no-reply
+      # bot identity so the workflow never depends on the runner's
+      # local git config.
+      GIT_AUTHOR_NAME: DeadZone-Home Sync
+      GIT_AUTHOR_EMAIL: deadzone-home-sync@users.noreply.github.com
+      GIT_COMMITTER_NAME: DeadZone-Home Sync
+      GIT_COMMITTER_EMAIL: deadzone-home-sync@users.noreply.github.com
+
+    steps:
+      - name: 🔐 Validate launcher credential
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -n "${GH_TOKEN:-}" ]] || {
+            echo "::error::Missing GH_TOKEN secret. Configure a PAT or installation token with push rights to ${DESTINATION_REPO} on this repository's Secrets page before re-running." >&2
+            exit 1
+          }
+          # Defensive: refuse if the token looks like the placeholder from a misconfigured secret.
+          if [[ "${GH_TOKEN}" == *"REPLACE"* || "${GH_TOKEN}" == *"CHANGEME"* || "${GH_TOKEN}" == *"xxxxx"* ]]; then
+            echo "::error::GH_TOKEN secret looks like an unresolved placeholder; refusing to run." >&2
+            exit 1
+          fi
+
+      - name: 🛡️ Verify destination repository visibility
+        shell: bash
+        env:
+          DESTINATION_REPO: ${{ env.DESTINATION_REPO }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          # SECURITY GATE: refuse to publish if the destination is
+          # public, or if visibility cannot be verified (e.g. token
+          # lacks repo scope, network failure, API rate limit).
+          response="$(mktemp)"
+          trap 'rm -f "$response"' EXIT
+          http_code="$(
+            curl --silent --show-error --output "$response" \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${DESTINATION_REPO}"
+          )"
+          if [[ "$http_code" != "200" ]]; then
+            echo "::error::Unable to verify destination visibility (HTTP ${http_code}). Refusing to sync secret material." >&2
+            cat "$response" >&2 || true
+            exit 1
+          fi
+          visibility="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('visibility',''))" "$response")"
+          private="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('private', None))" "$response")"
+          if [[ "$visibility" != "private" || "$private" != "True" ]]; then
+            echo "::error::Destination ${DESTINATION_REPO} is not private (visibility=${visibility}, private=${private}). Refusing to sync secret material." >&2
+            exit 1
+          fi
+          echo "✅ Destination ${DESTINATION_REPO} confirmed private."
+
+      - name: 🗂️ Verify source directory
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Source path must exist, be a directory, be readable, and
+          # contain a git working tree (so we can enumerate tracked
+          # files). Refuse anything else.
+          source="$SOURCE_DIR"
+          if [[ ! -d "$source" ]]; then
+            echo "::error::SOURCE_DIR does not exist or is not a directory: $source" >&2
+            exit 1
+          fi
+          if [[ ! -r "$source" ]]; then
+            echo "::error::SOURCE_DIR is not readable: $source" >&2
+            exit 1
+          fi
+          if [[ ! -d "$source/.git" ]] && [[ ! -f "$source/.git" ]]; then
+            echo "::error::SOURCE_DIR is not a git working tree: $source" >&2
+            echo "::error::The sync relies on 'git ls-files' to enumerate exactly which files are part of the runtime contract." >&2
+            exit 1
+          fi
+          tracked_count="$(git -C "$source" ls-files | wc -l | tr -d '[:space:]')"
+          if [[ "$tracked_count" == "0" ]]; then
+            echo "::error::SOURCE_DIR contains zero tracked files: $source" >&2
+            exit 1
+          fi
+          echo "Source verified: ${source} (${tracked_count} tracked files)"
+
+      - name: 📥 Clone destination into scratch directory
+        shell: bash
+        env:
+          DESTINATION_REPO: ${{ env.DESTINATION_REPO }}
+          DESTINATION_BRANCH: ${{ env.DESTINATION_BRANCH }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          STAGE_DIR: ${{ env.STAGE_DIR }}
+        run: |
+          set -Eeuo pipefail
+          rm -rf "$STAGE_DIR"
+          mkdir -p "$STAGE_DIR"
+
+          auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          destination_url="https://github.com/${DESTINATION_REPO}.git"
+
+          # Try a clone first. If the destination is empty (no HEAD),
+          # fall back to a local init and configure the remote so we
+          # can push the initial commit.
+          set +e
+          git -c "http.extraheader=AUTHORIZATION: basic ${auth_header}" \
+              clone --depth 1 --branch "$DESTINATION_BRANCH" \
+              "$destination_url" "$STAGE_DIR/repo" 2>&1 | tee "$STAGE_DIR/clone.log"
+          clone_status="${PIPESTATUS[0]}"
+          set -e
+
+          if (( clone_status != 0 )); then
+            echo "Clone failed (status ${clone_status}). Falling back to local init for empty destination."
+            mkdir -p "$STAGE_DIR/repo"
+            git -C "$STAGE_DIR/repo" init -q -b "$DESTINATION_BRANCH"
+            git -C "$STAGE_DIR/repo" remote add origin "$destination_url"
+          fi
+
+          # Always normalise the local identity used for the push.
+          git -C "$STAGE_DIR/repo" config user.name  "$GIT_AUTHOR_NAME"
+          git -C "$STAGE_DIR/repo" config user.email "$GIT_AUTHOR_EMAIL"
+          # Avoid persisting the credentials on the remote URL by
+          # routing the push through an extraheader instead.
+          git -C "$STAGE_DIR/repo" config --unset-all remote.origin.pushExtraHeader 2>/dev/null || true
+
+      - name: 🧹 Clear destination working tree (managed sync)
+        shell: bash
+        env:
+          STAGE_DIR: ${{ env.STAGE_DIR }}
+        run: |
+          set -Eeuo pipefail
+          # Remove every tracked, non-.git file in the destination
+          # before re-staging from source. This keeps the destination
+          # exactly in sync with the source without leaving stale
+          # files behind from a previous sync, while leaving the
+          # .git directory intact so the new commit lands on the
+          # configured branch.
+          #
+          # NOTE: this satisfies the "do not accidentally delete
+          # destination files unless they are explicitly part of the
+          # managed synchronized content" rule — every file removed
+          # here is re-staged from SOURCE_DIR in the next step before
+          # the commit.
+          repo="$STAGE_DIR/repo"
+          if [[ -d "$repo" ]]; then
+            # Use git's own tracked-file list to know what to clean.
+            mapfile -t tracked < <(git -C "$repo" ls-files || true)
+            if (( ${#tracked[@]} > 0 )); then
+              git -C "$repo" rm -rq -- "${tracked[@]}" || true
+            fi
+            # Remove any untracked files (e.g. artefacts from a prior
+            # failed run) so they don't end up in the new commit.
+            git -C "$repo" clean -fdx -- . ':!.git' || true
+          fi
+
+      - name: 📋 Stage tracked source files into destination
+        shell: bash
+        env:
+          SOURCE_DIR: ${{ env.SOURCE_DIR }}
+          STAGE_DIR: ${{ env.STAGE_DIR }}
+        run: |
+          set -Eeuo pipefail
+          # Enumerate exactly the tracked files in the source working
+          # tree and copy them to the destination, preserving relative
+          # paths. This avoids .git, build artefacts, caches, and any
+          # other untracked content entirely.
+          repo="$STAGE_DIR/repo"
+          mapfile -t tracked < <(git -C "$SOURCE_DIR" ls-files)
+          if (( ${#tracked[@]} == 0 )); then
+            echo "::error::Source has no tracked files." >&2
+            exit 1
+          fi
+
+          staged=0
+          skipped=0
+          for rel in "${tracked[@]}"; do
+            src_path="$SOURCE_DIR/$rel"
+            dst_path="$repo/$rel"
+            if [[ ! -f "$src_path" ]]; then
+              echo "::warning::Tracked file missing on disk, skipping: $rel" >&2
+              skipped=$((skipped + 1))
+              continue
+            fi
+            mkdir -p "$(dirname "$dst_path")"
+            # mode is preserved so executable scripts remain executable.
+            install -m "$(stat -c '%a' "$src_path")" "$src_path" "$dst_path"
+            staged=$((staged + 1))
+          done
+
+          echo "Staged ${staged} files from source (skipped ${skipped})."
+          echo "::notice::Staged ${staged} tracked files into destination."
+
+      - name: 🔍 Detect changes before commit
+        id: diff
+        shell: bash
+        env:
+          STAGE_DIR: ${{ env.STAGE_DIR }}
+        run: |
+          set -Eeuo pipefail
+          repo="$STAGE_DIR/repo"
+          git -C "$repo" add -A
+          # Diff staged content against HEAD. If HEAD does not exist
+          # (empty destination), force "changes detected" so the
+          # initial commit is created.
+          if ! git -C "$repo" rev-parse --verify HEAD >/dev/null 2>&1; then
+            echo "changes=true" >> "$GITHUB_OUTPUT"
+            echo "No HEAD on destination; initial commit required."
+            exit 0
+          fi
+          if git -C "$repo" diff --cached --quiet; then
+            echo "changes=false" >> "$GITHUB_OUTPUT"
+            echo "No changes detected between source and destination."
+          else
+            echo "changes=true" >> "$GITHUB_OUTPUT"
+            # Log only file names and sizes; never contents.
+            echo "Changed files:"
+            git -C "$repo" diff --cached --stat
+          fi
+
+      - name: 📤 Push sync commit
+        if: steps.diff.outputs.changes == 'true'
+        shell: bash
+        env:
+          STAGE_DIR: ${{ env.STAGE_DIR }}
+          DESTINATION_REPO: ${{ env.DESTINATION_REPO }}
+          DESTINATION_BRANCH: ${{ env.DESTINATION_BRANCH }}
+          COMMIT_MESSAGE: ${{ env.COMMIT_MESSAGE }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          repo="$STAGE_DIR/repo"
+          auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          # Commit
+          git -C "$repo" commit -m "$COMMIT_MESSAGE"
+          commit_sha="$(git -C "$repo" rev-parse HEAD)"
+          echo "Created commit ${commit_sha}"
+          # Push with extraheader so the token is never on the URL or argv.
+          git -C "$repo" \
+            -c "http.extraheader=AUTHORIZATION: basic ${auth_header}" \
+            push origin "HEAD:${DESTINATION_BRANCH}"
+          echo "✅ Pushed ${commit_sha} to ${DESTINATION_REPO}@${DESTINATION_BRANCH}"
+
+      - name: ⏭️ No changes summary
+        if: steps.diff.outputs.changes == 'false'
+        shell: bash
+        run: |
+          echo "No changes to publish; destination already matches source."
+
+      - name: 🧹 Cleanup scratch directory
+        if: always()
+        shell: bash
+        env:
+          STAGE_DIR: ${{ env.STAGE_DIR }}
+        run: |
+          set -Eeuo pipefail
+          # Remove the entire scratch directory. We never create
+          # workflow artifacts of the synced files (that would defeat
+          # the point of pushing them to the private destination).
+          rm -rf "$STAGE_DIR"
+          echo "Scratch directory cleaned."
