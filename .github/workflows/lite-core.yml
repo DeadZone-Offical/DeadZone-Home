@@ -1,57 +1,43 @@
 name: DeadZone-Home Lite Core
 
-# Reusable workflow that mirrors DeadZone-MEZO/.github/workflows/lite-core.yml
-# exactly so the bot sees the same behaviour. The only differences are:
-#   - DEADZONE_SOURCE_REPOSITORY points at this Home launcher
-#   - The Lite engine is cloned from DeadZone-Offical/DeadZone-xiaomi_Lite
-#     (not the legacy mohammedmezo99/ namespace).
-# The central runtime (`DeadZone-Offical/DeadZone-File`) is unchanged
-# because projects.env is already canonicalised on both legacy and new
-# engines -- DEADZONE_ENGINE_REPOSITORY comes from runtime/load-build.sh
-# and is hard-validated against the expected engine below.
-
 on:
   workflow_call:
     inputs:
       input_url:
-        description: ROM download URL
+        description: 📥 ROM download URL
         required: true
         type: string
       builder_name:
-        description: Builder name
+        description: 👤 Builder name
         required: false
         type: string
       builder_id:
-        description: Telegram user ID
+        description: 💬 Telegram user ID
         required: false
         type: string
       request_id:
-        description: DeadZone controlled build request ID
+        description: 🆔 DeadZone controlled build request ID
         required: true
         type: string
       callback_url:
-        description: Signed DeadZone build-event endpoint
+        description: 🔗 Signed DeadZone build-event endpoint
         required: true
         type: string
-    # DEADZONE: temporary single-destination upload.
-#
-# As of the 2026-09-30 disablement, Google Drive (rclone) is the only
-# active upload destination. SourceForge/PixelDrain upload steps are
-# skipped via `DeadZone-File/upload-mirrors.sh` (which honors
-# `DEADZONE_ENABLE_SECONDARY_MIRRORS`); the SSH/API secrets are no
-# longer required by this workflow. The credentials, mirror helper, and
-# website-publisher remain in tree so this can be reverted by removing
-# the feature-flag guard.
-secrets:
-  GH_TOKEN:
-    required: true
+    secrets:
+      # DEADZONE: temporary single-destination upload. As of the 2026-09-30
+      # disablement, only Google Drive (rclone) is active. The SourceForge
+      # SSH key and PixelDrain API key are no longer required to run this
+      # workflow; they remain in the upload helper so re-enabling is a
+      # one-line flip.
+      GH_TOKEN:
+        required: true
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build ROM
+    name: 🛠️ Build ROM
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -68,7 +54,7 @@ jobs:
       DEADZONE_ENABLE_SECONDARY_MIRRORS: "0"
 
     steps:
-      - name: Validate controlled request
+      - name: 🧾 Validate controlled request
         shell: python
         env:
           INPUT_URL: ${{ inputs.input_url }}
@@ -89,7 +75,7 @@ jobs:
               if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
                   raise SystemExit(f"{name} must be a safe HTTPS URL")
 
-      - name: Validate launcher credentials
+      - name: 🔐 Validate launcher credentials
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
@@ -102,13 +88,13 @@ jobs:
             fi
           done
 
-      - name: Checkout DeadZone launcher
+      - name: 📥 Checkout DeadZone launcher
         uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Checkout central runtime (DeadZone-File)
+      - name: 📥 Checkout private runtime
         uses: actions/checkout@v4
         with:
           repository: DeadZone-Offical/DeadZone-File
@@ -128,7 +114,7 @@ jobs:
             publish-website-release.py
           sparse-checkout-cone-mode: false
 
-      - name: Load central runtime
+      - name: ⚙️ Load central runtime
         id: runtime
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -145,7 +131,7 @@ jobs:
           python3 -m py_compile runtime/report_build_event.py runtime/publish-website-release.py
           runtime/load-build.sh lite
 
-      - name: Validate loaded runtime
+      - name: ✅ Validate loaded runtime
         env:
           ENGINE_REPOSITORY: ${{ steps.runtime.outputs.engine_repository }}
         run: |
@@ -174,7 +160,7 @@ jobs:
           printf '::add-mask::%s\n' "$BUILD_PROGRESS_SECRET"
           printf 'DEADZONE_EVENT_SECRET=%s\n' "$BUILD_PROGRESS_SECRET" >> "$GITHUB_ENV"
 
-      - name: Maximize build space
+      - name: 💾 Maximize build space
         uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
         with:
           build-mount-path: ${{ github.workspace }}/toolbuild
@@ -184,7 +170,7 @@ jobs:
           remove-android: "true"
           remove-haskell: "true"
 
-      - name: Clean unused runner packages
+      - name: 🧹 Clean unused runner packages
         run: |
           set -euo pipefail
           docker image prune --all --force || true
@@ -193,7 +179,7 @@ jobs:
           sudo apt-get autoremove --purge -y || true
           sudo apt-get clean
 
-      - name: Checkout private Lite engine
+      - name: 📦 Checkout private Lite engine
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.runtime.outputs.engine_repository }}
@@ -204,7 +190,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Validate Lite engine layout
+      - name: 🧭 Validate Lite engine layout
         working-directory: toolbuild
         run: |
           set -euo pipefail
@@ -225,22 +211,22 @@ jobs:
           bash -n uploadROM.sh
           bash -n packROM.sh
 
-      - name: Start live tracking
+      - name: 📣 Start live tracking
         working-directory: toolbuild
         run: |
           set -euo pipefail
           python3 notify.py start "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
 
-      - name: Set Cairo timezone
+      - name: 🕒 Set Cairo timezone
         run: sudo timedatectl set-timezone Africa/Cairo
 
-      - name: Install OpenJDK
+      - name: ☕ Install OpenJDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Install Lite dependencies
+      - name: 🧰 Install Lite dependencies
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
@@ -265,11 +251,11 @@ jobs:
           sudo pip3 install --break-system-packages --no-cache-dir ConfigObj lz4 zstandard setuptools || \
             sudo pip3 install --no-cache-dir ConfigObj lz4 zstandard setuptools
 
-      - name: Grant builder permissions
+      - name: 🔓 Grant builder permissions
         working-directory: toolbuild
         run: chmod -R u+rwX,go+rX .
 
-      - name: Install central Rclone configuration
+      - name: ☁️ Install central Rclone configuration
         working-directory: toolbuild
         run: |
           set -euo pipefail
@@ -286,25 +272,26 @@ jobs:
           fi
           rclone version
 
-      - name: Build ROM
+      - name: 🚀 Build ROM
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
           sudo -E bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" 2>&1 | tee build_action.log | tee -a build-full.log
 
-      - name: Pack Super
+      - name: 📦 Pack Super
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
           sudo -E bash packROM.sh 2>&1 | tee -a build_action.log | tee -a build-full.log
 
-      - name: Package and upload Google Drive
+      - name: 🗜️ Package and upload Google Drive
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
 
+          # Report disk space before packaging
           echo "[PERF][BEFORE PACKAGE]" | tee -a build-full.log
           df -h / | tail -1 | awk '{print "  Root:", $4, "available"}' | tee -a build-full.log
           if [[ -d /workspace ]]; then df -h /workspace | tail -1 | awk '{print "  Workspace:", $4, "available"}' | tee -a build-full.log; fi
@@ -326,6 +313,10 @@ jobs:
           final_zip="${final_zips[0]}"
           final_name="$(basename "$final_zip")"
 
+          # NOTE: create_zip.py performs streaming integrity validation (constant RAM).
+          # No duplicate full ZIP validation needed here.
+          # DEADZONE_INTEGRITY_VERIFIED is set based on create_zip.py success.
+
           final_size_bytes="$(stat -c '%s' "$final_zip")"
           final_size_human="$(python3 - "$final_size_bytes" <<'PY'
           import sys
@@ -344,10 +335,11 @@ jobs:
           echo "[PERF] Final ZIP verified by create_zip.py streaming validation" | tee -a build-full.log
           echo "[PERF] File size: ${final_size_human}" | tee -a build-full.log
 
+          # Post-package cleanup via centralized helper
           echo "[PERF][POST-PACKAGE] Running cleanup..." | tee -a build-full.log
           bash "$GITHUB_WORKSPACE/.github/scripts/runner-cleanup.sh" post-package || true
 
-      - name: Upload SourceForge and PixelDrain
+      - name: ⬆️ Upload SourceForge and PixelDrain
         working-directory: toolbuild
         # DEADZONE: secondary mirrors are temporarily disabled. The shared
         # helper (DeadZone-File/upload-mirrors.sh) no-ops when
@@ -409,21 +401,18 @@ jobs:
             echo "::error::Google Drive upload failed and no secondary mirrors are enabled"
             exit 1
           fi
-          # mirror_status is informational here: the helper exits 0 when
-          # mirrors are disabled, so any non-zero value would indicate a
-          # helper script regression rather than a missing credential.
           if (( mirror_status != 0 )); then
             echo "::warning::upload-mirrors.sh exited with status ${mirror_status}; continuing because Google Drive succeeded"
           fi
 
-      - name: Send success notification
+      - name: ✅ Send success notification
         if: success()
         working-directory: toolbuild
         run: |
           set -euo pipefail
           python3 notify.py success "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
 
-      - name: Publish Lite release to website
+      - name: 🌐 Publish Lite release to website
         if: success()
         continue-on-error: true
         working-directory: toolbuild
@@ -449,7 +438,7 @@ jobs:
             --sourceforge-url "${DEADZONE_SOURCEFORGE_URL:-}" \
             --pixeldrain-url "${DEADZONE_PIXELDRAIN_URL:-}"
 
-      - name: Send failure notification
+      - name: ❌ Send failure notification
         if: failure()
         shell: bash
         run: |
@@ -469,7 +458,7 @@ jobs:
             --project lite \
             --message "DeadZone Lite ROM build failed."
 
-      - name: Send cancellation notification
+      - name: ⛔ Send cancellation notification
         if: cancelled()
         shell: bash
         run: |
@@ -489,7 +478,7 @@ jobs:
             --project lite \
             --message "DeadZone Lite ROM build cancelled."
 
-      - name: Cleanup Lite workspace
+      - name: 🧽 Cleanup Lite workspace
         if: always()
         run: |
           set -Euo pipefail
@@ -497,7 +486,7 @@ jobs:
           bash "$GITHUB_WORKSPACE/.github/scripts/runner-cleanup.sh" final || true
           rm -f toolbuild/rclone.conf
 
-      - name: Upload debug logs
+      - name: 📋 Upload debug logs
         if: always()
         uses: actions/upload-artifact@v4
         with:

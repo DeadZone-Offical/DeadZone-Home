@@ -1,6 +1,6 @@
 name: DeadZone-Home Lite 2
 
-run-name: DeadZone Home Lite 2 - ${{ inputs.request_id }} - ${{ inputs.builder_name || github.actor }}
+run-name: 🚀 DeadZone-Home Lite 2 · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}
 
 concurrency:
   group: deadzone-home-lite-build-2
@@ -10,23 +10,23 @@ on:
   workflow_dispatch:
     inputs:
       input_url:
-        description: ROM download URL
+        description: 📥 ROM download URL
         required: true
         type: string
       builder_name:
-        description: Builder name
+        description: 👤 Builder name
         required: false
         type: string
       builder_id:
-        description: Telegram user ID
+        description: 💬 Telegram user ID
         required: false
         type: string
       request_id:
-        description: DeadZone controlled build request ID
+        description: 🆔 DeadZone controlled build request ID
         required: true
         type: string
       callback_url:
-        description: Signed DeadZone build-event endpoint
+        description: 🔗 Signed DeadZone build-event endpoint
         required: true
         type: string
 
@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   build:
-    name: Lite Worker 2
+    name: 🛠️ Lite Worker 2
     uses: ./.github/workflows/lite-core.yml
     with:
       input_url: ${{ inputs.input_url }}

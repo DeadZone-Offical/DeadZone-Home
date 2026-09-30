@@ -1,9 +1,6 @@
 name: DeadZone-Home Port 1
 
-run-name: DeadZone Home Port 1 - ${{ inputs.request_id }} - ${{ inputs.builder_name || github.actor }}
-
-# DeadZone-Home public dispatcher (Xiaomi Port engine, worker 1 of 5).
-# Mirrors DeadZone-MEZO/.github/workflows/port-1.yml with identical inputs.
+run-name: 🔂 DeadZone-Home Port 1 · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}
 
 concurrency:
   group: deadzone-home-port-build-1
@@ -42,7 +39,7 @@ permissions:
 
 jobs:
   build:
-    name: Port Worker 1
+    name: 🔂 Port Worker 1
     uses: ./.github/workflows/port-core.yml
     with:
       stock_rom_url: ${{ inputs.stock_rom_url }}
