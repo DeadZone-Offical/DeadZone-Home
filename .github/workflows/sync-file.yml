@@ -70,7 +70,6 @@ jobs:
       DESTINATION_BRANCH: ${{ inputs.destination_branch }}
       COMMIT_MESSAGE: ${{ inputs.commit_message }}
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
-      STAGE_DIR: ${{ runner.temp }}/deadzone-file-stage
       # Git identity for the sync commit. Hardcoded to a no-reply
       # bot identity so the workflow never depends on the runner's
       # local git config.
@@ -161,7 +160,7 @@ jobs:
           DESTINATION_REPO: ${{ env.DESTINATION_REPO }}
           DESTINATION_BRANCH: ${{ env.DESTINATION_BRANCH }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          STAGE_DIR: ${{ env.STAGE_DIR }}
+          STAGE_DIR: ${{ runner.temp }}/deadzone-file-stage
         run: |
           set -Eeuo pipefail
           rm -rf "$STAGE_DIR"
@@ -197,7 +196,7 @@ jobs:
       - name: 🧹 Clear destination working tree (managed sync)
         shell: bash
         env:
-          STAGE_DIR: ${{ env.STAGE_DIR }}
+          STAGE_DIR: ${{ runner.temp }}/deadzone-file-stage
         run: |
           set -Eeuo pipefail
           # Remove every tracked, non-.git file in the destination
@@ -228,7 +227,7 @@ jobs:
         shell: bash
         env:
           SOURCE_DIR: ${{ env.SOURCE_DIR }}
-          STAGE_DIR: ${{ env.STAGE_DIR }}
+          STAGE_DIR: ${{ runner.temp }}/deadzone-file-stage
         run: |
           set -Eeuo pipefail
           # Enumerate exactly the tracked files in the source working
@@ -265,7 +264,7 @@ jobs:
         id: diff
         shell: bash
         env:
-          STAGE_DIR: ${{ env.STAGE_DIR }}
+          STAGE_DIR: ${{ runner.temp }}/deadzone-file-stage
         run: |
           set -Eeuo pipefail
           repo="$STAGE_DIR/repo"
@@ -292,7 +291,7 @@ jobs:
         if: steps.diff.outputs.changes == 'true'
         shell: bash
         env:
-          STAGE_DIR: ${{ env.STAGE_DIR }}
+          STAGE_DIR: ${{ runner.temp }}/deadzone-file-stage
           DESTINATION_REPO: ${{ env.DESTINATION_REPO }}
           DESTINATION_BRANCH: ${{ env.DESTINATION_BRANCH }}
           COMMIT_MESSAGE: ${{ env.COMMIT_MESSAGE }}
@@ -321,7 +320,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          STAGE_DIR: ${{ env.STAGE_DIR }}
+          STAGE_DIR: ${{ runner.temp }}/deadzone-file-stage
         run: |
           set -Eeuo pipefail
           # Remove the entire scratch directory. We never create
