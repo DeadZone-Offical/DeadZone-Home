@@ -1,11 +1,5 @@
 name: DeadZone-Home Port Core
 
-# Reusable workflow that mirrors DeadZone-MEZO/.github/workflows/port-core.yml
-# exactly. The only difference is the engine repository: this launcher
-# checks out DeadZone-Offical/DeadZone-xiaomi_Port (the new private
-# engine), while the central runtime continues to live in
-# DeadZone-Offical/DeadZone-File.
-
 on:
   workflow_call:
     inputs:
@@ -33,16 +27,12 @@ on:
         description: Signed DeadZone build-event endpoint
         required: true
         type: string
-    # DEADZONE: temporary single-destination upload.
-#
-# As of the 2026-09-30 disablement, Google Drive (rclone) is the only
-# active upload destination. SourceForge/PixelDrain upload steps are
-# skipped via `DeadZone-File/upload-mirrors.sh` (which honors
-# `DEADZONE_ENABLE_SECONDARY_MIRRORS`); the SSH/API secrets are no
-# longer required by this workflow. The credentials, mirror helper, and
-# website-publisher remain in tree so this can be reverted by removing
-# the feature-flag guard.
-secrets:
+    secrets:
+      # DEADZONE: temporary single-destination upload. As of the 2026-09-30
+      # disablement, only Google Drive (rclone) is active. The SourceForge
+      # SSH key and PixelDrain API key are no longer required to run this
+      # workflow; they remain in the upload helper so re-enabling is a
+      # one-line flip.
       GH_TOKEN:
         required: true
 
@@ -51,7 +41,7 @@ permissions:
 
 jobs:
   build:
-    name: Build DeadZone Port
+    name: 🔂 Build DeadZone Port
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -69,7 +59,7 @@ jobs:
       DEADZONE_ENABLE_SECONDARY_MIRRORS: "0"
 
     steps:
-      - name: Validate Port request
+      - name: 🔐 Validate Port request
         shell: python
         env:
           STOCK_ROM_URL: ${{ inputs.stock_rom_url }}
@@ -97,16 +87,14 @@ jobs:
               ):
                   raise SystemExit(f"{name} must be a safe HTTPS URL")
 
-      - name: Validate publishing credentials
+      - name: 🔐 Validate publishing credentials
         shell: bash
         env:
           DEADZONE_RUNTIME_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -Eeuo pipefail
           # DEADZONE: while secondary mirrors are disabled, only the
-          # runtime bootstrap token is required. SourceForge/PixelDrain
-          # credentials are still consumed by the upload helper for
-          # re-enablement but are not gating build entry.
+          # runtime bootstrap token is required.
           required=(DEADZONE_RUNTIME_TOKEN)
           for variable_name in "${required[@]}"; do
             if [[ -z "${!variable_name:-}" ]]; then
@@ -115,14 +103,14 @@ jobs:
             fi
           done
 
-      - name: Checkout DeadZone launcher
-        uses: actions/checkout@v4
+      - name: 📥 Checkout DeadZone launcher
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Load DeadZone central runtime
-        uses: actions/checkout@v4
+      - name: 🔐 Load DeadZone central runtime
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: DeadZone-Offical/DeadZone-File
           token: ${{ secrets.GH_TOKEN }}
@@ -131,14 +119,14 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Import Port runtime
+      - name: 🔑 Import Port runtime
         id: central
         shell: bash
         env:
           DEADZONE_PRIVATE_TOKEN: ${{ secrets.GH_TOKEN }}
         run: bash runtime/load-build.sh port
 
-      - name: Validate Port engine runtime
+      - name: 🛡️ Validate Port engine runtime
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -162,8 +150,8 @@ jobs:
           echo "::add-mask::$BUILD_PROGRESS_SECRET"
           echo "DEADZONE_EVENT_SECRET=$BUILD_PROGRESS_SECRET" >> "$GITHUB_ENV"
 
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
+      - name: ⚡ Maximize build space
+        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
         with:
           build-mount-path: ${{ github.workspace }}/toolbuild
           swap-size-mb: 1024
@@ -173,8 +161,8 @@ jobs:
           remove-haskell: "true"
           remove-docker-images: "true"
 
-      - name: Checkout private Port engine
-        uses: actions/checkout@v4
+      - name: 📥 Checkout private Port engine
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: ${{ steps.central.outputs.engine_repository }}
           token: ${{ env.PRIVATE_REPO_TOKEN }}
@@ -184,23 +172,23 @@ jobs:
           lfs: true
           persist-credentials: false
 
-      - name: Report queued Port build
+      - name: 📡 Report queued Port build
         working-directory: toolbuild
         env:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
         run: |
           python3 notify.py start "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" port "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
 
-      - name: Set Cairo timezone
+      - name: 🕒 Set Cairo timezone
         run: sudo timedatectl set-timezone Africa/Cairo
 
-      - name: Prepare Java 17
-        uses: actions/setup-java@v4
+      - name: ☕ Prepare Java 17
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Install Port dependencies
+      - name: 🧰 Install Port dependencies
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
@@ -218,11 +206,11 @@ jobs:
           sudo apt-get -o Acquire::Retries=3 update
           sudo bash -Ee -o pipefail setup.sh
 
-      - name: Give Port tools permission
+      - name: 🔧 Give Port tools permission
         working-directory: toolbuild
         run: sudo chmod 777 -R *
 
-      - name: Install central rclone config
+      - name: ☁️ Install central rclone config
         shell: bash
         working-directory: toolbuild
         run: |
@@ -240,7 +228,7 @@ jobs:
           fi
           rclone version
 
-      - name: Build Stock + Port ROM
+      - name: 🔂 Build Stock + Port ROM
         working-directory: toolbuild
         env:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
@@ -255,7 +243,7 @@ jobs:
             "$DEADZONE_BUILDER_ID" \
             2>&1 | tee build_action.log
 
-      - name: Pack Port ROM
+      - name: 📦 Pack Port ROM
         working-directory: toolbuild
         env:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
@@ -264,7 +252,7 @@ jobs:
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" port "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
           sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
 
-      - name: Package and upload Google Drive
+      - name: 🗜️ Package and upload Google Drive
         working-directory: toolbuild
         env:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
@@ -272,6 +260,7 @@ jobs:
           set -Eeuo pipefail
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" port "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
 
+          # Report disk space before packaging
           echo "[PERF][BEFORE PACKAGE]"
           df -h / | tail -1 | awk '{print "  Root:", $4, "available"}'
           if [[ -d /workspace ]]; then df -h /workspace | tail -1 | awk '{print "  Workspace:", $4, "available"}'; fi
@@ -293,6 +282,10 @@ jobs:
           final_zip="${final_zips[0]}"
           final_name="$(basename "$final_zip")"
 
+          # NOTE: create_zip.py performs streaming integrity validation (constant RAM).
+          # No duplicate full ZIP validation needed here.
+          # DEADZONE_INTEGRITY_VERIFIED is set based on create_zip.py success.
+
           final_size_bytes="$(stat -c '%s' "$final_zip")"
           final_size_human="$(python3 - "$final_size_bytes" <<'PY'
           import sys
@@ -311,10 +304,11 @@ jobs:
           echo "[PERF] Final ZIP verified by create_zip.py streaming validation"
           echo "[PERF] File size: ${final_size_human}"
 
+          # Post-package cleanup via centralized helper
           echo "[PERF][POST-PACKAGE] Running cleanup..."
           bash "$GITHUB_WORKSPACE/.github/scripts/runner-cleanup.sh" post-package || true
 
-      - name: Upload SourceForge and PixelDrain
+      - name: ⬆️ Upload SourceForge and PixelDrain
         working-directory: toolbuild
         # DEADZONE: secondary mirrors are temporarily disabled. The shared
         # helper (DeadZone-File/upload-mirrors.sh) no-ops when
@@ -378,14 +372,11 @@ jobs:
             echo "::error::Google Drive upload failed and no secondary mirrors are enabled"
             exit 1
           fi
-          # mirror_status is informational here: the helper exits 0 when
-          # mirrors are disabled, so any non-zero value would indicate a
-          # helper script regression rather than a missing credential.
           if (( mirror_status != 0 )); then
             echo "::warning::upload-mirrors.sh exited with status ${mirror_status}; continuing because Google Drive succeeded"
           fi
 
-      - name: Report successful Port build
+      - name: ✅ Report successful Port build
         if: success()
         working-directory: toolbuild
         env:
@@ -394,7 +385,7 @@ jobs:
           set -euo pipefail
           python3 notify.py success "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" port "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
 
-      - name: Publish Port release to website
+      - name: 🌐 Publish Port release to website
         if: success()
         continue-on-error: true
         working-directory: toolbuild
@@ -421,7 +412,7 @@ jobs:
             --sourceforge-url "${DEADZONE_SOURCEFORGE_URL:-}" \
             --pixeldrain-url "${DEADZONE_PIXELDRAIN_URL:-}"
 
-      - name: Report failed Port build
+      - name: ❌ Report failed Port build
         if: failure()
         shell: bash
         run: |
@@ -441,7 +432,7 @@ jobs:
             --project port \
             --message "Port ROM build failed."
 
-      - name: Report cancelled Port build
+      - name: ⛔ Report cancelled Port build
         if: cancelled()
         shell: bash
         run: |
@@ -461,7 +452,7 @@ jobs:
             --project port \
             --message "Port ROM build cancelled."
 
-      - name: Cleanup Port workspace
+      - name: 🧹 Cleanup Port workspace
         if: always()
         run: |
           set -Eeuo pipefail

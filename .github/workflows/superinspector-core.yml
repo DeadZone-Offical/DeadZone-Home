@@ -1,17 +1,59 @@
 name: DeadZone-Home SuperInspector Core
 
-# Workflow 5 - Super Inspector reusable workflow (DeadZone-Home).
+# Workflow 5 - Super Inspector reusable workflow.
 #
-# Mirrors DeadZone-MEZO/.github/workflows/superinspector-core.yml exactly.
-# Differences vs the legacy workflow:
-#   - The launcher that runs this workflow is now DeadZone-Offical/DeadZone-Home.
-#   - The pinned SuperInspector engine is now cloned from
-#     DeadZone-Offical/DeadZone-SuperInspector.
-#   - The publish destinations default to DeadZone-Offical/DeadZone-xiaomi_Lite
-#     and DeadZone-Offical/DeadZone-xiaomi_Port.
-# The callback signing, status envelope, ROM download contract, archive
-# validation, and publishing tree are byte-identical to the legacy
-# implementation so the bot sees the same behaviour.
+# Single point of truth for what DeadZone Home does when the DeadZone-Bot
+# `/dz add` wizard dispatches a ROM URL:
+#
+#   1. Validate every required input up-front so a malformed dispatch
+#      fails fast with a signed `analyze.failed` callback.
+#   2. Load the same central runtime the Lite/Port paths use
+#      (`DeadZone-Offical/DeadZone-File`) so `BUILD_PROGRESS_SECRET` is
+#      sourced from the same place the bot reads `BUILD_EVENT_SECRET`
+#      from - no separate secret definition is required on this repo.
+#   3. Prepare a clean runner: maximise build space, install every
+#      system package DeadZone needs to unpack a Xiaomi Fastboot ROM
+#      (.tgz + lz4 + xz + zstd + erofs), and create the expected
+#      `workspace/{input,inspector,output,logs,downloads}` directory
+#      layout.
+#   4. Download the ROM archive with strict byte cap, redirect
+#      following, HTTP validation, file-size validation, and SHA-256.
+#      Download failures emit a signed `download.failed` callback so
+#      Telegram learns about it before the workflow exits.
+#   5. Validate the archive format (path-traversal-safe `tarfile`
+#      open + member/file count) so HTML error pages and truncated
+#      downloads are caught BEFORE the engine sees them.
+#   6. Check out DeadZone-SuperInspector at the pinned ref and run its
+#      real analysis pipeline (`build.sh analyze`).
+#   7. Project the dz-inspector output into the canonical Device
+#      Profile JSON the Cloudflare Worker expects and POST a signed
+#      `analyze.completed` callback carrying the full profile.
+#   8. Validate the canonical profile against the bot's published
+#      contract (16-hex profile_id, primary_codename present, generator
+#      SHA matches the pinned ref, etc.).
+#   9. Materialise the profile tree on the workflow runner, then for
+#      each destination repo (the launcher itself + configured Lite +
+#      configured Port) clone, rsync the tree, and push only when the
+#      working tree actually changed. Authentication uses the runner's
+#      auto-injected `GITHUB_TOKEN` so no extra secret is required.
+#  10. Report `publish.completed` once each destination commit is
+#      confirmed, or `publish.failed` with the profile preserved as
+#      a workflow artifact so the user can retry.
+#
+# Every step failure routes through the signed callback mechanism
+# before exiting, so Telegram always learns whether the failure was
+# a download, setup, install, analysis, validation, publishing, or
+# callback error. The callback signature matches the central
+# runtime's `report_build_event.py` contract:
+#
+#   signature = "sha256=" + HMAC(secret, f"{timestamp}.{body}")
+#   headers    = X-DeadZone-Timestamp, X-DeadZone-Signature
+#
+# The previous wrong signing scheme (no timestamp prefix + lowercase
+# `x-deadzone-signature` header) caused the bot to reject callbacks
+# with HTTP 403; non-terminal lifecycle callbacks now go through the
+# `dz_emit_callback.py` helper and terminal failures go through the
+# runtime's `report_build_event.py` exactly the way Lite does.
 
 on:
   workflow_call:
@@ -49,7 +91,8 @@ on:
         description: "Hard cap for ROM download in bytes"
         required: false
         type: string
-        default: "12884901888"
+        default: "12884901888"   # 12 GiB - matches the real size of Xiaomi
+                                  # Fastboot ROMs that exceed the old 4 GiB cap.
       downloads_root:
         description: "Directory inside the runner where ROMs and profiles live"
         required: false
@@ -75,6 +118,11 @@ on:
         required: true
       SUPER_INSPECTOR_REPOSITORY_TOKEN:
         required: false
+      # GITHUB_TOKEN is intentionally NOT declared here. The reusable
+      # workflow's `secrets:` interface rejects reserved secret names
+      # (HTTP 422 "secret name GITHUB_TOKEN within workflow_call can
+      # not be used"). The auto-injected token remains accessible as
+      # `${{ secrets.GITHUB_TOKEN }}` inside the steps below.
 
 permissions:
   contents: write
@@ -98,7 +146,17 @@ jobs:
       DEADZONE_INSPECTOR_REPOSITORY: "DeadZone-Offical/DeadZone-SuperInspector"
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SUPER_INSPECTOR_REPOSITORY_TOKEN: ${{ secrets.SUPER_INSPECTOR_REPOSITORY_TOKEN }}
+      # DEADZONE_EVENT_SECRET / DEADZONE_CALLBACK_SECRET are sourced from
+      # the central runtime in the "Load central runtime" step and
+      # forwarded through $GITHUB_ENV. This matches Lite's pattern and
+      # makes the callback contract byte-identical to the runtime's
+      # report_build_event.py signer.
     steps:
+      # NOTE: callers are not required to provide dz_emit_callback.py
+      # or dz_validate_rom.py. DeadZone Home ships self-contained copies
+      # in .github/scripts/ so the worker runs on a clean runner without
+      # needing a separate caller repo checkout.
+
       - name: "Checkout launcher repository (for publish step)"
         uses: actions/checkout@v4
         with:
@@ -141,6 +199,10 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # The system root filesystem only has ~100MB free. Put the
+          # isolated workspace on the 100GB volume mounted by
+          # `easimon/maximize-build-space` at toolbuild/ so we can
+          # actually fit a 5-12 GB Xiaomi Fastboot ROM.
           build_volume="${BUILD_VOLUME:-${{ github.workspace }}/toolbuild}"
           mkdir -p "$build_volume"
           root="$build_volume/$DEADZONE_DOWNLOADS_ROOT/$DEADZONE_JOB_ID"
@@ -222,6 +284,12 @@ jobs:
           done
           chmod 700 runtime/load-build.sh
           python3 -m py_compile runtime/report_build_event.py || true
+          # load-build.sh sources both env files and pushes every key into
+          # $GITHUB_ENV. The signing secret for our callbacks is exposed
+          # via BUILD_PROGRESS_SECRET, exactly like Lite does. We pass
+          # `lite` as the project key because the loader only requires
+          # it to derive DEADZONE_ENGINE_REPOSITORY; the Super Inspector
+          # worker never touches the engine repo so the value is unused.
           bash runtime/load-build.sh lite
 
       - name: "Validate loaded runtime + derive callback secret"
@@ -239,6 +307,11 @@ jobs:
             exit 1
           fi
           printf '::add-mask::%s\n' "$BUILD_PROGRESS_SECRET"
+          # Mirror Lite's pattern: expose both DEADZONE_EVENT_SECRET
+          # (the runtime-side canonical name) and DEADZONE_CALLBACK_SECRET
+          # (the legacy name retained for backwards compatibility with
+          # any older helper scripts). The runtime's report_build_event.py
+          # reads DEADZONE_EVENT_SECRET / BUILD_PROGRESS_SECRET.
           printf 'DEADZONE_EVENT_SECRET=%s\n' "$BUILD_PROGRESS_SECRET" >> "$GITHUB_ENV"
           printf 'DEADZONE_CALLBACK_SECRET=%s\n' "$BUILD_PROGRESS_SECRET" >> "$GITHUB_ENV"
           echo "callback secret loaded (sha256 prefix: ${BUILD_PROGRESS_SECRET:0:8})"
@@ -246,16 +319,27 @@ jobs:
       - name: "Stage callback emitter + validator helpers (self-contained)"
         shell: bash
         env:
-          DEADZONE_HOME_REPO: "DeadZone-Offical/DeadZone-Home"
-          DEADZONE_HOME_REF: "main"
+          # Hardcoded so the reusable workflow always knows where to
+          # fetch its own files from, even when invoked via the
+          # workflow_dispatch API (where the caller's repo is the
+          # one in github.workspace, not DeadZone Home).
+          DEADZONE_MEZO_REPO: "DeadZone-Offical/DeadZone-Home"
+          DEADZONE_MEZO_REF: "main"
         run: |
           set -Eeuo pipefail
-          repo_root="${DEADZONE_REPO_ROOT:-/tmp/deadzone_home_self}"
+          # The reusable workflow lives in this repo. Check it out so
+          # .github/scripts/ is always available regardless of how the
+          # reusable workflow was triggered (local `uses:` or remote
+          # workflow_dispatch / API). The default workflow_call
+          # workspace is the *caller's* repo, so we explicitly fetch
+          # this repo to guarantee the helpers and deadzone_mezo
+          # library are on disk.
+          repo_root="${DEADZONE_REPO_ROOT:-/tmp/deadzone_mezo_self}"
           if [[ ! -s "$repo_root/.github/scripts/dz_emit_callback.py" ]]; then
-            echo "fetching ${DEADZONE_HOME_REPO}@${DEADZONE_HOME_REF} into $repo_root"
+            echo "fetching ${DEADZONE_MEZO_REPO}@${DEADZONE_MEZO_REF} into $repo_root"
             rm -rf "$repo_root"
-            git clone --depth=1 --quiet --branch "${DEADZONE_HOME_REF}" \
-              "https://github.com/${DEADZONE_HOME_REPO}.git" "$repo_root"
+            git clone --depth=1 --quiet --branch "${DEADZONE_MEZO_REF}" \
+              "https://github.com/${DEADZONE_MEZO_REPO}.git" "$repo_root"
           fi
           if [[ ! -s "$repo_root/.github/scripts/dz_emit_callback.py" ]]; then
             echo "::error::missing self-contained dz_emit_callback.py in $repo_root/.github/scripts/"
@@ -274,6 +358,10 @@ jobs:
           cp "$repo_root/.github/scripts/dz_validate_rom.py" /tmp/dz_validate_rom.py
           chmod +x /tmp/dz_emit_callback.py /tmp/dz_validate_rom.py
           python3 -m py_compile /tmp/dz_emit_callback.py /tmp/dz_validate_rom.py
+          # Expose the repo root for downstream steps that need to
+          # call the deadzone_mezo library / e2e_real_rom driver.
+          # CALLER_REPO_DIR points at the launcher (target_repo)
+          # checkout — the publish step needs that to push profiles.
           printf 'DEADZONE_REPO_ROOT=%s\n' "$repo_root" >> "$GITHUB_ENV"
           printf 'CALLER_REPO_DIR=%s\n' "${{ github.workspace }}/launcher_repo" >> "$GITHUB_ENV"
           echo "self-contained helpers staged from $repo_root/.github/scripts/"
@@ -351,6 +439,11 @@ jobs:
           echo "  target    = $target"
           echo "  max_bytes = $max_bytes"
 
+          # Use curl's `--max-filesize` so a server that over-reports the
+          # Content-Length still aborts the body stream instead of filling
+          # the runner disk. `--fail-with-body` returns the HTTP error
+          # body so we can surface upstream reasons, but we treat any
+          # non-zero exit as a hard failure.
           set +e
           curl_args=(
             --silent --show-error --location --max-redirs 10
@@ -442,7 +535,11 @@ jobs:
           out="$root/mezo_output"
           rm -rf "$out"
           mkdir -p "$out"
-          repo_root="${DEADZONE_REPO_ROOT:-/tmp/deadzone_home_self}"
+          repo_root="${DEADZONE_REPO_ROOT:-/tmp/deadzone_mezo_self}"
+          if [[ ! -s "$repo_root/.github/scripts/e2e_real_rom.py" ]]; then
+            echo "::error::self-contained e2e_real_rom.py missing in $repo_root/.github/scripts/"
+            exit 1
+          fi
           if [[ ! -s "$repo_root/.github/scripts/lib/deadzone_mezo.py" ]]; then
             echo "::error::self-contained lib/deadzone_mezo.py missing in $repo_root/.github/scripts/lib/"
             exit 1
@@ -450,17 +547,15 @@ jobs:
           echo "running self-contained deadzone_mezo pipeline against $rom"
           START_MS=$(date +%s%3N)
           set +e
+          # tee into BOTH the canonical logs/ dir and mezo_output/ so
+          # either path can pick up the bundle for the artifact upload.
           mkdir -p "$root/logs"
-          # The legacy workflow exposes an e2e_real_rom.py driver; in this
-          # new repo we only ship the deadzone_mezo library, so we call
-          # the library directly through its analyze_rom_path entry point.
-          python3 - <<PY
-          import sys, os
-          sys.path.insert(0, "$repo_root/.github/scripts")
-          from lib.deadzone_mezo import analyze_rom_path
-          result = analyze_rom_path("$rom", output_dir="$out")
-          print("profile_id:", result.profile.get("profile_id"))
-          PY
+          python3 "$repo_root/.github/scripts/e2e_real_rom.py" \
+            --url "$rom" \
+            --rom-path "$rom" \
+            --output "$out" \
+            --max-bytes "$DEADZONE_MAX_ROM_BYTES" \
+            --json 2>&1 | tee "$root/logs/mezo_pipeline.log" "$out/mezo_pipeline.log"
           status="${PIPESTATUS[0]}"
           set -e
           END_MS=$(date +%s%3N)
@@ -478,8 +573,34 @@ jobs:
           echo "MEZO_PROFILE_PATH=$profile_path" >> "$GITHUB_OUTPUT"
           echo "MEZO_PROFILE_SHA256=$profile_sha" >> "$GITHUB_OUTPUT"
           echo "MEZO_DURATION_MS=$((END_MS - START_MS))" >> "$GITHUB_OUTPUT"
+          # Echo a summary directly into the workflow log so the run
+          # is self-documenting even if the artifact upload fails.
           echo "deadzone_mezo pipeline OK in $((END_MS - START_MS)) ms"
           echo "profile sha256: $profile_sha"
+          MEZO_PROFILE="$profile_path" python3 - <<'PY'
+          import json, os
+          p = json.load(open(os.environ["MEZO_PROFILE"], encoding="utf-8"))
+          dev = p.get("device", {})
+          rom = p.get("rom", {})
+          sup = p.get("super", {})
+          inv = p.get("inventory", {})
+          ana = p.get("analysis_status", {})
+          print(f"  codename     : {dev.get('primary_codename')}")
+          print(f"  models       : {dev.get('models')}")
+          print(f"  vendor       : {dev.get('vendor')}")
+          print(f"  android      : {rom.get('android_version')}")
+          print(f"  build_id     : {rom.get('build_id')}")
+          print(f"  fingerprint  : {rom.get('build_fingerprint')}")
+          print(f"  region       : {rom.get('region')}")
+          print(f"  super_format : {sup.get('format')}")
+          print(f"  partitions   : {sup.get('partition_count')}")
+          print(f"  lp_metadata  : {sup.get('lp_metadata_size')} bytes")
+          print(f"  images_count : {inv.get('image_count')}")
+          print(f"  archive_ok   : {ana.get('archive_validated')}")
+          print(f"  super_witness: {sup.get('witness_super_inspector')}")
+          print(f"  profile_id   : {p.get('profile_id')}")
+          print(f"  schema       : {p.get('schema_version')}")
+          PY
 
       - name: "Report analyze.started"
         if: success()
@@ -500,10 +621,23 @@ jobs:
           set -Eeuo pipefail
           root="${{ steps.workspace.outputs.ROOT }}"
           repo_url="https://github.com/${DEADZONE_INSPECTOR_REPOSITORY}"
+          # The pinned inspector lives in a *private* repo. The default
+          # GITHUB_TOKEN in a reusable-workflow call only has access to
+          # the caller repository, so the central runtime's
+          # PRIVATE_REPO_TOKEN (loaded via load-build.sh) or a PAT
+          # configured as SUPER_INSPECTOR_REPOSITORY_TOKEN must be used
+          # to clone the inspector source. Prefer the PAT (narrow
+          # scope); fall back to the runtime token; fall back to the
+          # caller GITHUB_TOKEN only for fully public repos / mirrors.
           clone_repo() {
             local tok="$1"
             local hdr
             hdr="$(printf 'x-access-token:%s' "$tok" | base64 -w0)"
+            # The pinned inspector ref is normally a 40-char commit
+            # SHA, not a branch name. `git clone --branch <sha>` only
+            # works when the SHA matches an existing ref name, so we
+            # always clone the default branch and then detach at the
+            # requested SHA below.
             git -c "http.extraheader=AUTHORIZATION: basic ${hdr}" \
                 clone --no-tags "$repo_url" "$root/inspector"
           }
@@ -531,8 +665,9 @@ jobs:
           command -v python3 >/dev/null || { echo "::error::python3 missing"; exit 1; }
           python3 -V
           python3 -m pip install --quiet --upgrade pip
-          python3 -m pip install --quiet "pyyaml"
+          python3 -m pip install --quiet "pyyaml>=6"
           python3 -m pip install --quiet "${{ steps.workspace.outputs.ROOT }}/inspector"
+          # `dz-inspector` should now be on PATH.
           command -v dz-inspector >/dev/null || {
             echo "::error::dz-inspector CLI was not installed by `pip install`"
             python3 -m pip install --quiet --force-reinstall "${{ steps.workspace.outputs.ROOT }}/inspector"
@@ -563,6 +698,10 @@ jobs:
           END_MS=$(date +%s%3N)
           if [[ "$status" -ne 0 ]]; then
             echo "::error::dz-inspector analyze exited with $status"
+            # Best-effort stage attribution: surface the tail of the
+            # engine log via the callback so the user does not get a
+            # generic "ROM analysis failed". Never block the failure
+            # callback on the engine log being missing.
             FAIL_MSG="$(tail -n 30 "$root/logs/analyze.log" 2>/dev/null | tr -d '\r' | tr '\n' ' ' | cut -c1-500)"
             if [[ -n "$FAIL_MSG" ]]; then
               export details="$FAIL_MSG"
@@ -596,6 +735,9 @@ jobs:
           out_base="$(dirname "$(dirname "$PROFILE_DIR")")"
           out_base="$(realpath "$out_base")"
           cb_path="$root/output/callback.json"
+          # The canonical profile expects `generator.run_id` so the bot
+          # can link the profile back to the GitHub Actions run that
+          # produced it. `$GITHUB_RUN_ID` is the workflow-level id.
           python3 "$root/inspector/scripts/emit_canonical_profile.py" \
             --output-dir "$out_base" \
             --generator-repository "DeadZone-Offical/DeadZone-SuperInspector" \
@@ -795,6 +937,9 @@ jobs:
                                        "commitSha": head})
                       continue
                   tmp = tempfile.mkdtemp(prefix="dz_pub_")
+                  # Prefer the dedicated publish PAT when present; only
+                  # fall back to GITHUB_TOKEN for repos where the
+                  # default token already has push rights.
                   token = (
                       os.environ.get("SUPER_INSPECTOR_REPOSITORY_TOKEN")
                       or os.environ.get("GITHUB_TOKEN")
@@ -903,6 +1048,8 @@ jobs:
             echo "warning: callback secret not yet loaded; cannot emit terminal analyze.failed"
             exit 0
           fi
+          # Use the same terminal reporter Lite uses so the bot gets a
+          # payload signed with the canonical runtime contract.
           python3 runtime/report_build_event.py failed \
             --project super \
             --message "DeadZone Super Inspector run failed before completion."
@@ -929,7 +1076,7 @@ jobs:
             --project super \
             --message "DeadZone Super Inspector run cancelled."
 
-      - name: "Upload job log bundle artifact"
+      - name: "Upload job log bundle (artifact)"
         if: always()
         shell: bash
         run: |
@@ -940,18 +1087,28 @@ jobs:
           rm -rf "$stage"
           mkdir -p "$stage"
           echo "ROOT: ${root:-<empty>}"
+          echo "MEZO_OUT: ${mezo_out:-<empty>}"
           echo "STAGE: $stage"
+          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
           if [[ -n "${root:-}" && -d "$root/logs" ]]; then
             cp -a "$root/logs/." "$stage/" || true
+            echo "copied logs from $root/logs/ to $stage/"
+          else
+            echo "WARNING: source logs dir not found at ${root:-<unset>}/logs"
           fi
           if [[ -d "$mezo_out" ]]; then
             mkdir -p "$stage/mezo_output"
             cp -a "$mezo_out/." "$stage/mezo_output/" || true
+            echo "copied mezo_output from $mezo_out/ to $stage/mezo_output/"
+          else
+            echo "WARNING: mezo_output dir not found at $mezo_out"
           fi
-          echo "deadzone_home staging OK at $(date -u +%FT%TZ)" > "$stage/_staging_sentinel.txt"
+          echo "deadzone_mezo staging OK at $(date -u +%FT%TZ)" > "$stage/_staging_sentinel.txt"
+          echo "staged files under $stage:"
           find "$stage" -maxdepth 5 -type f | sort || true
+          echo "total staged size: $(du -sb "$stage" 2>/dev/null | awk '{print $1}') bytes"
 
-      - name: "Upload job log bundle artifact (upload-artifact)"
+      - name: "Upload job log bundle artifact"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -966,11 +1123,16 @@ jobs:
           set -Eeuo pipefail
           root="${{ steps.workspace.outputs.ROOT }}"
           if [[ -n "$root" && -d "$root" ]]; then
+            # Preserve the deadzone_mezo output for upload BEFORE we
+            # tar up logs and delete the root. The mezo_output holds
+            # the Device Profile that proves the self-contained
+            # extraction ran end-to-end against the real ROM.
             if [[ -d "$root/mezo_output" ]]; then
               tar -C "$root" -czf "$root/logs/mezo_output.tar.gz" mezo_output || true
             fi
             tar -C "$root" -czf "$root/logs/bundle.tar.gz" logs || true
             rm -rf "$root/input" "$root/inspector" "$root/stage" || true
+            # Remove the per-job directory but keep the toolbuild volume mounted
             rm -rf "$root" || true
             echo "cleaned $root"
           fi

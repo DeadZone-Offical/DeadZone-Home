@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# DeadZone MEZO — Central Runner Cleanup Helper
+# DeadZone Home — Central Runner Cleanup Helper
 #
-# This script provides centralized cleanup operations for all MEZO workflows.
+# This script provides centralized cleanup operations for all DeadZone Home workflows.
 # It is ALLOWLIST-driven and safe to use.
 #
 # IMPORTANT: All ROM workflows use working-directory: toolbuild
@@ -297,7 +297,7 @@ cleanup_light() {
 # Print usage
 usage() {
     cat <<EOF
-DeadZone MEZO — Central Runner Cleanup Helper
+DeadZone Home — Central Runner Cleanup Helper
 
 Usage: $(basename "$0") <mode> [options]
 

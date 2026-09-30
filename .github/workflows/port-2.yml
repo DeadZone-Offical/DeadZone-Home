@@ -1,6 +1,6 @@
 name: DeadZone-Home Port 2
 
-run-name: DeadZone Home Port 2 - ${{ inputs.request_id }} - ${{ inputs.builder_name || github.actor }}
+run-name: 🔂 DeadZone-Home Port 2 · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}
 
 concurrency:
   group: deadzone-home-port-build-2
@@ -39,7 +39,7 @@ permissions:
 
 jobs:
   build:
-    name: Port Worker 2
+    name: 🔂 Port Worker 2
     uses: ./.github/workflows/port-core.yml
     with:
       stock_rom_url: ${{ inputs.stock_rom_url }}

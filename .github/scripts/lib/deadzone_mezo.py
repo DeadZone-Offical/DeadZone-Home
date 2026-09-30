@@ -938,7 +938,7 @@ def analyze_rom_path(
     rom_path: str,
     *,
     output_dir: str,
-    generator_repository: str = "mohammedmezo99/DeadZone-MEZO",
+    generator_repository: str = "DeadZone-Offical/DeadZone-Home",
     generator_ref: str = "main",
     generator_resolved_sha: str = "0000000000000000000000000000000000000000",
     archive_url: str | None = None,
@@ -1048,7 +1048,7 @@ def analyze_rom_url(
     os.makedirs(rom_dir, exist_ok=True)
     rom_path = os.path.join(rom_dir, filename)
 
-    req = urllib.request.Request(url, headers={"User-Agent": "DeadZone-MEZO/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "DeadZone-Home/1.0"})
     with urllib.request.urlopen(req, timeout=60) as resp, open(rom_path + ".part", "wb") as out:
         total = 0
         while True:
@@ -1076,7 +1076,7 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--profile-id", default="")
     parser.add_argument("--generator-ref", default="main")
     parser.add_argument("--generator-resolved-sha", default="")
-    parser.add_argument("--generator-repository", default="mohammedmezo99/DeadZone-MEZO")
+    parser.add_argument("--generator-repository", default="DeadZone-Offical/DeadZone-Home")
     args = parser.parse_args(argv)
 
     artifact = analyze_rom_path(
