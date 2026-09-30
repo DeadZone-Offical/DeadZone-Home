@@ -1,0 +1,378 @@
+name: DeadZone-Bot Deploy
+
+run-name: 🚀 DeadZone-Bot · ${{ github.event.inputs.mode || 'auto' }} · ${{ github.actor }}
+
+# Public CI/CD entry point for the DeadZone-Bot Cloudflare Worker.
+#
+# Architecture (Home → Bot → Cloudflare):
+#   DeadZone-Home (public, this workflow)
+#     ↓ 1. fine-grained PAT (DEADZONE_BOT_TOKEN, contents: read on Bot)
+#     ↓ 2. clones DeadZone-Offical/DeadZone-Bot
+#     ↓ 3. runs npm ci + secret-audit + typecheck + tests
+#     ↓ 4. wrangler deploy --dry-run
+#     ↓ 5. wrangler deploy (uses CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID)
+#     ↓ 6. probes https://deadzone-bot.<account>.workers.dev/health
+#   Cloudflare Worker `deadzone-bot`
+#
+# Required GitHub repository secrets in DeadZone-Home:
+#   CLOUDFLARE_API_TOKEN   — Cloudflare API token with the following
+#                            least-privilege scopes:
+#                              * Workers Scripts:Edit
+#                              * Workers Routes:Edit
+#                              * D1:Edit
+#                              * Queues:Edit
+#                              * Account Settings:Read
+#                            The bot does NOT need R2, KV, Pages, or any
+#                            zone/DNS scope.
+#   CLOUDFLARE_ACCOUNT_ID  — 32-character hexadecimal Cloudflare account
+#                            ID. The Worker URL is derived from this
+#                            (`deadzone-bot.<account>.workers.dev`) so
+#                            it MUST match the account that owns the
+#                            `deadzone-bot` Worker.
+#   DEADZONE_BOT_TOKEN     — Fine-grained Personal Access Token (PAT)
+#                            authorised on `DeadZone-Offical/DeadZone-Bot`
+#                            ONLY with `Contents: Read-only`. Used here
+#                            only for `actions/checkout`; never used to
+#                            push. A PAT rather than the auto-injected
+#                            `GITHUB_TOKEN` is required because the
+#                            auto-injected token cannot read other
+#                            repositories (including other private repos
+#                            in the same organisation).
+#
+# Secrets that DO NOT live here:
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, BUILD_EVENT_SECRET,
+#   GITHUB_BUILD_TOKEN — remain Cloudflare Worker Secrets (`wrangler
+#   secret put` or the Cloudflare dashboard). They MUST NOT be exposed
+#   via this public repository.
+#
+# Triggers:
+#   * workflow_dispatch — manual deploy, supports `mode` (deploy |
+#     dry-run) and `ref` (Bot branch/ref to deploy from).
+#   * schedule         — every 15 minutes. Uses a SHA-keyed GitHub
+#                        Actions cache to skip work when the upstream
+#                        Bot commit has not changed since the last
+#                        successful deploy. A deployment loop is
+#                        impossible because:
+#                          - the workflow never writes back to Bot;
+#                          - the cache key is keyed on the *new*
+#                            upstream SHA, so a successful deploy
+#                            writes a *different* cache entry than the
+#                            one it consulted (no self-hit loop);
+#                          - `wrangler deploy` itself is idempotent on
+#                            the Cloudflare side.
+#
+# Permissions:
+#   * contents: read — required for `actions/checkout` of Bot.
+#   No write permissions are requested.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 🚀 Deployment mode
+        required: false
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - dry-run
+      ref:
+        description: 🌿 DeadZone-Bot branch / ref to deploy from
+        required: false
+        default: main
+        type: string
+  schedule:
+    # Every 15 minutes. The upstream SHA check (see 🔁 gate step)
+    # short-circuits when the upstream did not change since the last
+    # successful deploy, so the per-run cost is one GitHub API call
+    # + one `wrangler deploy --dry-run` (which is purely local).
+    - cron: '*/15 * * * *'
+
+concurrency:
+  # Never run two deploys at once for the same Worker. This prevents
+  # the scheduled trigger from racing with a manual `workflow_dispatch`.
+  group: deadzone-bot-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# Default timeout protects against the bot's deploy hanging on a
+# Cloudflare upload stall. 15 min matches the previous in-Bot
+# `cloudflare-deploy.yml` budget.
+jobs:
+  deploy:
+    name: 🚀 Deploy DeadZone-Bot Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BOT_REPOSITORY: DeadZone-Offical/DeadZone-Bot
+      BOT_REF: ${{ inputs.ref || 'main' }}
+      DEPLOY_MODE: ${{ inputs.mode || 'deploy' }}
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WORKER_NAME: deadzone-bot
+      CACHE_KEY_PREFIX: deadzone-bot-deploy-sha
+      DEPLOY_MARKER_PATH: ${{ runner.temp }}/deadzone-bot-deploy-marker.txt
+    steps:
+      - name: 🛂 Validate launcher credentials
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # --- Cloudflare ---
+          [[ -n "${CF_API_TOKEN:-}" ]] || {
+            echo "::error::Missing CLOUDFLARE_API_TOKEN secret in DeadZone-Home. Add it at https://github.com/${{ github.repository }}/settings/secrets/actions" >&2
+            exit 1
+          }
+          [[ -n "${CF_ACCOUNT_ID:-}" ]] || {
+            echo "::error::Missing CLOUDFLARE_ACCOUNT_ID secret in DeadZone-Home. Add it at https://github.com/${{ github.repository }}/settings/secrets/actions" >&2
+            exit 1
+          }
+          if [[ "${CF_API_TOKEN}" == *"REPLACE"* || "${CF_API_TOKEN}" == *"CHANGEME"* ]]; then
+            echo "::error::CLOUDFLARE_API_TOKEN looks like an unresolved placeholder; refusing to run." >&2
+            exit 1
+          fi
+          if ! [[ "${CF_ACCOUNT_ID}" =~ ^[a-f0-9]{32}$ ]]; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID must be exactly 32 hexadecimal characters; got '${CF_ACCOUNT_ID}'." >&2
+            exit 1
+          fi
+          # --- Bot access token ---
+          [[ -n "${DEADZONE_BOT_TOKEN:-}" ]] || {
+            echo "::error::Missing DEADZONE_BOT_TOKEN secret in DeadZone-Home. Provision a fine-grained PAT authorised on ${BOT_REPOSITORY} with Contents: Read-only and store it at https://github.com/${{ github.repository }}/settings/secrets/actions" >&2
+            exit 1
+          }
+          if [[ "${DEADZONE_BOT_TOKEN}" == *"REPLACE"* || "${DEADZONE_BOT_TOKEN}" == *"CHANGEME"* || "${DEADZONE_BOT_TOKEN}" == *"xxxxx"* ]]; then
+            echo "::error::DEADZONE_BOT_TOKEN looks like an unresolved placeholder; refusing to run." >&2
+            exit 1
+          fi
+          echo "✅ All three launcher credentials present and well-formed."
+
+      - name: 📥 Checkout DeadZone-Bot (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BOT_REPOSITORY }}
+          ref: ${{ env.BOT_REF }}
+          token: ${{ secrets.DEADZONE_BOT_TOKEN }}
+          # Shallow clone keeps the checkout fast. The deploy step
+          # does not need full history.
+          fetch-depth: 1
+          # The bot token is only consumed by this checkout step.
+          # Subsequent steps use Cloudflare credentials from the
+          # runner env (not git credentials), so we disable credential
+          # persistence to avoid leaving the PAT in .git/config.
+          persist-credentials: false
+
+      - name: 🟢 Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+
+      - name: 📦 Install npm dependencies
+        working-directory: cloudflare
+        run: npm ci
+
+      - name: 🔐 Secret audit
+        working-directory: cloudflare
+        run: npm run security:audit
+
+      - name: 🧪 Typecheck
+        working-directory: cloudflare
+        run: npm run typecheck
+
+      - name: 🧪 Tests
+        working-directory: cloudflare
+        run: npm test
+
+      - name: 🛂 Verify Worker production workflow contracts
+        working-directory: cloudflare
+        run: npm run workflows:audit
+
+      - name: 🧮 Resolve upstream commit SHA
+        id: upstream
+        shell: bash
+        env:
+          BOT_REPOSITORY: ${{ env.BOT_REPOSITORY }}
+          BOT_REF: ${{ env.BOT_REF }}
+          DEADZONE_BOT_TOKEN: ${{ secrets.DEADZONE_BOT_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          # Resolve the upstream HEAD via the GitHub REST API rather
+          # than `git rev-parse` so we don't depend on the detached
+          # HEAD produced by `actions/checkout` with a non-branch
+          # ref. The API call uses DEADZONE_BOT_TOKEN, which has
+          # `Contents: Read-only` on the private Bot repo.
+          body="$(mktemp)"
+          trap 'rm -f "$body"' EXIT
+          http_code="$(
+            curl --silent --show-error --output "$body" \
+              --write-out '%{http_code}' \
+              -H "Authorization: Bearer ${DEADZONE_BOT_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${BOT_REPOSITORY}/commits/${BOT_REF}"
+          )"
+          if [[ "${http_code}" != "200" ]]; then
+            echo "::error::GitHub API returned HTTP ${http_code} for ${BOT_REPOSITORY}/commits/${BOT_REF}." >&2
+            cat "$body" >&2 || true
+            exit 1
+          fi
+          sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha"])' "$body")"
+          if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Failed to resolve upstream commit SHA; got '${sha}'." >&2
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Upstream ${BOT_REPOSITORY}@${BOT_REF} HEAD = ${sha}"
+
+      - name: 🔁 Skip scheduled runs that target an already-deployed SHA
+        id: cache-check
+        if: github.event_name == 'schedule'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPLOY_MARKER_PATH }}
+          key: ${{ env.CACHE_KEY_PREFIX }}-${{ steps.upstream.outputs.sha }}
+          lookup-only: 'true'
+
+      - name: 🔀 Compute deploy/skip decision
+        id: gate
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          CACHE_HIT: ${{ steps.cache-check.outputs.cache-hit }}
+        run: |
+          set -Eeuo pipefail
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "result=manual" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch — proceeding regardless of upstream SHA."
+            exit 0
+          fi
+          if [[ "${CACHE_HIT}" == "true" ]]; then
+            echo "result=skip-same-sha" >> "$GITHUB_OUTPUT"
+            echo "Cache hit for upstream ${UPSTREAM_SHA:0:12} — already deployed."
+          else
+            echo "result=deploy-new-sha" >> "$GITHUB_OUTPUT"
+            echo "Cache miss for upstream ${UPSTREAM_SHA:0:12} — proceeding with deploy."
+          fi
+
+      - name: 🧪 Wrangler dry-run
+        if: steps.gate.outputs.result != 'skip-same-sha'
+        working-directory: cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_LOG: info
+        run: |
+          set -Eeuo pipefail
+          echo "🧪 Running 'wrangler deploy --dry-run'…"
+          npx wrangler deploy --dry-run
+
+      - name: 🚀 Deploy Worker to Cloudflare
+        if: steps.gate.outputs.result != 'skip-same-sha' && env.DEPLOY_MODE == 'deploy'
+        id: deploy
+        working-directory: cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_LOG: info
+        run: |
+          set -Eeuo pipefail
+          echo "🚀 Deploying Worker to Cloudflare…"
+          npx wrangler deploy
+          echo "✅ Worker deployed."
+
+      - name: 💾 Persist deploy marker (write the marker file on success)
+        if: steps.deploy.outcome == 'success'
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          DEPLOY_MARKER_PATH: ${{ env.DEPLOY_MARKER_PATH }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$(dirname "${DEPLOY_MARKER_PATH}")"
+          printf 'upstream_sha=%s\nworker=deploy\ndeployed_at=%s\n' \
+            "${UPSTREAM_SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "${DEPLOY_MARKER_PATH}"
+          echo "Marker for ${UPSTREAM_SHA:0:12} persisted."
+
+      - name: 💾 Save deploy marker to cache (post-step)
+        if: steps.deploy.outcome == 'success'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPLOY_MARKER_PATH }}
+          key: ${{ env.CACHE_KEY_PREFIX }}-${{ steps.upstream.outputs.sha }}
+
+      - name: 🔬 Verify Worker /health
+        if: steps.deploy.outcome == 'success' && env.DEPLOY_MODE == 'deploy'
+        id: health
+        shell: bash
+        env:
+          WORKER_URL: https://deadzone-bot.${CF_ACCOUNT_ID}.workers.dev
+        run: |
+          set -Eeuo pipefail
+          url="${WORKER_URL}/health"
+          echo "Probing ${url} …"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            http_code="$(
+              curl --silent --show-error --output /tmp/health.json \
+                --write-out '%{http_code}' \
+                --max-time 15 \
+                "${url}" || true
+            )"
+            echo "  attempt ${attempt}: HTTP ${http_code}"
+            if [[ "${http_code}" =~ ^2 ]]; then
+              echo "---- /health body ----"
+              cat /tmp/health.json
+              echo
+              echo "----"
+              echo "✅ /health responded OK."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Worker /health endpoint did not return 2xx after 10 attempts." >&2
+          exit 1
+
+      - name: 🧹 Cleanup scratch files
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # /tmp/health.json can leak the Worker response body to
+          # subsequent steps or post-job artifact uploads. Remove it.
+          rm -f /tmp/health.json
+          echo "Scratch cleaned."
+
+      - name: 📣 Deployment summary
+        if: always()
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          BOT_REPOSITORY: ${{ env.BOT_REPOSITORY }}
+          BOT_REF: ${{ env.BOT_REF }}
+          DEPLOY_MODE: ${{ env.DEPLOY_MODE }}
+          EVENT_NAME: ${{ github.event_name }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          HEALTH_OUTCOME: ${{ steps.health.outcome }}
+          GATE_RESULT: ${{ steps.gate.outputs.result }}
+          CACHE_HIT: ${{ steps.cache-check.outputs.cache-hit }}
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "## 🚀 DeadZone-Bot deploy"
+            echo
+            echo "- Trigger: \`${EVENT_NAME}\`"
+            echo "- Mode: \`${DEPLOY_MODE}\`"
+            echo "- Upstream: \`${BOT_REPOSITORY}@${BOT_REF}\`"
+            echo "- Upstream SHA: \`${UPSTREAM_SHA:-unknown}\`"
+            echo "- Cache hit: \`${CACHE_HIT:-n/a}\`"
+            echo "- Gate: \`${GATE_RESULT:-unknown}\`"
+            echo "- Deploy step: \`${DEPLOY_OUTCOME:-skipped}\`"
+            echo "- Health check: \`${HEALTH_OUTCOME:-skipped}\`"
+            if [[ "${DEPLOY_MODE}" == "deploy" && "${DEPLOY_OUTCOME}" == "success" ]]; then
+              echo "- Worker URL: https://deadzone-bot.${CF_ACCOUNT_ID}.workers.dev"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Summary written."
