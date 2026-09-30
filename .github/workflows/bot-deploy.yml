@@ -113,7 +113,6 @@ jobs:
       CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       WORKER_NAME: deadzone-bot
       CACHE_KEY_PREFIX: deadzone-bot-deploy-sha
-      DEPLOY_MARKER_PATH: ${{ runner.temp }}/deadzone-bot-deploy-marker.txt
     steps:
       - name: 🛂 Validate launcher credentials
         shell: bash
@@ -231,7 +230,7 @@ jobs:
         if: github.event_name == 'schedule'
         uses: actions/cache@v4
         with:
-          path: ${{ env.DEPLOY_MARKER_PATH }}
+          path: ${{ runner.temp }}/deadzone-bot-deploy-marker.txt
           key: ${{ env.CACHE_KEY_PREFIX }}-${{ steps.upstream.outputs.sha }}
           lookup-only: 'true'
 
@@ -288,7 +287,7 @@ jobs:
         shell: bash
         env:
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
-          DEPLOY_MARKER_PATH: ${{ env.DEPLOY_MARKER_PATH }}
+          DEPLOY_MARKER_PATH: ${{ runner.temp }}/deadzone-bot-deploy-marker.txt
         run: |
           set -Eeuo pipefail
           mkdir -p "$(dirname "${DEPLOY_MARKER_PATH}")"
@@ -301,7 +300,7 @@ jobs:
         if: steps.deploy.outcome == 'success'
         uses: actions/cache@v4
         with:
-          path: ${{ env.DEPLOY_MARKER_PATH }}
+          path: ${{ runner.temp }}/deadzone-bot-deploy-marker.txt
           key: ${{ env.CACHE_KEY_PREFIX }}-${{ steps.upstream.outputs.sha }}
 
       - name: 🔬 Verify Worker /health
