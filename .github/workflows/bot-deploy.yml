@@ -309,11 +309,22 @@ jobs:
         id: health
         shell: bash
         env:
-          WORKER_URL: https://deadzone-bot.${CF_ACCOUNT_ID}.workers.dev
+          WORKER_NAME: deadzone-bot
         run: |
           set -Eeuo pipefail
-          url="${WORKER_URL}/health"
-          echo "Probing ${url} …"
+          # Build the Workers.dev URL in a shell context so that
+          # ${CF_ACCOUNT_ID} (inherited from the job-level env) expands
+          # naturally. Previously the URL was baked into a YAML env
+          # scalar as 'https://deadzone-bot.${CF_ACCOUNT_ID}.workers.dev'
+          # and curl received the literal '${CF_ACCOUNT_ID}' as part of
+          # the hostname, which it rejected with 'URL rejected: Bad
+          # hostname'.
+          if [[ -z "${CF_ACCOUNT_ID:-}" ]]; then
+            echo "::error::CF_ACCOUNT_ID is not set in the job environment; cannot construct the Worker health URL." >&2
+            exit 1
+          fi
+          url="https://${WORKER_NAME}.${CF_ACCOUNT_ID}.workers.dev/health"
+          echo "Probing ${url}"
           for attempt in 1 2 3 4 5 6 7 8 9 10; do
             http_code="$(
               curl --silent --show-error --output /tmp/health.json \
@@ -358,6 +369,7 @@ jobs:
           HEALTH_OUTCOME: ${{ steps.health.outcome }}
           GATE_RESULT: ${{ steps.gate.outputs.result }}
           CACHE_HIT: ${{ steps.cache-check.outputs.cache-hit }}
+          WORKER_NAME: deadzone-bot
         run: |
           set -Eeuo pipefail
           {
@@ -372,7 +384,16 @@ jobs:
             echo "- Deploy step: \`${DEPLOY_OUTCOME:-skipped}\`"
             echo "- Health check: \`${HEALTH_OUTCOME:-skipped}\`"
             if [[ "${DEPLOY_MODE}" == "deploy" && "${DEPLOY_OUTCOME}" == "success" ]]; then
-              echo "- Worker URL: https://deadzone-bot.${CF_ACCOUNT_ID}.workers.dev"
+              # Build the Worker URL in the shell so that ${CF_ACCOUNT_ID}
+              # (job-level env) expands to the real account id. The previous
+              # YAML literal would have rendered as
+              # 'https://deadzone-bot.${CF_ACCOUNT_ID}.workers.dev' and
+              # shipped a broken link into the run summary.
+              if [[ -n "${CF_ACCOUNT_ID:-}" ]]; then
+                echo "- Worker URL: https://${WORKER_NAME}.${CF_ACCOUNT_ID}.workers.dev"
+              else
+                echo "- Worker URL: https://${WORKER_NAME}.<account-id-unavailable>.workers.dev"
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Summary written."
