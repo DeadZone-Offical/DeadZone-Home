@@ -55,7 +55,11 @@ jobs:
       - name: 📥 Checkout private DeadZone Bot
         working-directory: ${{ github.workspace }}
         env:
-          DEADZONE_GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          # Use DEADZONE_BOT_TOKEN (Contents: Read-only on DeadZone-Bot)
+          # rather than GH_TOKEN (Contents: Read-only on DeadZone-File)
+          # for this checkout. GH_TOKEN is not authorized on
+          # DeadZone-Bot and would 403 here. Mirrors bot-deploy.yml.
+          DEADZONE_GH_TOKEN: ${{ secrets.DEADZONE_BOT_TOKEN }}
         run: |
           set -Eeuo pipefail
           bot_dir="$GITHUB_WORKSPACE/bot"
