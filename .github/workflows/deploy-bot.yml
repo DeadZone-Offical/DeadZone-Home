@@ -144,35 +144,33 @@ jobs:
           NO_COLOR: "1"
         run: |
           set -Eeuo pipefail
-          resolve_database_id() {
-            ./node_modules/.bin/wrangler d1 list --json |
-              jq -r --arg name "$D1_NAME" '
-                def rows:
-                  if type == "array" then .
-                  elif (.result | type) == "array" then .result
-                  else []
-                  end;
-                rows
-                | map(select(.name == $name))
-                | .[0]
-                | (.uuid // .id // empty)
-              '
-          }
-
-          database_id="$(resolve_database_id)"
-          if [[ -z "$database_id" ]]; then
-            echo "::error::D1 database '${D1_NAME}' was not found."
+          # Read the D1 database ID directly from the committed wrangler.jsonc.
+          # This avoids requiring the CLOUDFLARE_API_TOKEN to have D1:Read
+          # scope (the token is provisioned for Workers Scripts:Edit
+          # only — sufficient to push secrets and deploy). The previous
+          # `wrangler d1 list --json` API call required D1:Read and
+          # failed with code 10000 in production.
+          config="bot/cloudflare/wrangler.jsonc"
+          [[ -f "${config}" ]] || { echo "::error::Missing ${config}." >&2; exit 1; }
+          database_id="$(
+            jq -er --arg name "${D1_NAME}" '
+              [ (.d1_databases // [])[] | select(.database_name == $name) ]
+              | .[0].database_id // empty
+            ' "${config}"
+          )"
+          if [[ -z "${database_id}" ]]; then
+            echo "::error::D1 database '${D1_NAME}' was not found in ${config}." >&2
             exit 1
           fi
 
-          if [[ ! "$database_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89AaBb][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$ ]] || \
-             [[ "$database_id" == "00000000-0000-0000-0000-000000000000" ]]; then
+          if [[ ! "${database_id}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89AaBb][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$ ]] || \
+             [[ "${database_id}" == "00000000-0000-0000-0000-000000000000" ]]; then
             echo '::error::Resolved D1 database ID is invalid.'
             exit 1
           fi
 
-          echo "::add-mask::$database_id"
-          echo "database_id=$database_id" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::${database_id}"
+          echo "database_id=${database_id}" >> "$GITHUB_OUTPUT"
 
       - name: 📬 Verify build-events Queue
         env:
