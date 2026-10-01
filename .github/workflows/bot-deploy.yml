@@ -522,7 +522,10 @@ jobs:
           jq -e '.ok == true' <<<"${response}" >/dev/null
           echo "Telegram webhook registered."
           echo "  url: ${webhook_url}"
-          echo "  pending_update_count (if resolved): $(jq -r '.result.pending_update_count // "n/a"' <<<"${response}")"
+          # setWebhook returns {ok:true,result:true}; getWebhookInfo
+          # would carry pending_update_count but is a separate call.
+          # Scrub the response so it does not leak via later steps.
+          unset response
           # Scrub the runtime checkout so they do not leak via
           # artifact uploads or post-job cleanup.
           rm -rf "${runtime_dir}"
