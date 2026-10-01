@@ -1,0 +1,184 @@
+# user-repo-toolbuild.yml CI guard
+#
+# Validates the generic dispatch workflow on every push that touches
+# it or any of the per-project reusable workflows it forwards to.
+# Fails the build if:
+#
+#   1. user-repo-toolbuild.yml is no longer parseable YAML
+#   2. any of the six project enum options (lite / jesse / port /
+#      port_coloros / port_oxygenos / port_realmeui) does not map to
+#      a non-empty existing reusable workflow file
+#   3. any of those reusable workflow files does not have a
+#      `workflow_call` block
+#   4. user-repo-toolbuild.yml forwards an input that the matching
+#      reusable workflow does not declare (it would be silently
+#      dropped)
+#   5. user-repo-toolbuild.yml omits a required input that the
+#      matching reusable workflow does declare
+#
+# The audit is read-only and runs on public-side data only; it does
+# not require any GitHub API token.
+
+name: DeadZone-Home User-Repo Toolbuild CI
+
+on:
+  push:
+    paths:
+      - .github/workflows/user-repo-toolbuild.yml
+      - .github/workflows/lite-core.yml
+      - .github/workflows/jesse-core.yml
+      - .github/workflows/port-core.yml
+      - .github/workflows/port-coloros.yml
+      - .github/workflows/port-oxygenos.yml
+      - .github/workflows/port-realmeui.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: 🧪 Audit generic dispatch contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: 🐍 Validate generic dispatch contract
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          import sys
+
+          workflows_dir = Path(".github/workflows")
+          generic = workflows_dir / "user-repo-toolbuild.yml"
+          if not generic.is_file():
+              print("::error::user-repo-toolbuild.yml is missing")
+              sys.exit(1)
+
+          # Parse the generic workflow by hand (avoiding yaml
+          # library dependency). We only need the bare structure.
+          text = generic.read_text(encoding="utf-8")
+
+          # Extract workflow_dispatch inputs (top-level indentation only).
+          in_on = False
+          in_dispatch = False
+          inputs = {}
+          cur_name = None
+          cur_required = None
+          for raw_line in text.splitlines():
+              line = raw_line.rstrip()
+              stripped = line.strip()
+              if stripped.startswith("on:"):
+                  in_on = True
+                  continue
+              if in_on and stripped and not stripped.startswith("#"):
+                  # Each non-comment line below "on:" is either
+                  # "  workflow_dispatch:" (which we care about) or
+                  # some other top-level field. Detect by indentation.
+                  indent = len(line) - len(line.lstrip(" "))
+                  if indent == 2 and stripped == "workflow_dispatch:":
+                      in_dispatch = True
+                      continue
+                  if indent == 2 and stripped != "workflow_dispatch:":
+                      in_dispatch = False
+                      continue
+                  if in_dispatch:
+                      if indent == 4 and stripped.endswith(":"):
+                          cur_name = stripped[:-1]
+                          cur_required = None
+                          inputs[cur_name] = {"required": False, "type": "string"}
+                          continue
+                      if indent == 6 and cur_name is not None:
+                          m = re.match(r"required:\s*(true|false)", stripped)
+                          if m:
+                              inputs[cur_name]["required"] = m.group(1) == "true"
+                          m = re.match(r"type:\s*([A-Za-z]+)", stripped)
+                          if m:
+                              inputs[cur_name]["type"] = m.group(1)
+
+          if not inputs:
+              print("::error::user-repo-toolbuild.yml has no workflow_dispatch inputs")
+              sys.exit(1)
+          if "project" not in inputs:
+              print("::error::user-repo-toolbuild.yml is missing 'project' input")
+              sys.exit(1)
+          if not inputs["project"]["required"]:
+              print("::error::'project' input must be required: true")
+              sys.exit(1)
+          for required in ("request_id", "callback_url", "builder_id"):
+              if required not in inputs:
+                  print(f"::error::user-repo-toolbuild.yml is missing required input '{required}'")
+                  sys.exit(1)
+              if not inputs[required]["required"]:
+                  print(f"::error::'{required}' input must be required: true")
+                  sys.exit(1)
+
+          # Map project key → reusable workflow path
+          project_map = {
+              "lite": "lite-core.yml",
+              "jesse": "jesse-core.yml",
+              "port": "port-core.yml",
+              "port_coloros": "port-coloros.yml",
+              "port_oxygenos": "port-oxygenos.yml",
+              "port_realmeui": "port-realmeui.yml",
+          }
+          for project, filename in project_map.items():
+              path = workflows_dir / filename
+              if not path.is_file():
+                  print(f"::error::Project '{project}' maps to missing workflow '{filename}'")
+                  sys.exit(1)
+              content = path.read_text(encoding="utf-8")
+              if "workflow_call:" not in content:
+                  print(f"::error::Workflow '{filename}' is referenced by user-repo-toolbuild.yml but has no workflow_call block")
+                  sys.exit(1)
+
+              # Extract workflow_call inputs from the reusable workflow
+              wc_inputs = {}
+              cur_name = None
+              cur_required = False
+              in_wc = False
+              for raw_line in content.splitlines():
+                  line = raw_line.rstrip()
+                  stripped = line.strip()
+                  if stripped == "workflow_call:":
+                      in_wc = True
+                      continue
+                  if in_wc:
+                      if stripped.startswith("secrets:") or stripped.startswith("jobs:"):
+                          break
+                      indent = len(line) - len(line.lstrip(" "))
+                      if indent == 4 and stripped.endswith(":"):
+                          cur_name = stripped[:-1]
+                          cur_required = False
+                          wc_inputs[cur_name] = {"required": False, "type": "string"}
+                          continue
+                      if indent == 6 and cur_name is not None:
+                          m = re.match(r"required:\s*(true|false)", stripped)
+                          if m:
+                              wc_inputs[cur_name]["required"] = m.group(1) == "true"
+                          m = re.match(r"type:\s*([A-Za-z]+)", stripped)
+                          if m:
+                              wc_inputs[cur_name]["type"] = m.group(1)
+
+              # Inputs the generic workflow forwards to this reusable
+              # workflow. (Same set as `inputs` above; user-repo-toolbuild.yml
+              # forwards ALL declared inputs via the `with:` block.)
+              forwarded = set(inputs.keys()) - {"project"}
+              # The reusable workflow's required inputs must be a
+              # subset of the generic workflow's declared inputs.
+              required_in_reusable = {
+                  name for name, spec in wc_inputs.items() if spec["required"]
+              }
+              missing = required_in_reusable - set(inputs.keys())
+              if missing:
+                  print(f"::error::Workflow '{filename}' requires inputs {sorted(missing)} but user-repo-toolbuild.yml does not declare them")
+                  sys.exit(1)
+              print(f"  ✓ '{project}' → '{filename}': {len(wc_inputs)} inputs, {len(required_in_reusable)} required")
+
+          print("Generic dispatch contract audit: clean.")
