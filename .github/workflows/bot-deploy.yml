@@ -111,6 +111,7 @@ jobs:
       DEPLOY_MODE: ${{ inputs.mode || 'deploy' }}
       CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      DEADZONE_BOT_TOKEN: ${{ secrets.DEADZONE_BOT_TOKEN }}
       WORKER_NAME: deadzone-bot
       CACHE_KEY_PREFIX: deadzone-bot-deploy-sha
     steps:
