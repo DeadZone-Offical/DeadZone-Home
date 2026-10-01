@@ -1,0 +1,205 @@
+# user-repo-toolbuild.yml
+#
+# Single generic Telegram-dispatch entry point. The Telegram bot
+# (`DeadZone-Offical/DeadZone-Bot`) POSTs a `workflow_dispatch` payload
+# to this file regardless of which project the user picked. The bot
+# does not need to know which per-project launcher file
+# (`build.yml`, `build-jesse.yml`, `port.yml`, …) actually owns the
+# build. This file routes the request to the matching per-project
+# reusable workflow so the existing engine code keeps running
+# unchanged.
+#
+# Concurrency model
+# ----------------
+# Each `workflow_dispatch` invocation creates a fresh GitHub Actions
+# run with its own runner, its own workspace, its own
+# `toolbuild/` checkout, and its own log/artifact uploads. GitHub
+# Actions is responsible for scheduling; 20 simultaneous dispatches
+# become 20 simultaneous independent runs (subject to repo/org
+# concurrency limits). The per-project `concurrency:` block on each
+# reusable workflow continues to enforce "one Lite build, one Jesse
+# build, one Port build, … at a time" — that is preserved.
+
+name: DeadZone-Home User-Repo Toolbuild
+
+concurrency:
+  # Cancelling in-progress is safe: each dispatch is a discrete user
+  # request, not a queued series. A new /start press supersedes the
+  # previous one.
+  group: deadzone-home-user-repo-toolbuild-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 🧩 Selected builder
+        required: true
+        type: choice
+        options:
+          - lite
+          - jesse
+          - port
+          - port_coloros
+          - port_oxygenos
+          - port_realmeui
+      input_url:
+        description: 📥 ROM / firmware HTTPS URL (non-port projects)
+        required: false
+        type: string
+      stock_rom_url:
+        description: 📥 Stock ROM HTTPS URL (port projects only)
+        required: false
+        type: string
+      port_rom_url:
+        description: 📥 Port ROM HTTPS URL (port projects only)
+        required: false
+        type: string
+      build_name:
+        description: 🏷️ Build name — required by `jesse` only
+        required: false
+        type: string
+      builder_name:
+        description: 👤 Builder display name
+        required: false
+        type: string
+      builder_id:
+        description: 💬 Telegram user ID
+        required: true
+        type: string
+      request_id:
+        description: 🆔 DeadZone controlled build request ID
+        required: true
+        type: string
+      callback_url:
+        description: 🔗 Signed DeadZone build-event endpoint
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Resolve which reusable workflow + internal project label each
+# `project` choice maps to. Anything past this gate has the same
+# input contract as the per-project launcher files.
+jobs:
+  resolve:
+    name: 🧭 Resolve builder
+    runs-on: ubuntu-latest
+    outputs:
+      builder_workflow: ${{ steps.map.outputs.builder_workflow }}
+      builder_project: ${{ steps.map.outputs.builder_project }}
+    steps:
+      - name: 🧾 Validate controlled request
+        shell: python
+        env:
+          PROJECT: ${{ inputs.project }}
+          INPUT_URL: ${{ inputs.input_url }}
+          STOCK_ROM_URL: ${{ inputs.stock_rom_url }}
+          PORT_ROM_URL: ${{ inputs.port_rom_url }}
+          BUILD_NAME: ${{ inputs.build_name }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          import os
+          import re
+          from urllib.parse import urlparse
+
+          project = os.environ["PROJECT"].strip()
+          request_id = os.environ["REQUEST_ID"].strip()
+
+          # request_id format is builder-specific, so we accept any
+          # well-formed DeadZone controlled id here (per-builder
+          # format is re-validated by the per-builder reusable
+          # workflow).
+          if not re.fullmatch(r"[A-Za-z0-9_]{1,32}-[A-Za-z0-9_-]{1,80}", request_id):
+              raise SystemExit("Invalid DeadZone request_id")
+
+          if not re.fullmatch(r"https://[^/?#]+", os.environ["CALLBACK_URL"].strip()):
+              raise SystemExit("CALLBACK_URL must be a safe HTTPS URL")
+          parsed_callback = urlparse(os.environ["CALLBACK_URL"].strip())
+          if (
+              parsed_callback.scheme != "https"
+              or not parsed_callback.hostname
+              or parsed_callback.username
+              or parsed_callback.password
+          ):
+              raise SystemExit("CALLBACK_URL must be a safe HTTPS URL")
+
+          if project.startswith("port_") or project == "port":
+              if not os.environ["STOCK_ROM_URL"].strip():
+                  raise SystemExit("Port projects require stock_rom_url")
+              if not os.environ["PORT_ROM_URL"].strip():
+                  raise SystemExit("Port projects require port_rom_url")
+              for label in ("STOCK_ROM_URL", "PORT_ROM_URL"):
+                  value = os.environ[label].strip()
+                  parsed = urlparse(value)
+                  if (
+                      parsed.scheme != "https"
+                      or not parsed.hostname
+                      or parsed.username
+                      or parsed.password
+                      or len(value) > 2048
+                  ):
+                      raise SystemExit(f"{label} must be a safe HTTPS URL")
+          else:
+              if not os.environ["INPUT_URL"].strip():
+                  raise SystemExit("Non-port projects require input_url")
+              value = os.environ["INPUT_URL"].strip()
+              parsed = urlparse(value)
+              if (
+                  parsed.scheme != "https"
+                  or not parsed.hostname
+                  or parsed.username
+                  or parsed.password
+                  or len(value) > 2048
+              ):
+                  raise SystemExit("INPUT_URL must be a safe HTTPS URL")
+
+          if project == "jesse" and not os.environ["BUILD_NAME"].strip():
+              raise SystemExit("jesse requires build_name")
+
+      - name: 🗺️ Map project → reusable workflow
+        id: map
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          set -Eeuo pipefail
+          declare -A workflows=(
+            [lite]=./.github/workflows/lite-core.yml
+            [jesse]=./.github/workflows/jesse-core.yml
+            [port]=./.github/workflows/port.yml
+            [port_coloros]=./.github/workflows/port-coloros.yml
+            [port_oxygenos]=./.github/workflows/port-oxygenos.yml
+            [port_realmeui]=./.github/workflows/port-realmeui.yml
+          )
+          workflow="${workflows[${PROJECT}]:-}"
+          if [[ -z "${workflow}" ]]; then
+            echo "::error::Unsupported project: ${PROJECT}"
+            exit 1
+          fi
+          if [[ ! -s "${workflow}" ]]; then
+            echo "::error::Required reusable workflow is missing: ${workflow#./.github/workflows/}"
+            exit 1
+          fi
+          {
+            echo "builder_workflow=${workflow}"
+            echo "builder_project=${PROJECT}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: 🚀 Build via ${{ inputs.project }}
+    needs: resolve
+    permissions:
+      contents: read
+    uses: ${{ needs.resolve.outputs.builder_workflow }}
+    with:
+      input_url: ${{ inputs.input_url }}
+      stock_rom_url: ${{ inputs.stock_rom_url }}
+      port_rom_url: ${{ inputs.port_rom_url }}
+      build_name: ${{ inputs.build_name }}
+      builder_name: ${{ inputs.builder_name }}
+      builder_id: ${{ inputs.builder_id }}
+      request_id: ${{ inputs.request_id }}
+      callback_url: ${{ inputs.callback_url }}
+    secrets: inherit
