@@ -178,6 +178,15 @@ jobs:
         run: |
           set -Eeuo pipefail
           queue_list="$(./node_modules/.bin/wrangler queues list --page 1 2>&1 || true)"
+          # Rate-limit responses must NOT block the deploy — the queue is
+          # already bound by the existing wrangler.jsonc, so a 10429 here
+          # is transient and a fresh deploy will not silently break the
+          # production worker. Treat rate-limit / transient errors as
+          # "cannot verify, proceeding" rather than failing the run.
+          if grep -qE '\[code: (10429|10000|10001)\]' <<<"${queue_list}"; then
+            echo "::warning::wrangler queues list returned a transient API error; the queue binding in wrangler.jsonc is authoritative. Proceeding."
+            exit 0
+          fi
           if printf '%s\n' "$queue_list" | grep -Eq "(^|[^[:alnum:]_-])${QUEUE_NAME}([^[:alnum:]_-]|$)"; then
             echo "Queue exists: ${QUEUE_NAME}"
             exit 0
@@ -188,6 +197,11 @@ jobs:
           create_status=$?
           set -e
           if ((create_status != 0)) && ! grep -qi 'already exists' <<<"$create_output"; then
+            # Same transient-error tolerance for create.
+            if grep -qE '\[code: (10429|10000|10001)\]' <<<"${create_output}"; then
+              echo "::warning::wrangler queues create returned a transient API error; the queue binding in wrangler.jsonc is authoritative. Proceeding."
+              exit 0
+            fi
             printf '%s\n' "$create_output" >&2
             exit "$create_status"
           fi
