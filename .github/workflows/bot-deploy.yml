@@ -463,6 +463,70 @@ jobs:
           rm -f /tmp/health.json
           echo "Scratch cleaned."
 
+      - name: 🤖 Register Telegram webhook to the new Worker URL
+        if: steps.deploy.outcome == 'success' && steps.resolve.outcome == 'success' && env.DEPLOY_MODE == 'deploy'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          WORKER_URL: ${{ steps.resolve.outputs.worker_url }}
+        run: |
+          set -Eeuo pipefail
+          # The Telegram bot token is the canonical owner of the
+          # webhook registration — without it we cannot tell Telegram
+          # that the Worker URL changed. The token lives in
+          # DeadZone-Offical/DeadZone-File (private), so we read it
+          # via a sparse checkout using GH_TOKEN (which has
+          # Contents: Read-only on that repo).
+          #
+          # We do NOT print, echo, or pass the token through
+          # environment in any log-visible way: every step uses
+          # `set +x` implicitly via `bash` defaults, and the value is
+          # masked via `::add-mask::` before being assigned.
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Missing GH_TOKEN secret in DeadZone-Home. GH_TOKEN is required to read the bot token from DeadZone-File." >&2
+            exit 1
+          fi
+          if [[ -z "${WORKER_URL:-}" ]]; then
+            echo "::error::Worker URL is empty (resolve step did not publish 'worker_url'). Cannot register Telegram webhook." >&2
+            exit 1
+          fi
+          runtime_dir="${RUNNER_TEMP}/deadzone-bot-runtime"
+          rm -rf "${runtime_dir}"
+          mkdir -p "${runtime_dir}"
+          git init -q "${runtime_dir}"
+          git -C "${runtime_dir}" remote add origin \
+            "https://github.com/DeadZone-Offical/DeadZone-File.git"
+          git -C "${runtime_dir}" sparse-checkout init --no-cone
+          printf 'bot.env\n' | git -C "${runtime_dir}" sparse-checkout set --stdin
+          auth_header="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
+          git -C "${runtime_dir}" \
+            -c "http.extraheader=AUTHORIZATION: basic ${auth_header}" \
+            fetch --no-tags --prune --depth=1 origin refs/heads/main
+          git -C "${runtime_dir}" checkout -q FETCH_HEAD
+          test -s "${runtime_dir}/bot.env"
+          token="$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "${runtime_dir}/bot.env" | head -n 1)"
+          if [[ -z "${token}" ]]; then
+            echo "::error::TELEGRAM_BOT_TOKEN not found in DeadZone-File/bot.env." >&2
+            exit 1
+          fi
+          # Mask the token so it never appears in step logs.
+          echo "::add-mask::${token}"
+          webhook_url="${WORKER_URL%/}/telegram/webhook"
+          echo "Registering Telegram webhook: ${webhook_url}"
+          response="$(curl --silent --show-error --fail-with-body \
+            -X POST \
+            "https://api.telegram.org/bot${token}/setWebhook" \
+            --data-urlencode "url=${webhook_url}" \
+            --data-urlencode 'allowed_updates=["message","edited_message","callback_query"]' \
+            --data-urlencode 'drop_pending_updates=false')"
+          jq -e '.ok == true' <<<"${response}" >/dev/null
+          echo "Telegram webhook registered."
+          echo "  url: ${webhook_url}"
+          echo "  pending_update_count (if resolved): $(jq -r '.result.pending_update_count // "n/a"' <<<"${response}")"
+          # Scrub the runtime checkout so they do not leak via
+          # artifact uploads or post-job cleanup.
+          rm -rf "${runtime_dir}"
+
       - name: 📣 Deployment summary
         if: always()
         shell: bash
