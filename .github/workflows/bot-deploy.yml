@@ -291,29 +291,59 @@ jobs:
           # `tee` mirrors Wrangler's stdout/stderr to the log so the
           # run log still shows the full deploy transcript.
           npx wrangler deploy 2>&1 | tee "${wrangler_log}"
+          # The deploy itself succeeded; Wrangler exits non-zero only on
+          # actual upload/auth errors. Reaching this line means the
+          # Worker is live.
           echo "✅ Worker deployed."
-          # Extract the deployed workers.dev URL. Wrangler prints the
-          # workers.dev URL on a line by itself, formatted like:
+          echo "Post-deploy: captured wrangler log (${wrangler_log}, $(wc -l < "${wrangler_log}" | tr -d ' ') lines, $(wc -c < "${wrangler_log}" | tr -d ' ') bytes)."
+          # ----------------------------------------------------------------
+          # Extract the deployed workers.dev URL.
+          #
+          # Wrangler prints the workers.dev URL on a line by itself,
+          # formatted like:
           #   https://<worker-name>.<subdomain>.workers.dev
-          # We grep for any HTTPS URL ending in '.workers.dev' (with an
-          # optional trailing slash) and trim it. The first match is the
-          # canonical URL for the deployed Worker.
-          worker_url="$(
-            grep -oE 'https://[A-Za-z0-9_-]+\.[A-Za-z0-9.-]*workers\.dev/?' "${wrangler_log}" \
-              | head -n 1 \
-              | sed -E 's#/$##'
-          )"
-          if [[ -z "${worker_url:-}" ]]; then
+          #
+          # IMPORTANT pipeline pitfalls under `set -o pipefail`:
+          #
+          #   * `grep | head -n 1`  — `head` closes the pipe after one
+          #     match, which causes `grep` to receive SIGPIPE on its next
+          #     write and exit 141. Under `pipefail` that propagates as
+          #     a pipeline failure, the `worker_url=$(...)` assignment
+          #     then fails, and `set -e` aborts the script with exit 1
+          #     *before* the `::error::` block below can run — which is
+          #     why a SIGPIPE here surfaces as a silent "exit code 1"
+          #     with no diagnostic output.
+          #
+          #   * `grep -oE`         — exits 1 when nothing matches. Under
+          #     `set -o pipefail` that still fails the pipeline.
+          #
+          # To avoid both, we read the log into a bash array (or loop)
+          # without a SIGPIPE-prone `head`, and we treat "no match" as a
+          # distinct, well-explained failure that DOES reach the
+          # `::error::` branch.
+          # ----------------------------------------------------------------
+          worker_url=""
+          echo "Post-deploy: extracting Worker URL from wrangler log…"
+          # Use a here-string read loop — no pipe, no SIGPIPE.
+          while IFS= read -r match; do
+            # Strip exactly one trailing slash if present.
+            worker_url="${match%/}"
+            break
+          done < <(grep -oE 'https://[A-Za-z0-9_-]+\.[A-Za-z0-9.-]*workers\.dev/?' "${wrangler_log}" || true)
+          echo "Post-deploy: validating Worker URL…"
+          if [[ -z "${worker_url}" ]]; then
             echo "::error::Could not derive the deployed Worker URL from Wrangler output. Expected a line matching 'https://<worker>.<subdomain>.workers.dev' in:" >&2
             sed -E 's/^/  | /' "${wrangler_log}" >&2 || true
             echo "::error::If the Worker is deployed to a custom route/domain only (no workers.dev), set WORKER_URL in this workflow env and re-run." >&2
             exit 1
           fi
           echo "Worker URL: ${worker_url}"
+          echo "Post-deploy: publishing worker_url to GITHUB_OUTPUT…"
           echo "worker_url=${worker_url}" >> "$GITHUB_OUTPUT"
           # Best-effort cleanup of the captured log so we don't leak it
           # via later debug steps.
           rm -f "${wrangler_log}"
+          echo "Post-deploy: deploy step complete."
 
       - name: 💾 Persist deploy marker (write the marker file on success)
         if: steps.deploy.outcome == 'success'
