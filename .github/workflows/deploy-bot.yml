@@ -150,7 +150,7 @@ jobs:
           # only — sufficient to push secrets and deploy). The previous
           # `wrangler d1 list --json` API call required D1:Read and
           # failed with code 10000 in production.
-          config="bot/cloudflare/wrangler.jsonc"
+          config="wrangler.jsonc"
           [[ -f "${config}" ]] || { echo "::error::Missing ${config}." >&2; exit 1; }
           database_id="$(
             jq -er --arg name "${D1_NAME}" '
