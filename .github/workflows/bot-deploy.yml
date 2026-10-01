@@ -280,70 +280,117 @@ jobs:
         run: |
           set -Eeuo pipefail
           echo "🚀 Deploying Worker to Cloudflare…"
-          # Capture the full Wrangler output so we can grep the workers.dev
-          # URL that Wrangler prints on a successful deploy. We do NOT
-          # assume the workers.dev subdomain equals the Cloudflare Account
-          # ID — those are independent identifiers in Cloudflare's data
-          # model, and constructing '<worker>.<account_id>.workers.dev'
-          # produces a non-existent hostname.
-          wrangler_log="${RUNNER_TEMP:-/tmp}/wrangler-deploy.log"
-          : > "${wrangler_log}"
-          # `tee` mirrors Wrangler's stdout/stderr to the log so the
-          # run log still shows the full deploy transcript.
-          npx wrangler deploy 2>&1 | tee "${wrangler_log}"
-          # The deploy itself succeeded; Wrangler exits non-zero only on
-          # actual upload/auth errors. Reaching this line means the
-          # Worker is live.
+          # The deploy step is intentionally minimal: it runs
+          # `npx wrangler deploy` and exits. It does NOT try to
+          # discover the deployed Worker URL — Cloudflare's Workers
+          # dev subdomain is independent of the Account ID, so we
+          # cannot construct it from CF_ACCOUNT_ID, and Wrangler's
+          # stdout is not a reliable source of the URL across
+          # versions / log levels / pipe conditions.
+          #
+          # URL resolution lives in the next step (`🌐 Resolve
+          # Worker URL`) and uses the Cloudflare REST API as the
+          # authoritative source.
+          npx wrangler deploy 2>&1
           echo "✅ Worker deployed."
-          echo "Post-deploy: captured wrangler log (${wrangler_log}, $(wc -l < "${wrangler_log}" | tr -d ' ') lines, $(wc -c < "${wrangler_log}" | tr -d ' ') bytes)."
-          # ----------------------------------------------------------------
-          # Extract the deployed workers.dev URL.
+
+      - name: 🌐 Resolve Worker URL via Cloudflare API
+        if: steps.deploy.outcome == 'success' && env.DEPLOY_MODE == 'deploy'
+        id: resolve
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_NAME: ${{ env.WORKER_NAME }}
+          # Explicit override for custom-domain / multi-env deployments.
+          # If set, we use it verbatim and skip the Cloudflare API call.
+          WORKER_URL_OVERRIDE: ${{ vars.WORKER_URL || '' }}
+        run: |
+          set -Eeuo pipefail
+          # Resolve the canonical Worker URL from Cloudflare's API,
+          # NOT from Wrangler stdout and NOT from CF_ACCOUNT_ID. The
+          # workers.dev subdomain is independent of the Account ID
+          # in Cloudflare's data model — constructing
+          # '<worker>.<account_id>.workers.dev' produces a
+          # non-existent hostname.
           #
-          # Wrangler prints the workers.dev URL on a line by itself,
-          # formatted like:
-          #   https://<worker-name>.<subdomain>.workers.dev
+          # Authoritative endpoint (Cloudflare REST API v4):
+          #   GET /accounts/{account_id}/workers/subdomain
+          #   → { "success": true, "result": { "subdomain": "<sub>" } }
           #
-          # IMPORTANT pipeline pitfalls under `set -o pipefail`:
-          #
-          #   * `grep | head -n 1`  — `head` closes the pipe after one
-          #     match, which causes `grep` to receive SIGPIPE on its next
-          #     write and exit 141. Under `pipefail` that propagates as
-          #     a pipeline failure, the `worker_url=$(...)` assignment
-          #     then fails, and `set -e` aborts the script with exit 1
-          #     *before* the `::error::` block below can run — which is
-          #     why a SIGPIPE here surfaces as a silent "exit code 1"
-          #     with no diagnostic output.
-          #
-          #   * `grep -oE`         — exits 1 when nothing matches. Under
-          #     `set -o pipefail` that still fails the pipeline.
-          #
-          # To avoid both, we read the log into a bash array (or loop)
-          # without a SIGPIPE-prone `head`, and we treat "no match" as a
-          # distinct, well-explained failure that DOES reach the
-          # `::error::` branch.
-          # ----------------------------------------------------------------
+          # The required token scope (`Account Settings:Read`) is
+          # already documented as part of CLOUDFLARE_API_TOKEN in the
+          # workflow header.
+
           worker_url=""
-          echo "Post-deploy: extracting Worker URL from wrangler log…"
-          # Use a here-string read loop — no pipe, no SIGPIPE.
-          while IFS= read -r match; do
-            # Strip exactly one trailing slash if present.
-            worker_url="${match%/}"
-            break
-          done < <(grep -oE 'https://[A-Za-z0-9_-]+\.[A-Za-z0-9.-]*workers\.dev/?' "${wrangler_log}" || true)
+
+          # 1) Explicit override path. Useful for custom-domain setups
+          #    or when the Worker has workers.dev disabled entirely.
+          if [[ -n "${WORKER_URL_OVERRIDE}" ]]; then
+            worker_url="${WORKER_URL_OVERRIDE}"
+            echo "Post-deploy: resolved Worker URL from WORKER_URL override."
+          else
+            # 2) Authoritative Cloudflare API path.
+            echo "Post-deploy: querying Cloudflare API for workers.dev subdomain…"
+            subdomain_body="$(mktemp)"
+            trap 'rm -f "${subdomain_body}"' EXIT
+            http_code="$(
+              curl --silent --show-error --output "${subdomain_body}" \
+                --write-out '%{http_code}' \
+                --max-time 30 \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H 'Content-Type: application/json' \
+                "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/subdomain"
+            )"
+            if [[ "${http_code}" != "200" ]]; then
+              echo "::error::Cloudflare API returned HTTP ${http_code} for GET /accounts/{account_id}/workers/subdomain. Body:" >&2
+              sed -E 's/^/  | /' "${subdomain_body}" >&2 || true
+              echo "::error::Verify CLOUDFLARE_API_TOKEN has 'Account Settings:Read' scope and that CF_ACCOUNT_ID is the account the Worker belongs to." >&2
+              exit 1
+            fi
+            if ! jq -e '.success == true and (.result.subdomain | type == "string") and (.result.subdomain | length > 0)' "${subdomain_body}" >/dev/null; then
+              echo "::error::Cloudflare API returned 200 but the payload is not a recognised {success:true, result:{subdomain:'…'}}. Body:" >&2
+              sed -E 's/^/  | /' "${subdomain_body}" >&2 || true
+              exit 1
+            fi
+            subdomain="$(jq -r '.result.subdomain' "${subdomain_body}")"
+            # Sanity: must look like a workers.dev subdomain label
+            # (lowercase letters, digits, hyphens; not the Account ID).
+            if ! [[ "${subdomain}" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]; then
+              echo "::error::Cloudflare returned subdomain '${subdomain}' which does not look like a workers.dev subdomain label." >&2
+              exit 1
+            fi
+            # Build the canonical workers.dev URL from the API's
+            # authoritative subdomain — explicitly NOT from
+            # CF_ACCOUNT_ID. The Worker name comes from ${{ env.WORKER_NAME }}
+            # which is hardcoded to 'deadzone-bot' in the job env.
+            worker_url="https://${WORKER_NAME}.${subdomain}.workers.dev"
+            echo "Post-deploy: resolved Worker URL from Cloudflare API."
+          fi
+
+          # Strip any trailing slash for downstream composition safety.
+          worker_url="${worker_url%/}"
+
           echo "Post-deploy: validating Worker URL…"
-          if [[ -z "${worker_url}" ]]; then
-            echo "::error::Could not derive the deployed Worker URL from Wrangler output. Expected a line matching 'https://<worker>.<subdomain>.workers.dev' in:" >&2
-            sed -E 's/^/  | /' "${wrangler_log}" >&2 || true
-            echo "::error::If the Worker is deployed to a custom route/domain only (no workers.dev), set WORKER_URL in this workflow env and re-run." >&2
+          if ! [[ "${worker_url}" =~ ^https://[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Resolved Worker URL '${worker_url}' is not a valid HTTPS URL." >&2
             exit 1
           fi
-          echo "Worker URL: ${worker_url}"
+          # Hard guard: the URL MUST NOT contain CF_ACCOUNT_ID. If
+          # it does, we have regressed to the wrong-construction bug
+          # we previously fixed. Fail loudly.
+          if [[ "${worker_url}" == *"${CF_ACCOUNT_ID}"* ]]; then
+            echo "::error::Resolved Worker URL contains CF_ACCOUNT_ID ('${CF_ACCOUNT_ID}'). The workers.dev subdomain is independent of the Account ID; this URL is wrong." >&2
+            exit 1
+          fi
+
+          echo "Post-deploy: resolved Worker URL: ${worker_url}"
           echo "Post-deploy: publishing worker_url to GITHUB_OUTPUT…"
-          echo "worker_url=${worker_url}" >> "$GITHUB_OUTPUT"
-          # Best-effort cleanup of the captured log so we don't leak it
-          # via later debug steps.
-          rm -f "${wrangler_log}"
-          echo "Post-deploy: deploy step complete."
+          printf 'worker_url=%s\n' "${worker_url}" >> "$GITHUB_OUTPUT"
+          # Scrub the API response body so it does not leak via later
+          # debug steps or artifact uploads.
+          rm -f "${subdomain_body:-}" 2>/dev/null || true
+          echo "Post-deploy: URL resolution complete."
 
       - name: 💾 Persist deploy marker (write the marker file on success)
         if: steps.deploy.outcome == 'success'
@@ -367,20 +414,20 @@ jobs:
           key: ${{ env.CACHE_KEY_PREFIX }}-${{ steps.upstream.outputs.sha }}
 
       - name: 🔬 Verify Worker /health
-        if: steps.deploy.outcome == 'success' && env.DEPLOY_MODE == 'deploy'
+        if: steps.deploy.outcome == 'success' && steps.resolve.outcome == 'success' && env.DEPLOY_MODE == 'deploy'
         id: health
         shell: bash
         env:
-          WORKER_URL: ${{ steps.deploy.outputs.worker_url }}
+          WORKER_URL: ${{ steps.resolve.outputs.worker_url }}
         run: |
           set -Eeuo pipefail
-          # Use the Worker URL that the deploy step captured from
-          # `wrangler deploy` output. We do NOT construct it from
-          # ${CF_ACCOUNT_ID} — Cloudflare's Account ID is independent
-          # of the workers.dev subdomain, and the URL the bot is
-          # actually served from is the one Wrangler reports.
+          # Use the Worker URL the resolve step discovered via the
+          # Cloudflare REST API (NOT constructed from ${CF_ACCOUNT_ID}
+          # — the workers.dev subdomain is independent of the Account
+          # ID, and constructing '<worker>.<account_id>.workers.dev'
+          # produces a non-existent hostname).
           if [[ -z "${WORKER_URL:-}" ]]; then
-            echo "::error::Worker URL is empty (deploy step did not publish 'worker_url' to its outputs). Cannot probe /health." >&2
+            echo "::error::Worker URL is empty (resolve step did not publish 'worker_url' to its outputs). Cannot probe /health." >&2
             exit 1
           fi
           url="${WORKER_URL%/}/health"
@@ -426,10 +473,11 @@ jobs:
           DEPLOY_MODE: ${{ env.DEPLOY_MODE }}
           EVENT_NAME: ${{ github.event_name }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          RESOLVE_OUTCOME: ${{ steps.resolve.outcome }}
           HEALTH_OUTCOME: ${{ steps.health.outcome }}
           GATE_RESULT: ${{ steps.gate.outputs.result }}
           CACHE_HIT: ${{ steps.cache-check.outputs.cache-hit }}
-          WORKER_URL: ${{ steps.deploy.outputs.worker_url }}
+          WORKER_URL: ${{ steps.resolve.outputs.worker_url }}
         run: |
           set -Eeuo pipefail
           {
@@ -442,11 +490,13 @@ jobs:
             echo "- Cache hit: \`${CACHE_HIT:-n/a}\`"
             echo "- Gate: \`${GATE_RESULT:-unknown}\`"
             echo "- Deploy step: \`${DEPLOY_OUTCOME:-skipped}\`"
+            echo "- URL resolution: \`${RESOLVE_OUTCOME:-skipped}\`"
             echo "- Health check: \`${HEALTH_OUTCOME:-skipped}\`"
             if [[ "${DEPLOY_MODE}" == "deploy" && "${DEPLOY_OUTCOME}" == "success" && -n "${WORKER_URL:-}" ]]; then
-              # Use the Worker URL that the deploy step captured from
-              # 'wrangler deploy' output (the canonical workers.dev URL),
-              # not a fabricated '<worker>.<account_id>.workers.dev'.
+              # Worker URL is resolved via the Cloudflare REST API
+              # (`GET /accounts/{id}/workers/subdomain`) by the
+              # `🌐 Resolve Worker URL` step — never derived from
+              # CF_ACCOUNT_ID.
               echo "- Worker URL: ${WORKER_URL}"
               echo "- Health: ${WORKER_URL%/}/health"
             fi
