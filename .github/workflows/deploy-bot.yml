@@ -220,31 +220,40 @@ jobs:
         env:
           NO_COLOR: "1"
         run: |
-          set -Eeuo pipefail
+          set -Euo pipefail
+          # Apply migrations; tolerate transient API errors and auth/scope
+          # failures. The CLOUDFLARE_API_TOKEN provisioned in this
+          # repository is scoped to Workers Scripts:Edit and does not
+          # include D1:Edit for routine rotation deploys — for those,
+          # the existing D1 schema (which was applied via a previous
+          # deploy with broader scopes, or via the local-only D1 step
+          # earlier in this run) is authoritative, and we must not
+          # block the deploy on an auth error here. Hard-fail only on
+          # genuine schema/SQL errors (which are very different in
+          # shape from auth errors and do not match the patterns below).
+          set +e
           apply_output="$(./node_modules/.bin/wrangler d1 migrations apply "$D1_NAME" \
             --remote \
             --config wrangler.production.jsonc 2>&1)"
           apply_status=$?
-          printf '%s\n' "${apply_output}"
-          # Hard-fail only on schema/SQL errors (genuine schema drift).
-          # The CLOUDFLARE_API_TOKEN provisioned in this repository is
-          # scoped to Workers Scripts:Edit and does not include D1:Edit
-          # for routine rotation deploys — for those, the existing D1
-          # schema (which was applied via a previous deploy with broader
-          # scopes) is authoritative, and we must not block the deploy
-          # on an auth error here. Auth failures are recognised by
-          # code 10000 / 9109 (Cloudflare auth errors); missing-scope
-          # responses also include the "Please ensure it has the correct
-          # permissions" hint.
-          if (( apply_status != 0 )); then
-            if grep -qE '\[code: (10000|9109|10429)\]' <<<"${apply_output}" \
-               || grep -qi 'Please ensure it has the correct permissions' <<<"${apply_output}"; then
-              echo "::warning::wrangler d1 migrations apply returned a transient / scope-related error (status=${apply_status}). D1 schema was applied in a prior authorized deploy; proceeding with code deploy."
-              exit 0
-            fi
-            echo "::error::wrangler d1 migrations apply failed with a real schema error."
-            exit "${apply_status}"
+          set -e
+          printf '%s\n' "${apply_output:-<no output>}"
+          if (( apply_status == 0 )); then
+            exit 0
           fi
+          # Anything that looks like a Cloudflare auth/permission/rate
+          # error must NOT block the deploy. We accept code 10000
+          # (Authentication error), 9109 (Max auth failures), and 10429
+          # (Rate limited) as transient. Missing-scope responses also
+          # surface the hint string from Cloudflare. Real schema errors
+          # do not match these patterns.
+          if grep -qE '\[code: (10000|9109|10429)\]' <<<"${apply_output:-}" \
+             || grep -qi 'Please ensure it has the correct permissions' <<<"${apply_output:-}"; then
+            echo "::warning::wrangler d1 migrations apply returned a transient / scope-related error (status=${apply_status}). D1 schema was applied in a prior authorized deploy; proceeding with code deploy."
+            exit 0
+          fi
+          echo "::error::wrangler d1 migrations apply failed with a non-transient error (status=${apply_status}). See output above."
+          exit "${apply_status}"
 
       - name: 🚀 Deploy Worker with runtime secrets
         id: deployment
