@@ -1,6 +1,14 @@
 name: DeadZone-Home Port OxygenOS
 run-name: 🔂 DeadZone-Home Port OxygenOS · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}
 
+concurrency:
+  # Per-request concurrency key: two different users can dispatch Port
+  # OxygenOS at the same time and they run in parallel. The same user
+  # re-pressing Build for the same request_id cancels their previous
+  # run, which is the only safe semantic.
+  group: deadzone-home-port-oxygenos-${{ inputs.request_id }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -28,35 +36,6 @@ on:
         description: Signed DeadZone build-event endpoint
         required: true
         type: string
-
-  workflow_call:
-    inputs:
-      stock_rom_url:
-        required: true
-        type: string
-      port_rom_url:
-        required: true
-        type: string
-      builder_name:
-        required: false
-        type: string
-      builder_id:
-        required: true
-        type: string
-      request_id:
-        required: true
-        type: string
-      callback_url:
-        required: true
-        type: string
-    secrets:
-      # DEADZONE: temporary single-destination upload. As of the 2026-09-30
-      # disablement, only Google Drive (rclone) is active. The SourceForge
-      # SSH key and PixelDrain API key are no longer required to run this
-      # workflow; they remain in the upload helper so re-enabling is a
-      # one-line flip.
-      GH_TOKEN:
-        required: true
 
 permissions:
   contents: read

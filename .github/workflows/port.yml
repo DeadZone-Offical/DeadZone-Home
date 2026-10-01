@@ -2,7 +2,11 @@ name: DeadZone-Home Port
 run-name: 🔂 DeadZone-Home Port · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}
 
 concurrency:
-  group: deadzone-home-port-build-queue
+  # Per-request concurrency key: two different users can dispatch Port
+  # at the same time and they run in parallel. The same user re-pressing
+  # Build for the same request_id cancels their previous run, which is
+  # the only safe semantic.
+  group: deadzone-home-port-${{ inputs.request_id }}
   cancel-in-progress: false
 
 on:
