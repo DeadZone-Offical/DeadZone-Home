@@ -150,3 +150,45 @@
 <p align="center">
   <sub>DeadZone ROM Engineering — GamingPlus · Legend · Ninja · Lite · Port · Framework</sub>
 </p>
+
+---
+
+## 📚 Build Contract & Architecture
+
+The DeadZone-Home build network follows a **reusable build contract** — every
+master workflow (`lite.yml`, `jesse.yml`, `custom-gamingplus.yml`,
+`custom-legend.yml`, `custom-ninja.yml`, `port*.yml`) implements the same
+eleven-step lifecycle (validate → checkout runtime → load runtime →
+checkout engine → install deps → build → pack → upload → notify →
+cleanup).
+
+Read these two documents before adding a new ROM project:
+
+- [`docs/REUSABLE_BUILD_CONTRACT.md`](./docs/REUSABLE_BUILD_CONTRACT.md) —
+  the shared lifecycle, the `workflow_call` / `workflow_dispatch`
+  contract, the central-runtime contract, and the `rom_url` vs
+  `port_pair` split.
+- [`docs/WORKFLOWS.md`](./docs/WORKFLOWS.md) — tour of
+  `.github/workflows/` and the master-vs-wrapper pattern.
+- [`docs/BUILD_SYSTEM_ARCHITECTURE.md`](./docs/BUILD_SYSTEM_ARCHITECTURE.md) —
+  the cross-repo map (bot ↔ home ↔ central runtime).
+
+### Numbered Workers (Concurrency Pool)
+
+Every ROM project that ships with a dedicated engine (gamingplus,
+legend, ninja) gets a **master workflow** plus five **numbered
+worker wrappers**:
+
+```text
+custom-gamingplus.yml      # master — full implementation, workflow_dispatch + workflow_call
+custom-gamingplus-1.yml    # thin wrapper, workflow_dispatch → uses: ./custom-gamingplus.yml
+custom-gamingplus-2.yml    # ↑ each wrapper has its own concurrency group
+custom-gamingplus-3.yml    # so 5 builds of the same project can run concurrently
+custom-gamingplus-4.yml
+custom-gamingplus-5.yml
+```
+
+The Telegram bot **always dispatches the master** (`custom-gamingplus.yml`).
+The numbered wrappers exist for self-hosted runners and manual builds
+that want to pin a single builder slot. Adding a new project means
+adding a master plus 0–5 wrappers, never replacing the master.
