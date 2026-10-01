@@ -132,6 +132,17 @@
 
 ---
 
+## 📚 Documentation
+
+- **[Reusable Build Contract](docs/REUSABLE_BUILD_CONTRACT.md)** —
+  the shared build lifecycle, `workflow_call` contract, and how to
+  add a new ROM project in three steps.
+- **[Workflows tour](docs/WORKFLOWS.md)** — index of
+  `.github/workflows/`, master vs wrapper, rom_url vs port_pair,
+  and how to add a new master workflow.
+
+---
+
 <p align="center">
   <strong>🔥 BUILD DIFFERENT • AUTOMATE EVERYTHING • SHIP WITH CONTROL 🔥</strong>
 </p>
