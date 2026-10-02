@@ -19,14 +19,8 @@ back to the bot via signed callback events.
 | Public name | Workflow file | Private engine repository |
 |---|---|---|
 | `Deadzone-Lite` | `.github/workflows/deadzone-lite.yml` | `DeadZone-Offical/DeadZone-xiaomi_Lite` |
-| `DeadZone-GaimngPlus` | `.github/workflows/deadzone-gaimngplus.yml` | `DeadZone-Offical/DeadZone-xiaomi_GamingPlus` |
-| `DeadZone-Legend` | `.github/workflows/deadzone-legend.yml` | `DeadZone-Offical/DeadZone-xiaomi_Legend` |
-| `DeadZone-Ninja` | `.github/workflows/deadzone-ninja.yml` | `DeadZone-Offical/DeadZone-xiaomi_Ninja` |
-| `DeadZoneJesi` | `.github/workflows/deadzone-jesi.yml` | `DeadZone-Offical/DeadZone_MysticGSI` |
-| `DeadZone-Fastboot` | `.github/workflows/deadzone-fastboot.yml` | `DeadZone-Offical/DeadZone-Fastboot-Doctor` |
 | `DeadZone-Xiaomi-Port` | `.github/workflows/deadzone-xiaomi-port.yml` | `DeadZone-Offical/DeadZone-xiaomi_Port` |
-| `DeadZone-ColorOS-Port` | `.github/workflows/deadzone-coloros-port.yml` | `DeadZone-Offical/DeadZone-ColorOS_Port` |
-| `DeadZone-Oxgen-Port` | `.github/workflows/deadzone-oxgen-port.yml` | `DeadZone-Offical/DeadZone-OxygenOS_Port` |
+| `DeadZone-Fastboot` | `.github/workflows/deadzone-fastboot.yml` | `DeadZone-Offical/DeadZone-SuperInspector` |
 
 ## Required secrets
 
