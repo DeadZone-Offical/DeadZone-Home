@@ -217,7 +217,7 @@ jobs:
           ref: main
           token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           path: toolbuild
-          lfs: true
+          lfs: false
           fetch-depth: 1
           persist-credentials: false
 
@@ -226,18 +226,25 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # `actions/checkout@v4` retries LFS fetches 3 times (~35s)
-          # before giving up with a generic 404. Re-run the fetch once
-          # here and emit a precise list of any objects the server
-          # is still missing so the operator gets an actionable
-          # diagnostic instead of a stack of identical 404 lines.
-          missing="$(git lfs ls-files 2>/dev/null | awk '{print $3}' || true)"
-          if [[ -z "$missing" ]]; then
+          # `actions/checkout@v4` with `lfs: true` retries the LFS
+          # fetch three times (~35s) before failing with a stack of
+          # identical 404 lines. With `lfs: false` the checkout above
+          # leaves the LFS pointer files in place and we perform a
+          # single explicit fetch here so any missing objects surface
+          # as an actionable diagnostic in one attempt.
+          if ! command -v git-lfs >/dev/null 2>&1 && ! git lfs version >/dev/null 2>&1; then
+            echo "Installing git-lfs..."
+            curl -fsSL https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-linux-amd64-v3.5.1.tar.gz \
+              | tar -xz -C /tmp git-lfs \
+              && sudo install -m 0755 /tmp/git-lfs /usr/local/bin/git-lfs
+            git lfs install --local
+          fi
+          expected="$(git lfs ls-files 2>/dev/null | awk '{print $3}' || true)"
+          if [[ -z "$expected" ]]; then
             echo "No LFS-tracked files in this checkout."
             exit 0
           fi
-          echo "LFS objects expected for this checkout: $(echo "$missing" | wc -l)"
-          echo "Re-running a single LFS fetch to surface any missing objects..."
+          echo "LFS objects expected: $(echo "$expected" | wc -l)"
           git lfs fetch origin main 2>&1 | tee /tmp/lfs-fetch.log || true
           not_found="$(grep -oE '\[sha256:[0-9a-f]+\] Object does not exist on the server' /tmp/lfs-fetch.log | sort -u || true)"
           if [[ -n "$not_found" ]]; then
