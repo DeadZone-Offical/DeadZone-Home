@@ -17,9 +17,9 @@
 # the SAME Telegram request, but does NOT serialize across different
 # requests.
 
-name: DeadZone-Home Lite
+name: Deadzone-Lite
 
-run-name: 🚀 DeadZone-Home Lite · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}
+run-name: "🚀 Deadzone-Lite · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}"
 
 concurrency:
   # Per-request concurrency key: two different users can dispatch Lite
@@ -33,23 +33,23 @@ on:
   workflow_dispatch:
     inputs:
       input_url:
-        description: 📥 ROM download URL
+        description: "📥 ROM download URL"
         required: true
         type: string
       builder_name:
-        description: 👤 Builder name
+        description: "👤 Builder name"
         required: false
         type: string
       builder_id:
-        description: 💬 Telegram user ID
+        description: "💬 Telegram user ID"
         required: false
         type: string
       request_id:
-        description: 🆔 DeadZone controlled build request ID
+        description: "🆔 DeadZone controlled build request ID"
         required: true
         type: string
       callback_url:
-        description: 🔗 Signed DeadZone build-event endpoint
+        description: "🔗 Signed DeadZone build-event endpoint"
         required: true
         type: string
 
@@ -58,7 +58,7 @@ permissions:
 
 jobs:
   build:
-    name: 🛠️ Build ROM
+    name: "🛠️ Build ROM"
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -75,7 +75,7 @@ jobs:
       DEADZONE_ENABLE_SECONDARY_MIRRORS: "0"
 
     steps:
-      - name: 🧾 Validate controlled request
+      - name: "🧾 Validate controlled request"
         shell: python
         env:
           INPUT_URL: ${{ inputs.input_url }}
@@ -96,31 +96,38 @@ jobs:
               if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
                   raise SystemExit(f"{name} must be a safe HTTPS URL")
 
-      - name: 🔐 Validate launcher credentials
+      - name: "🔐 Validate launcher credentials"
         env:
+          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
-          required=(GH_TOKEN)
+          # Prefer the fine-grained, read-only PAT scoped to the
+          # private source repositories. Fall back to GH_TOKEN for
+          # backward compatibility until the new secret is fully
+          # provisioned.
+          required=(DEADZONE_PRIVATE_READ_TOKEN)
+          missing=0
           for variable_name in "${required[@]}"; do
-            if [[ -z "${!variable_name:-}" ]]; then
-              echo "::error::Missing required repository secret: ${variable_name}"
-              exit 1
+            if [[ -z "${!variable_name:-}" && -z "${GH_TOKEN:-}" ]]; then
+              echo "::error::Missing required launcher secret: ${variable_name}"
+              missing=1
             fi
           done
+          [[ "$missing" == "0" ]]
 
-      - name: 📥 Checkout DeadZone launcher
+      - name: "📥 Checkout DeadZone launcher"
         uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: 📥 Checkout private runtime
+      - name: "📥 Checkout private runtime"
         uses: actions/checkout@v4
         with:
           repository: DeadZone-Offical/DeadZone-File
           ref: main
-          token: ${{ secrets.GH_TOKEN }}
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN || secrets.GH_TOKEN }}
           path: runtime
           fetch-depth: 1
           persist-credentials: false
@@ -135,9 +142,10 @@ jobs:
             publish-website-release.py
           sparse-checkout-cone-mode: false
 
-      - name: ⚙️ Load central runtime
+      - name: "⚙️ Load central runtime"
         id: runtime
         env:
+          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           DEADZONE_CONTROLLED_BUILD: "1"
         run: |
@@ -152,7 +160,7 @@ jobs:
           python3 -m py_compile runtime/report_build_event.py runtime/publish-website-release.py
           runtime/load-build.sh lite
 
-      - name: ✅ Validate loaded runtime
+      - name: "✅ Validate loaded runtime"
         env:
           ENGINE_REPOSITORY: ${{ steps.runtime.outputs.engine_repository }}
         run: |
@@ -181,7 +189,7 @@ jobs:
           printf '::add-mask::%s\n' "$BUILD_PROGRESS_SECRET"
           printf 'DEADZONE_EVENT_SECRET=%s\n' "$BUILD_PROGRESS_SECRET" >> "$GITHUB_ENV"
 
-      - name: 💾 Maximize build space
+      - name: "💾 Maximize build space"
         uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
         with:
           build-mount-path: ${{ github.workspace }}/toolbuild
@@ -191,7 +199,7 @@ jobs:
           remove-android: "true"
           remove-haskell: "true"
 
-      - name: 🧹 Clean unused runner packages
+      - name: "🧹 Clean unused runner packages"
         run: |
           set -euo pipefail
           docker image prune --all --force || true
@@ -200,18 +208,18 @@ jobs:
           sudo apt-get autoremove --purge -y || true
           sudo apt-get clean
 
-      - name: 📦 Checkout private Lite engine
+      - name: "📦 Checkout private Lite engine"
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.runtime.outputs.engine_repository }}
           ref: main
-          token: ${{ secrets.GH_TOKEN }}
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN || secrets.GH_TOKEN }}
           path: toolbuild
           lfs: true
           fetch-depth: 1
           persist-credentials: false
 
-      - name: 🧭 Validate Lite engine layout
+      - name: "🧭 Validate Lite engine layout"
         working-directory: toolbuild
         run: |
           set -euo pipefail
@@ -232,22 +240,22 @@ jobs:
           bash -n uploadROM.sh
           bash -n packROM.sh
 
-      - name: 📣 Start live tracking
+      - name: "📣 Start live tracking"
         working-directory: toolbuild
         run: |
           set -euo pipefail
           python3 notify.py start "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
 
-      - name: 🕒 Set Cairo timezone
+      - name: "🕒 Set Cairo timezone"
         run: sudo timedatectl set-timezone Africa/Cairo
 
-      - name: ☕ Install OpenJDK
+      - name: "☕ Install OpenJDK"
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: 🧰 Install Lite dependencies
+      - name: "🧰 Install Lite dependencies"
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
@@ -272,11 +280,11 @@ jobs:
           sudo pip3 install --break-system-packages --no-cache-dir ConfigObj lz4 zstandard setuptools || \
             sudo pip3 install --no-cache-dir ConfigObj lz4 zstandard setuptools
 
-      - name: 🔓 Grant builder permissions
+      - name: "🔓 Grant builder permissions"
         working-directory: toolbuild
         run: chmod -R u+rwX,go+rX .
 
-      - name: ☁️ Install central Rclone configuration
+      - name: "☁️ Install central Rclone configuration"
         working-directory: toolbuild
         run: |
           set -euo pipefail
@@ -293,105 +301,54 @@ jobs:
           fi
           rclone version
 
-      - name: 🚀 Build ROM
+      - name: "🚀 Build ROM"
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
-          sudo -E bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" 2>&1 | tee build_action.log | tee -a build-full.log
+          sudo -E bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" 2>&1 | tee build_action.log
 
-      - name: 📦 Pack Super
+      - name: "📦 Pack Super"
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
-          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log | tee -a build-full.log
+          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
 
-      - name: 🗜️ Package and upload Google Drive
+      - name: "🗜️ Package and upload Google Drive"
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
-
-          # Report disk space before packaging
-          echo "[PERF][BEFORE PACKAGE]" | tee -a build-full.log
-          df -h / | tail -1 | awk '{print "  Root:", $4, "available"}' | tee -a build-full.log
-          if [[ -d /workspace ]]; then df -h /workspace | tail -1 | awk '{print "  Workspace:", $4, "available"}' | tee -a build-full.log; fi
-          free -h | awk '/^Mem:/ {printf "  Memory: %s total, %s free\n", $2, $7}' | tee -a build-full.log
-          nproc | xargs -I{} echo "  CPU cores: {}" | tee -a build-full.log
-
           set +e
-          sudo -E bash uploadROM.sh 2>&1 | tee -a build_action.log | tee -a build-full.log
+          sudo -E bash uploadROM.sh 2>&1 | tee -a build_action.log
           google_status=${PIPESTATUS[0]}
           set -e
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
 
           mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Lite_*.zip' -print 2>/dev/null)
           if (( ${#final_zips[@]} != 1 )); then
-            echo "::error::Expected exactly one preserved final Lite ZIP; found ${#final_zips[@]}" | tee -a build-full.log
+            echo "::error::Expected exactly one preserved final Lite ZIP; found ${#final_zips[@]}" | tee -a build_action.log
             exit 1
           fi
 
           final_zip="${final_zips[0]}"
           final_name="$(basename "$final_zip")"
-
-          # NOTE: create_zip.py performs streaming integrity validation (constant RAM).
-          # No duplicate full ZIP validation needed here.
-          # DEADZONE_INTEGRITY_VERIFIED is set based on create_zip.py success.
-
           final_size_bytes="$(stat -c '%s' "$final_zip")"
-          final_size_human="$(python3 - "$final_size_bytes" <<'PY'
-          import sys
-          size = int(sys.argv[1])
-          value = float(size)
-          for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-              if value < 1024 or unit == "TiB":
-                  print(f"{size} B" if unit == "B" else f"{value:.2f} {unit}")
-                  break
-              value /= 1024
-          PY
-          )"
           printf 'DEADZONE_FILE_SIZE=%s\nDEADZONE_INTEGRITY_VERIFIED=1\nDEADZONE_RESULT_NAME=%s\n' \
-            "$final_size_human" "$final_name" >> "$GITHUB_ENV"
-
-          echo "[PERF] Final ZIP verified by create_zip.py streaming validation" | tee -a build-full.log
-          echo "[PERF] File size: ${final_size_human}" | tee -a build-full.log
-
-          # Post-package cleanup via centralized helper
-          echo "[PERF][POST-PACKAGE] Running cleanup..." | tee -a build-full.log
-          bash "$GITHUB_WORKSPACE/.github/scripts/runner-cleanup.sh" post-package || true
-
-      - name: ⬆️ Upload SourceForge and PixelDrain
-        working-directory: toolbuild
-        # DEADZONE: secondary mirrors are temporarily disabled. The shared
-        # helper (DeadZone-File/upload-mirrors.sh) no-ops when
-        # DEADZONE_ENABLE_SECONDARY_MIRRORS != "1" while still publishing
-        # the documented DEADZONE_*_URL env vars for downstream consumers.
-        env:
-          DEADZONE_ENABLE_SECONDARY_MIRRORS: "0"
-        run: |
-          set -Eeuo pipefail
-          mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Lite_*.zip' -print 2>/dev/null)
-          (( ${#final_zips[@]} == 1 )) || {
-            echo "::error::Final Lite ZIP is unavailable for mirror upload"
-            exit 1
-          }
-          final_zip="${final_zips[0]}"
-          final_name="$(basename "$final_zip")"
-
-          codename="$(tr '[:lower:]' '[:upper:]' < "$PWD/bin/device/device_f.txt" | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
-          rom_version="$(tr -d '\r\n' < "$PWD/bin/device/base_rom_code.txt")"
-          if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
-            os_folder="${BASH_REMATCH[1]}"
-          elif [[ "$rom_version" =~ ^[Vv]([0-9]+) ]]; then
-            os_folder="MIUI${BASH_REMATCH[1]}"
-          else
-            echo "::error::Unable to derive mirror OS folder from ROM version: ${rom_version}"
-            exit 1
-          fi
+            "$final_size_bytes" "$final_name" >> "$GITHUB_ENV"
 
           google_status="${DEADZONE_GOOGLE_UPLOAD_STATUS:-1}"
-          drive_url="${DEADZONE_GOOGLE_DRIVE_URL:-}"
+          drive_url=""
           if (( google_status == 0 )) && [[ -z "$drive_url" ]]; then
+            codename="$(tr '[:lower:]' '[:upper:]' < "$PWD/bin/device/device_f.txt" | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+            rom_version="$(tr -d '\r\n' < "$PWD/bin/device/base_rom_code.txt")"
+            if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
+              os_folder="${BASH_REMATCH[1]}"
+            elif [[ "$rom_version" =~ ^[Vv]([0-9]+) ]]; then
+              os_folder="MIUI${BASH_REMATCH[1]}"
+            else
+              os_folder=""
+            fi
             drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Lite/${codename}/${os_folder}/${final_name}"
             drive_url="$(rclone --config="$PWD/rclone.conf" link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
             if [[ -n "$drive_url" ]]; then
@@ -406,18 +363,13 @@ jobs:
             export DEADZONE_SET_RESULT_URL=1
           fi
 
-          # Delegate to the central helper. While secondary mirrors are
-          # disabled the script is a no-op success; it still records the
-          # final ZIP name and zero mirror URLs so downstream consumers
-          # behave identically to the previous flow.
           set +e
           bash "$GITHUB_WORKSPACE/runtime/upload-mirrors.sh" \
             "Lite" "$codename" "$os_folder" "$final_zip" "$final_name" \
-            2>&1 | tee -a build_action.log | tee -a build-full.log
+            2>&1 | tee -a build_action.log
           mirror_status=${PIPESTATUS[0]}
           set -e
 
-          # With Drive as the only destination, only a Drive failure is fatal.
           if (( google_status != 0 )); then
             echo "::error::Google Drive upload failed and no secondary mirrors are enabled"
             exit 1
@@ -426,40 +378,14 @@ jobs:
             echo "::warning::upload-mirrors.sh exited with status ${mirror_status}; continuing because Google Drive succeeded"
           fi
 
-      - name: ✅ Send success notification
+      - name: "✅ Send success notification"
         if: success()
         working-directory: toolbuild
         run: |
           set -euo pipefail
           python3 notify.py success "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
 
-      - name: 🌐 Publish Lite release to website
-        if: success()
-        continue-on-error: true
-        working-directory: toolbuild
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          set -Eeuo pipefail
-          [[ -n "${DEADZONE_RESULT_NAME:-}" ]] || {
-            echo "::warning::Website release skipped: final ZIP name is unavailable"
-            exit 0
-          }
-          state_dir="$PWD/bin/device"
-          python3 "$GITHUB_WORKSPACE/runtime/publish-website-release.py" local \
-            --request-id "$DEADZONE_REQUEST_ID" \
-            --edition-version "$(tr -d '\r\n' < Version)" \
-            --codename "$(tr -d '\r\n' < "$state_dir/device_f.txt")" \
-            --rom-version "$(tr -d '\r\n' < "$state_dir/base_rom_code.txt")" \
-            --android-version "$(tr -d '\r\n' < "$state_dir/androidver.txt")" \
-            --region "$(tr -d '\r\n' < "$state_dir/device_type.txt")" \
-            --filename "$DEADZONE_RESULT_NAME" \
-            --artifact-path "$PWD/out/$DEADZONE_RESULT_NAME" \
-            --google-drive-url "${DEADZONE_GOOGLE_DRIVE_URL:-}" \
-            --sourceforge-url "${DEADZONE_SOURCEFORGE_URL:-}" \
-            --pixeldrain-url "${DEADZONE_PIXELDRAIN_URL:-}"
-
-      - name: ❌ Send failure notification
+      - name: "❌ Send failure notification"
         if: failure()
         shell: bash
         run: |
@@ -479,7 +405,7 @@ jobs:
             --project lite \
             --message "DeadZone Lite ROM build failed."
 
-      - name: ⛔ Send cancellation notification
+      - name: "⛔ Send cancellation notification"
         if: cancelled()
         shell: bash
         run: |
@@ -499,21 +425,40 @@ jobs:
             --project lite \
             --message "DeadZone Lite ROM build cancelled."
 
-      - name: 🧽 Cleanup Lite workspace
+      - name: "🧽 Cleanup Lite workspace"
         if: always()
         run: |
           set -Euo pipefail
-          echo "[CLEANUP] Running final Lite workspace cleanup..." | tee -a build-full.log
-          bash "$GITHUB_WORKSPACE/.github/scripts/runner-cleanup.sh" final || true
+          rm -rf toolbuild runtime
           rm -f toolbuild/rclone.conf
 
-      - name: 📋 Upload debug logs
+      - name: "📋 Upload debug logs"
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs-${{ github.run_number }}
           path: |
-            toolbuild/build-full.log
             toolbuild/build_action.log
           retention-days: 1
           if-no-files-found: ignore
+
+      - name: "📣 Build summary"
+        if: always()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+          DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
+          DEADZONE_GOOGLE_DRIVE_URL: ${{ env.DEADZONE_GOOGLE_DRIVE_URL }}
+        run: |
+          {
+            echo "## 🚀 Deadzone-Lite build"
+            echo
+            echo "- Project: \`Deadzone-Lite\`"
+            echo "- Engine repository: \`DeadZone-Offical/DeadZone-xiaomi_Lite\`"
+            echo "- Request ID: \`${DEADZONE_REQUEST_ID}\`"
+            echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
+            [[ -n "${DEADZONE_RESULT_NAME:-}" ]] && echo "- Final ZIP: \`${DEADZONE_RESULT_NAME}\`"
+            [[ -n "${DEADZONE_GOOGLE_DRIVE_URL:-}" ]] && echo "- Drive URL: ${DEADZONE_GOOGLE_DRIVE_URL}"
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,278 @@
+# DeadZone-Home Fastboot
+#
+# Independent Telegram-dispatch workflow for the DeadZone Fastboot
+# Doctor Windows tool. This file is invoked directly by
+# `DeadZone-Offical/DeadZone-Bot` via `workflow_dispatch` whenever a
+# user picks "DeadZone-Fastboot". Each dispatch creates its own
+# GitHub Actions run; Fastboot is NOT routed through any generic
+# dispatcher.
+#
+# Concurrency model
+# ----------------
+# Each `workflow_dispatch` invocation creates a fresh GitHub Actions
+# run with its own runner, its own workspace, its own `fastboot-doctor/`
+# checkout, and its own log/artifact uploads. The request-id-scoped
+# key cancels a previous Fastboot build for the SAME Telegram request,
+# but does NOT serialize across different requests.
+
+name: DeadZone-Fastboot
+
+run-name: "🩺 DeadZone-Fastboot · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}"
+
+concurrency:
+  # Per-request concurrency key: two different users can dispatch
+  # Fastboot at the same time and they run in parallel. The same user
+  # re-pressing Build for the same request_id cancels their previous
+  # run, which is the only safe semantic.
+  group: deadzone-home-fastboot-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      doctor_ref:
+        description: "Fastboot Doctor branch or tag to build"
+        required: true
+        default: "main"
+        type: string
+      builder_name:
+        description: "👤 Builder name"
+        required: false
+        type: string
+      builder_id:
+        description: "💬 Telegram user ID"
+        required: false
+        type: string
+      request_id:
+        description: "🆔 DeadZone controlled build request ID"
+        required: true
+        type: string
+      callback_url:
+        description: "🔗 Signed DeadZone build-event endpoint"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-fastboot-doctor:
+    name: "🛠️ Build Fastboot Doctor"
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+      DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+      DEADZONE_PROJECT: fastboot
+      DEADZONE_CONTROLLED_BUILD: "1"
+      DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+      DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+      DEADZONE_SOURCE_REPOSITORY: ${{ github.repository }}
+
+    steps:
+      - name: "🧾 Validate controlled request"
+        shell: python
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          import os
+          import re
+          from urllib.parse import urlparse
+
+          request_id = os.environ["REQUEST_ID"].strip()
+          if not re.fullmatch(r"fastboot_[A-Za-z0-9]{8,80}", request_id):
+              raise SystemExit("Invalid DeadZone request ID")
+
+          for name in ("CALLBACK_URL",):
+              value = os.environ[name].strip()
+              parsed = urlparse(value)
+              if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                  raise SystemExit(f"{name} must be a safe HTTPS URL")
+
+      - name: "🔐 Validate launcher credentials"
+        env:
+          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        shell: pwsh
+        run: |
+          $missing = 0
+          foreach ($name in @('DEADZONE_PRIVATE_READ_TOKEN','GH_TOKEN')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrEmpty($value)) {
+              Write-Host "::error::Missing required launcher secret: $name"
+              $missing = 1
+            }
+          }
+          if ($missing -eq 1) { exit 1 }
+
+      - name: "📥 Checkout Fastboot Doctor"
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Fastboot-Doctor
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN || secrets.GH_TOKEN }}
+          ref: ${{ inputs.doctor_ref || 'main' }}
+          path: fastboot-doctor
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "🛠️ Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: fastboot-doctor/requirements.txt
+
+      - name: "📦 Install build dependencies"
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r fastboot-doctor/requirements.txt
+          python -m pip install pyinstaller
+
+      - name: "🔍 Validate project structure"
+        shell: pwsh
+        run: |
+          $required = @(
+            "fastboot-doctor/app.py",
+            "fastboot-doctor/build.py",
+            "fastboot-doctor/requirements.txt",
+            "fastboot-doctor/core",
+            "fastboot-doctor/ui",
+            "fastboot-doctor/assets"
+          )
+
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) {
+              throw "Required project path is missing: $path"
+            }
+          }
+
+          if (Test-Path "fastboot-doctor/tests") {
+            throw "The tests directory is forbidden in this project."
+          }
+
+      - name: "🐍 Python syntax check"
+        shell: pwsh
+        run: |
+          $files = @("fastboot-doctor/app.py", "fastboot-doctor/build.py")
+          $files += Get-ChildItem -Recurse -Path fastboot-doctor/core, fastboot-doctor/ui -Filter *.py | ForEach-Object { $_.FullName }
+          python -m py_compile $files
+
+      - name: "📥 Download official Android Platform Tools"
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "platform-tools-windows.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "android-platform-tools"
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $source = Join-Path $extract "platform-tools"
+          $destination = "fastboot-doctor/tools/platform-tools"
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          Copy-Item (Join-Path $source "*") $destination -Recurse -Force
+
+          foreach ($file in @("adb.exe", "fastboot.exe")) {
+            $path = Join-Path $destination $file
+            if (-not (Test-Path $path -PathType Leaf)) {
+              throw "Missing required Platform Tool: $path"
+            }
+            Get-FileHash $path -Algorithm SHA256
+          }
+
+      - name: "🛠️ Build one-file Windows EXE"
+        shell: pwsh
+        run: python fastboot-doctor/build.py --clean --onefile
+
+      - name: "✅ Verify build output"
+        shell: pwsh
+        run: |
+          $exe = "fastboot-doctor/dist/DeadZoneFastbootDoctor.exe"
+          if (-not (Test-Path $exe -PathType Leaf)) {
+            throw "Build did not produce: $exe"
+          }
+          if ((Get-Item $exe).Length -le 0) {
+            throw "The generated EXE is empty."
+          }
+          Write-Host "EXE generated successfully."
+          Get-Item $exe | Format-List FullName, Length, LastWriteTime
+
+      - name: "🛡️ Verify read-only safety rules"
+        shell: pwsh
+        run: |
+          $executionFiles = @(
+            "fastboot-doctor/core/process_runner.py",
+            "fastboot-doctor/core/fastboot_runner.py",
+            "fastboot-doctor/core/adb_runner.py"
+          )
+
+          $forbiddenPatterns = @(
+            "(?i)fastboot(?:\.exe)?\s+(flash|erase|format|reboot|set_active)",
+            "(?i)flashing\s+unlock",
+            "(?i)oem\s+unlock"
+          )
+
+          foreach ($file in $executionFiles) {
+            if (-not (Test-Path $file)) {
+              throw "Missing command-runner module: $file"
+            }
+
+            $lines = Get-Content $file
+            foreach ($line in $lines) {
+              foreach ($pattern in $forbiddenPatterns) {
+                if ($line -match $pattern) {
+                  throw "Forbidden destructive command found in executable runner code: $file"
+                }
+              }
+            }
+          }
+
+          Write-Host "Read-only command safety check passed."
+
+      - name: "🗜️ Package artifact"
+        shell: pwsh
+        run: |
+          $artifact = "fastboot-doctor/dist/DeadZoneFastbootDoctor-Windows.zip"
+          Compress-Archive -Path "fastboot-doctor/dist/DeadZoneFastbootDoctor.exe", "fastboot-doctor/dist/tools" -DestinationPath $artifact -Force
+          if (-not (Test-Path $artifact -PathType Leaf)) {
+            throw "Artifact package was not created."
+          }
+
+      - name: "⬆️ Upload Windows EXE artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZoneFastbootDoctor-Windows
+          path: fastboot-doctor/dist/DeadZoneFastbootDoctor-Windows.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: "❌ Report failed Fastboot build"
+        if: failure()
+        shell: pwsh
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+          DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          Write-Host "::warning::Fastboot Doctor EXE build failed. Reporting to the central event bus is not yet wired into this workflow; the Telegram bot will discover the failure via the missing-artifact condition."
+
+      - name: "🧹 Cleanup Fastboot workspace"
+        if: always()
+        run: rm -rf fastboot-doctor
+
+      - name: "📣 Build summary"
+        if: always()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+        run: |
+          {
+            echo "## 🩺 DeadZone-Fastboot build"
+            echo
+            echo "- Project: \`DeadZone-Fastboot\`"
+            echo "- Engine repository: \`DeadZone-Offical/DeadZone-Fastboot-Doctor\`"
+            echo "- Request ID: \`${DEADZONE_REQUEST_ID}\`"
+            echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"

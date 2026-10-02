@@ -1,141 +1,87 @@
-<p align="center">
-  <img src="./assets/deadzone-rom-command-center.svg" width="100%" alt="DeadZone ROM Build Command Center" />
-</p>
+# DeadZone-Home
 
-<p align="center">
-  <a href="https://github.com/DeadZone-Offical/DeadZone_GamingPlus"><img src="https://img.shields.io/badge/🎮_GamingPlus-PERFORMANCE_ENGINE-7C3AED?style=for-the-badge" alt="DeadZone GamingPlus" /></a>
-  <a href="https://github.com/DeadZone-Offical/DeadZone_Legend"><img src="https://img.shields.io/badge/👑_Legend-FLAGSHIP_CLASS-D97706?style=for-the-badge" alt="DeadZone Legend" /></a>
-  <a href="https://github.com/DeadZone-Offical/DeadZone_Ninja"><img src="https://img.shields.io/badge/🥷_Ninja-STEALTH_FRAMEWORK-111827?style=for-the-badge" alt="DeadZone Ninja" /></a>
-</p>
-<p align="center">
-  <a href="https://github.com/DeadZone-Offical/DeadZone_Lite"><img src="https://img.shields.io/badge/⚡_Lite-CLEAN_DAILY_DRIVER-0EA5E9?style=for-the-badge" alt="DeadZone Lite" /></a>
-  <a href="https://github.com/DeadZone-Offical/DeadZone_Port"><img src="https://img.shields.io/badge/🧩_Port-CROSS_DEVICE_ADAPTATION-2563EB?style=for-the-badge" alt="DeadZone Port" /></a>
-  <a href="https://github.com/DeadZone-Offical/DeadZone-xiaomi_FrameworkPatcher"><img src="https://img.shields.io/badge/🧬_Framework-PATCH_ENGINE-E11D48?style=for-the-badge" alt="DeadZone Framework Patcher" /></a>
-</p>
+`DeadZone-Home` is the lightweight dispatch surface for the DeadZone build
+automation. It contains **only** the centralized GitHub Actions workflows
+that the public Telegram bot (`DeadZone-Offical/DeadZone-Bot`) invokes
+through `workflow_dispatch`, plus the supporting `.gitattributes` that
+keeps shell scripts and Python source LF-clean on Windows checkouts.
 
----
+It does **not** contain engine code, build assets, documentation, or
+tests. Those live in the private engine repositories listed below.
 
-# 🚀 DeadZone ROM Build Network
+## Project → workflow map
 
-**DeadZone Home** is the control center for the DeadZone ROM build ecosystem — a collection of specialized Android build tracks designed for different performance profiles, devices, and framework workflows.
+The bot dispatches one workflow per project. Each workflow is its own
+self-contained build pipeline: it pulls the central runtime, clones the
+private engine repository, runs the build, packages the ROM, and reports
+back to the bot via signed callback events.
 
-<p align="center">
-  <img src="./assets/build-pipeline.svg" width="100%" alt="Animated DeadZone ROM build pipeline" />
-</p>
+| Public name | Workflow file | Private engine repository |
+|---|---|---|
+| `Deadzone-Lite` | `.github/workflows/deadzone-lite.yml` | `DeadZone-Offical/DeadZone-xiaomi_Lite` |
+| `DeadZone-GaimngPlus` | `.github/workflows/deadzone-gaimngplus.yml` | `DeadZone-Offical/DeadZone-xiaomi_GamingPlus` |
+| `DeadZone-Legend` | `.github/workflows/deadzone-legend.yml` | `DeadZone-Offical/DeadZone-xiaomi_Legend` |
+| `DeadZone-Ninja` | `.github/workflows/deadzone-ninja.yml` | `DeadZone-Offical/DeadZone-xiaomi_Ninja` |
+| `DeadZoneJesi` | `.github/workflows/deadzone-jesi.yml` | `DeadZone-Offical/DeadZone_MysticGSI` |
+| `DeadZone-Fastboot` | `.github/workflows/deadzone-fastboot.yml` | `DeadZone-Offical/DeadZone-Fastboot-Doctor` |
+| `DeadZone-Xiaomi-Port` | `.github/workflows/deadzone-xiaomi-port.yml` | `DeadZone-Offical/DeadZone-xiaomi_Port` |
+| `DeadZone-ColorOS-Port` | `.github/workflows/deadzone-coloros-port.yml` | `DeadZone-Offical/DeadZone-ColorOS_Port` |
+| `DeadZone-Oxgen-Port` | `.github/workflows/deadzone-oxgen-port.yml` | `DeadZone-Offical/DeadZone-OxygenOS_Port` |
 
-> **SOURCE → VALIDATE → BUILD → PATCH → PACKAGE → UPLOAD → RELEASE**
+## Required secrets
 
----
+| Secret | Used by | Purpose |
+|---|---|---|
+| `GITHUB_TOKEN` | All workflows | Default token; used for everything inside `DeadZone-Home`. |
+| `DEADZONE_PRIVATE_READ_TOKEN` | All workflows | Fine-grained PAT scoped to `Contents: Read` on the private engine repos and to `DeadZone-Offical/DeadZone-File`. This is the canonical credential for cloning private sources. |
+| `GH_TOKEN` | All workflows | Migration fallback for `DEADZONE_PRIVATE_READ_TOKEN`; kept active until the new secret is fully provisioned. |
+| `GITHUB_BUILD_TOKEN` | `DeadZone-Bot` only | Used by the bot when it dispatches `workflow_dispatch` against this repo. |
 
-# 🎮 DeadZone GamingPlus
+## Layout rules
 
-<p align="center">
-  <a href="https://github.com/DeadZone-Offical/DeadZone_GamingPlus">
-    <img src="./assets/gamingplus.svg" width="100%" alt="DeadZone GamingPlus animated card" />
-  </a>
-</p>
+- One workflow per public project. No per-version, per-codename, or per-flavor
+  workflow files.
+- Each workflow sets its own `concurrency.group` to
+  `deadzone-home-<project>-${{ inputs.request_id }}`. Two different
+  Telegram users can dispatch the same project in parallel; the same
+  user re-pressing Build for the same `request_id` cancels their
+  previous run.
+- The build environment, system packages, scripts, storage management,
+  and curl/rclone pipeline are driven by the central runtime in
+  `DeadZone-Offical/DeadZone-File`. Workflow files do not vendor any of
+  this content.
+- `.gitattributes` keeps shell scripts, Python, YAML, Markdown, and
+  web sources LF, and marks ROM/build artifacts as `binary` so
+  `git checkout` and `git diff` never re-encode them.
 
-**Performance-first ROM engineering.** GamingPlus is built around responsiveness, sustained performance, and a more aggressive tuning direction for users who want speed before subtlety.
+## Local validation (run before opening a PR)
 
-<p align="center"><strong>⚡ PERFORMANCE • 🎯 RESPONSIVENESS • 🔥 GAMING PROFILE</strong></p>
+1. `python -m py_compile $(find .github -name '*.py')` — sanity-check
+   embedded Python.
+2. YAML lint:
 
----
+   ```bash
+   python -c "import sys, glob, yaml
+   for path in sorted(glob.glob('.github/workflows/*.yml')):
+       with open(path, encoding='utf-8') as fh:
+           yaml.safe_load(fh)
+   print('OK')"
+   ```
 
-# 👑 DeadZone Legend
+3. Confirm only the nine expected workflow files are tracked:
 
-<p align="center">
-  <a href="https://github.com/DeadZone-Offical/DeadZone_Legend">
-    <img src="./assets/legend.svg" width="100%" alt="DeadZone Legend animated card" />
-  </a>
-</p>
+   ```bash
+   git ls-files .github/workflows/ | sort
+   ```
 
-**Flagship-focused build line.** Legend presents the premium DeadZone direction with a stronger emphasis on polish, advanced integration, and a heavyweight feature set.
+   The expected list is:
 
-<p align="center"><strong>👑 FLAGSHIP • ✨ PREMIUM • 🏆 ADVANCED</strong></p>
-
----
-
-# 🥷 DeadZone Ninja
-
-<p align="center">
-  <a href="https://github.com/DeadZone-Offical/DeadZone_Ninja">
-    <img src="./assets/ninja.svg" width="100%" alt="DeadZone Ninja animated card" />
-  </a>
-</p>
-
-**Stealth framework integration.** Ninja focuses on controlled, precise system modification with a darker, more tactical identity and framework-heavy workflows.
-
-<p align="center"><strong>🥷 STEALTH • 🧠 FRAMEWORK • 🛡️ CONTROL</strong></p>
-
----
-
-# ⚡ DeadZone Lite
-
-<p align="center">
-  <a href="https://github.com/DeadZone-Offical/DeadZone_Lite">
-    <img src="./assets/lite.svg" width="100%" alt="DeadZone Lite animated card" />
-  </a>
-</p>
-
-**Clean daily-driver architecture.** Lite targets stability, efficiency, and a lean build path without sacrificing the DeadZone core experience.
-
-<p align="center"><strong>⚡ FAST • 🧼 CLEAN • 🔋 EFFICIENT</strong></p>
-
----
-
-# 🧩 DeadZone Port
-
-<p align="center">
-  <a href="https://github.com/DeadZone-Offical/DeadZone_Port">
-    <img src="./assets/port.svg" width="100%" alt="DeadZone Port animated card" />
-  </a>
-</p>
-
-**Cross-device adaptation pipeline.** Port exists for translation between device bases, framework layouts, and platform assumptions — converting one environment into another without losing control of the build chain.
-
-<p align="center"><strong>🧩 ADAPT • 🔄 TRANSFORM • 📱 CROSS-DEVICE</strong></p>
-
----
-
-# 🧬 DeadZone Framework Patcher
-
-<p align="center">
-  <a href="https://github.com/DeadZone-Offical/DeadZone-xiaomi_FrameworkPatcher">
-    <img src="./assets/framework.svg" width="100%" alt="DeadZone Framework Patcher animated card" />
-  </a>
-</p>
-
-**Framework-level patch engineering.** Dedicated tooling for Android framework JAR patching across supported Android generations, packaged as an automated build-and-release pipeline.
-
-<p align="center"><strong>🧬 PATCH • ⚙️ AUTOMATE • 📦 RELEASE</strong></p>
-
----
-
-# ⚙️ Build Control Center
-
-<table>
-<tr>
-<td width="33%" align="center"><b>📥 Intake</b><br/><sub>Controlled build requests enter the queue</sub></td>
-<td width="33%" align="center"><b>🧠 Routing</b><br/><sub>The correct project engine is selected</sub></td>
-<td width="33%" align="center"><b>🏗️ Build</b><br/><sub>Specialized pipelines perform the actual work</sub></td>
-</tr>
-<tr>
-<td width="33%" align="center"><b>🔍 Validation</b><br/><sub>Artifacts and configuration are checked</sub></td>
-<td width="33%" align="center"><b>📦 Packaging</b><br/><sub>ROMs, modules, and patched outputs are prepared</sub></td>
-<td width="33%" align="center"><b>☁️ Delivery</b><br/><sub>Outputs are uploaded and released automatically</sub></td>
-</tr>
-</table>
-
-<p align="center">
-  <img src="https://skillicons.dev/icons?i=androidstudio,java,kotlin,python,bash,linux,git,github,githubactions,docker&perline=10" alt="DeadZone build stack" />
-</p>
-
----
-
-<p align="center">
-  <strong>🔥 BUILD DIFFERENT • AUTOMATE EVERYTHING • SHIP WITH CONTROL 🔥</strong>
-</p>
-
-<p align="center">
-  <sub>DeadZone ROM Engineering — GamingPlus · Legend · Ninja · Lite · Port · Framework</sub>
-</p>
+   - `deadzone-coloros-port.yml`
+   - `deadzone-fastboot.yml`
+   - `deadzone-gaimngplus.yml`
+   - `deadzone-jesi.yml`
+   - `deadzone-legend.yml`
+   - `deadzone-lite.yml`
+   - `deadzone-ninja.yml`
+   - `deadzone-oxgen-port.yml`
+   - `deadzone-xiaomi-port.yml`
