@@ -138,7 +138,11 @@ jobs:
           done
           chmod 700 runtime/load-build.sh runtime/upload-mirrors.sh
           python3 -m py_compile runtime/report_build_event.py runtime/publish-website-release.py
-          runtime/load-build.sh gaimngplus
+          # The central runtime loader recognises the engine key as `gamingplus`
+          # (see load-build.sh's case statement) even though the project's
+          # user-facing slug is `gaimngplus`. Forward the engine key here so
+           # the runtime can pick the right engine repository.
+          runtime/load-build.sh gamingplus
 
       - name: "✅ Validate loaded runtime"
         env:
