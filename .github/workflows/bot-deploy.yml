@@ -465,25 +465,30 @@ jobs:
 
       - name: 🤖 Register Telegram webhook to the new Worker URL
         if: steps.deploy.outcome == 'success' && steps.resolve.outcome == 'success' && env.DEPLOY_MODE == 'deploy'
+        id: register
         shell: bash
         env:
           DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           WORKER_URL: ${{ steps.resolve.outputs.worker_url }}
         run: |
           set -Eeuo pipefail
-          # The Telegram bot token is the canonical owner of the
-          # webhook registration — without it we cannot tell Telegram
-          # that the Worker URL changed. The token lives in
-          # DeadZone-Offical/DeadZone-File (private), so we read it
-          # via a sparse checkout using the dedicated fine-grained
-          # DEADZONE_PRIVATE_READ_TOKEN (Contents: Read-only on the
-          # runtime repo and every engine repo). We do not use the
-            # bot dispatch token or any write-capable credential here.
+          # The canonical owner of webhook registration is the Cloudflare
+          # Worker itself, NOT a token stored in DeadZone-File. The
+          # Worker's `wrangler secret put TELEGRAM_BOT_TOKEN` is the
+          # authoritative credential bound to the bot the user is
+          # actually talking to. Reading TELEGRAM_BOT_TOKEN from
+          # `DeadZone-File/bot.env` is unsafe: that file is a
+          # convenience for cross-repo dispatch and can drift away
+          # from the Worker's secret, in which case the webhook gets
+          # re-registered for the wrong bot and the user's real
+          # updates never reach the Worker.
           #
-          # We do NOT print, echo, or pass the token through
-          # environment in any log-visible way: every step uses
-          # `set +x` implicitly via `bash` defaults, and the value is
-          # masked via `::add-mask::` before being assigned.
+          # The Worker exposes POST /admin/register-webhook, which
+          # uses its own TELEGRAM_BOT_TOKEN to call Telegram's
+          # setWebhook. The route is authenticated with the existing
+          # BUILD_EVENT_SECRET shared secret, which the deploy
+          # workflow already pulls from `bot.env`. We do not log
+          # either secret.
           if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
             echo "::error::Missing DEADZONE_PRIVATE_READ_TOKEN secret in DeadZone-Home. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
             exit 1
@@ -506,31 +511,45 @@ jobs:
             fetch --no-tags --prune --depth=1 origin refs/heads/main
           git -C "${runtime_dir}" checkout -q FETCH_HEAD
           test -s "${runtime_dir}/bot.env"
-          token="$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "${runtime_dir}/bot.env" | head -n 1)"
-          if [[ -z "${token}" ]]; then
-            echo "::error::TELEGRAM_BOT_TOKEN not found in DeadZone-File/bot.env." >&2
+          build_event_secret="$(sed -n 's/^BUILD_EVENT_SECRET=//p' "${runtime_dir}/bot.env" | head -n 1)"
+          if [[ -z "${build_event_secret}" ]]; then
+            echo "::error::BUILD_EVENT_SECRET not found in DeadZone-File/bot.env." >&2
             exit 1
           fi
-          # Mask the token so it never appears in step logs.
-          echo "::add-mask::${token}"
+          # Mask the secret so it never appears in step logs.
+          echo "::add-mask::${build_event_secret}"
           webhook_url="${WORKER_URL%/}/telegram/webhook"
-          echo "Registering Telegram webhook: ${webhook_url}"
-          response="$(curl --silent --show-error --fail-with-body \
-            -X POST \
-            "https://api.telegram.org/bot${token}/setWebhook" \
-            --data-urlencode "url=${webhook_url}" \
-            --data-urlencode 'allowed_updates=["message","edited_message","callback_query"]' \
-            --data-urlencode 'drop_pending_updates=false')"
-          jq -e '.ok == true' <<<"${response}" >/dev/null
-          echo "Telegram webhook registered."
-          echo "  url: ${webhook_url}"
-          # setWebhook returns {ok:true,result:true}; getWebhookInfo
-          # would carry pending_update_count but is a separate call.
-          # Scrub the response so it does not leak via later steps.
-          unset response
-          # Scrub the runtime checkout so they do not leak via
-          # artifact uploads or post-job cleanup.
-          rm -rf "${runtime_dir}"
+          echo "Registering Telegram webhook via Worker admin route: ${webhook_url}"
+          response_body="${RUNNER_TEMP}/register.json"
+          http_code="$(
+            curl --silent --show-error --output "${response_body}" \
+              --write-out '%{http_code}' \
+              --max-time 30 \
+              -X POST \
+              -H "Authorization: Bearer ${build_event_secret}" \
+              -H 'Content-Type: application/json' \
+              --data "$(printf '{"url":"%s","drop_pending_updates":false,"allowed_updates":["message","edited_message","callback_query"]}' "${webhook_url}")" \
+              "${WORKER_URL%/}/admin/register-webhook"
+          )"
+          echo "  worker responded HTTP ${http_code}"
+          if [[ "${http_code}" != "200" ]]; then
+            echo "::error::Worker /admin/register-webhook returned HTTP ${http_code}." >&2
+            sed -E 's/^/  | /' "${response_body}" >&2 || true
+            exit 1
+          fi
+          if ! jq -e '.ok == true' "${response_body}" >/dev/null; then
+            echo "::error::Worker /admin/register-webhook did not return ok=true." >&2
+            sed -E 's/^/  | /' "${response_body}" >&2 || true
+            exit 1
+          fi
+          bot_username="$(jq -r '.bot.username // "unknown"' "${response_body}")"
+          echo "Telegram webhook registered via Worker admin route."
+          echo "  bot:    @${bot_username}"
+          echo "  url:    ${webhook_url}"
+          # Scrub the response and the runtime checkout so they do not
+          # leak via artifact uploads or post-job cleanup.
+          unset build_event_secret
+          rm -rf "${runtime_dir}" "${response_body}"
 
       - name: 📣 Deployment summary
         if: always()
