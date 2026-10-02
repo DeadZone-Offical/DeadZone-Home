@@ -170,6 +170,14 @@ jobs:
       - name: "⚙️ Load central runtime"
         id: runtime
         env:
+          # The fine-grained PAT is the single source-of-truth credential
+          # for private source checkouts. load-build.sh reads the engine
+          # bootstrap token from DEADZONE_PRIVATE_TOKEN first, then
+          # PRIVATE_REPO_TOKEN, then GH_TOKEN. Expose the PAT under all
+          # three names so the central runtime can open the private
+          # registry and engine repos without a write-capable fallback.
+          DEADZONE_PRIVATE_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          PRIVATE_REPO_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           DEADZONE_CONTROLLED_BUILD: "1"
         run: |
