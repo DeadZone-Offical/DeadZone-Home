@@ -93,24 +93,18 @@ jobs:
       - name: "🔐 Validate launcher credentials"
         env:
           DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         shell: pwsh
         run: |
-          $missing = 0
-          foreach ($name in @('DEADZONE_PRIVATE_READ_TOKEN','GH_TOKEN')) {
-            $value = [Environment]::GetEnvironmentVariable($name)
-            if ([string]::IsNullOrEmpty($value)) {
-              Write-Host "::error::Missing required launcher secret: $name"
-              $missing = 1
-            }
+          if ([string]::IsNullOrEmpty($env:DEADZONE_PRIVATE_READ_TOKEN)) {
+            Write-Host '::error::Missing required launcher secret: DEADZONE_PRIVATE_READ_TOKEN. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home.'
+            exit 1
           }
-          if ($missing -eq 1) { exit 1 }
 
       - name: "📥 Checkout Fastboot Doctor"
         uses: actions/checkout@v4
         with:
           repository: DeadZone-Offical/DeadZone-Fastboot-Doctor
-          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN || secrets.GH_TOKEN }}
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           ref: ${{ inputs.doctor_ref || 'main' }}
           path: fastboot-doctor
           fetch-depth: 1

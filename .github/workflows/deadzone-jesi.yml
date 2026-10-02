@@ -134,17 +134,12 @@ jobs:
       - name: "🔐 Validate launcher credentials"
         env:
           DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
-          missing=0
-          for variable_name in DEADZONE_PRIVATE_READ_TOKEN GH_TOKEN; do
-            if [[ -z "${!variable_name:-}" ]]; then
-              echo "::error::Missing required launcher secret: ${variable_name}"
-              missing=1
-            fi
-          done
-          [[ "$missing" == "0" ]]
+          if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
+            echo "::error::Missing required launcher secret: DEADZONE_PRIVATE_READ_TOKEN. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
+            exit 1
+          fi
 
       - name: "📥 Checkout Jesi launcher"
         uses: actions/checkout@v4
@@ -157,7 +152,7 @@ jobs:
         with:
           repository: DeadZone-Offical/DeadZone-File
           ref: main
-          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN || secrets.GH_TOKEN }}
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           path: runtime
           fetch-depth: 1
           persist-credentials: false
@@ -176,7 +171,6 @@ jobs:
         id: runtime
         env:
           DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
           DEADZONE_CONTROLLED_BUILD: "1"
         run: |
           set -euo pipefail
@@ -243,7 +237,7 @@ jobs:
         with:
           repository: ${{ steps.runtime.outputs.engine_repository }}
           ref: main
-          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN || secrets.GH_TOKEN }}
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           path: toolbuild
           lfs: true
           fetch-depth: 1

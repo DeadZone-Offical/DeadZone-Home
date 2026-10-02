@@ -94,17 +94,12 @@ jobs:
       - name: "🔐 Validate launcher credentials"
         env:
           DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
-          missing=0
-          for variable_name in DEADZONE_PRIVATE_READ_TOKEN GH_TOKEN; do
-            if [[ -z "${!variable_name:-}" ]]; then
-              echo "::error::Missing required launcher secret: ${variable_name}"
-              missing=1
-            fi
-          done
-          [[ "$missing" == "0" ]]
+          if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
+            echo "::error::Missing required launcher secret: DEADZONE_PRIVATE_READ_TOKEN. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
+            exit 1
+          fi
 
       - name: "📥 Checkout DeadZone launcher"
         uses: actions/checkout@v4
@@ -116,7 +111,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: DeadZone-Offical/DeadZone-File
-          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN || secrets.GH_TOKEN }}
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           ref: main
           path: runtime
           fetch-depth: 1
@@ -126,7 +121,7 @@ jobs:
         id: central
         shell: bash
         env:
-          DEADZONE_PRIVATE_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN || secrets.GH_TOKEN }}
+          DEADZONE_PRIVATE_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
         run: bash runtime/load-build.sh port_oxygenos
 
       - name: "🛡️ Validate Port engine runtime"
@@ -192,7 +187,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.central.outputs.engine_repository }}
-          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN || secrets.GH_TOKEN }}
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           ref: main
           path: toolbuild
           fetch-depth: 1

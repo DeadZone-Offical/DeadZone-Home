@@ -467,7 +467,7 @@ jobs:
         if: steps.deploy.outcome == 'success' && steps.resolve.outcome == 'success' && env.DEPLOY_MODE == 'deploy'
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           WORKER_URL: ${{ steps.resolve.outputs.worker_url }}
         run: |
           set -Eeuo pipefail
@@ -475,15 +475,17 @@ jobs:
           # webhook registration — without it we cannot tell Telegram
           # that the Worker URL changed. The token lives in
           # DeadZone-Offical/DeadZone-File (private), so we read it
-          # via a sparse checkout using GH_TOKEN (which has
-          # Contents: Read-only on that repo).
+          # via a sparse checkout using the dedicated fine-grained
+          # DEADZONE_PRIVATE_READ_TOKEN (Contents: Read-only on the
+          # runtime repo and every engine repo). We do not use the
+            # bot dispatch token or any write-capable credential here.
           #
           # We do NOT print, echo, or pass the token through
           # environment in any log-visible way: every step uses
           # `set +x` implicitly via `bash` defaults, and the value is
           # masked via `::add-mask::` before being assigned.
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "::error::Missing GH_TOKEN secret in DeadZone-Home. GH_TOKEN is required to read the bot token from DeadZone-File." >&2
+          if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
+            echo "::error::Missing DEADZONE_PRIVATE_READ_TOKEN secret in DeadZone-Home. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
             exit 1
           fi
           if [[ -z "${WORKER_URL:-}" ]]; then
@@ -498,7 +500,7 @@ jobs:
             "https://github.com/DeadZone-Offical/DeadZone-File.git"
           git -C "${runtime_dir}" sparse-checkout init --no-cone
           printf 'bot.env\n' | git -C "${runtime_dir}" sparse-checkout set --stdin
-          auth_header="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
+          auth_header="$(printf 'x-access-token:%s' "${DEADZONE_PRIVATE_READ_TOKEN}" | base64 -w0)"
           git -C "${runtime_dir}" \
             -c "http.extraheader=AUTHORIZATION: basic ${auth_header}" \
             fetch --no-tags --prune --depth=1 origin refs/heads/main
