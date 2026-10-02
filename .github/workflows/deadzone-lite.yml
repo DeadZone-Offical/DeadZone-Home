@@ -148,8 +148,6 @@ jobs:
           # PRIVATE_REPO_TOKEN, then GH_TOKEN. Expose the PAT under all
           # three names so the central runtime can open the private
           # registry and engine repos without a write-capable fallback.
-          DEADZONE_PRIVATE_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
-          PRIVATE_REPO_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           DEADZONE_CONTROLLED_BUILD: "1"
         run: |
@@ -222,6 +220,35 @@ jobs:
           lfs: true
           fetch-depth: 1
           persist-credentials: false
+
+      - name: "🔍 Verify Lite engine LFS objects"
+        working-directory: toolbuild
+        shell: bash
+        run: |
+          set -uo pipefail
+          # `actions/checkout@v4` retries LFS fetches 3 times (~35s)
+          # before giving up with a generic 404. Re-run the fetch once
+          # here and emit a precise list of any objects the server
+          # is still missing so the operator gets an actionable
+          # diagnostic instead of a stack of identical 404 lines.
+          missing="$(git lfs ls-files 2>/dev/null | awk '{print $3}' || true)"
+          if [[ -z "$missing" ]]; then
+            echo "No LFS-tracked files in this checkout."
+            exit 0
+          fi
+          echo "LFS objects expected for this checkout: $(echo "$missing" | wc -l)"
+          echo "Re-running a single LFS fetch to surface any missing objects..."
+          git lfs fetch origin main 2>&1 | tee /tmp/lfs-fetch.log || true
+          not_found="$(grep -oE '\[sha256:[0-9a-f]+\] Object does not exist on the server' /tmp/lfs-fetch.log | sort -u || true)"
+          if [[ -n "$not_found" ]]; then
+            echo
+            echo "::error::DeadZone Lite engine is missing the following Git LFS objects on the server:"
+            echo "$not_found" | sed 's/^/  - /'
+            echo
+            echo "Push the corresponding binaries to DeadZone-Offical/DeadZone-xiaomi_Lite and re-run."
+            exit 1
+          fi
+          echo "All LFS objects fetched successfully."
 
       - name: "🧭 Validate Lite engine layout"
         working-directory: toolbuild
@@ -393,7 +420,12 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -uo pipefail
+          # The central-runtime checkout may have failed (or never
+          # ran) before this step executes, so `runtime/` may be
+          # absent. `DEADZONE_EVENT_SECRET` is also already in the
+          # environment from the successful runtime-load step, so the
+          # conditional source is best-effort.
           if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
             set -a
             # shellcheck disable=SC1091
@@ -401,19 +433,23 @@ jobs:
             set +a
             export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:-}"
           fi
-          [[ -n "${DEADZONE_EVENT_SECRET:-}" ]] || {
-            echo '::error::Terminal Lite event cannot be signed because the central event secret is unavailable.'
-            exit 1
-          }
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" ]]; then
+            echo '::warning::Terminal Lite event cannot be signed because the central event secret is unavailable.' >&2
+            exit 0
+          fi
+          if [[ ! -s runtime/report_build_event.py ]]; then
+            echo '::warning::Central runtime report_build_event.py is missing; skipping the terminal failure callback.' >&2
+            exit 0
+          fi
           python3 runtime/report_build_event.py failed \
             --project lite \
-            --message "DeadZone Lite ROM build failed."
+            --message "DeadZone Lite ROM build failed." || true
 
       - name: "⛔ Send cancellation notification"
         if: cancelled()
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -uo pipefail
           if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
             set -a
             # shellcheck disable=SC1091
@@ -421,20 +457,35 @@ jobs:
             set +a
             export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:-}"
           fi
-          [[ -n "${DEADZONE_EVENT_SECRET:-}" ]] || {
-            echo '::error::Terminal Lite event cannot be signed because the central event secret is unavailable.'
-            exit 1
-          }
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" ]]; then
+            echo '::warning::Terminal Lite event cannot be signed because the central event secret is unavailable.' >&2
+            exit 0
+          fi
+          if [[ ! -s runtime/report_build_event.py ]]; then
+            echo '::warning::Central runtime report_build_event.py is missing; skipping the terminal cancellation callback.' >&2
+            exit 0
+          fi
           python3 runtime/report_build_event.py cancelled \
             --project lite \
-            --message "DeadZone Lite ROM build cancelled."
+            --message "DeadZone Lite ROM build cancelled." || true
 
       - name: "🧽 Cleanup Lite workspace"
         if: always()
+        shell: bash
         run: |
-          set -Euo pipefail
-          rm -rf toolbuild runtime
-          rm -f toolbuild/rclone.conf
+          set -uo pipefail
+          # `toolbuild` may be busy if Maximize-build-space mounted an
+          # LVM volume on it, and `runtime` may not exist if the
+          # private-runtime checkout failed before completing. Both
+          # conditions are expected after a failed Lite build, so the
+          # cleanup is best-effort and never fails the job.
+          if mountpoint -q toolbuild 2>/dev/null; then
+            echo "Unmounting toolbuild (was a build-space mount point)"
+            sudo umount toolbuild || true
+          fi
+          rm -rf toolbuild runtime 2>/dev/null || true
+          rm -f toolbuild/rclone.conf 2>/dev/null || true
+          echo "Lite workspace cleanup complete"
 
       - name: "📋 Upload debug logs"
         if: always()

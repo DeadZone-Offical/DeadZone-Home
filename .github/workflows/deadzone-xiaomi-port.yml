@@ -121,7 +121,7 @@ jobs:
         id: central
         shell: bash
         env:
-          DEADZONE_PRIVATE_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
         run: bash runtime/load-build.sh port_xiaomi
 
       - name: "🛡️ Validate Port engine runtime"
