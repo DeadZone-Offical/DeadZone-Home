@@ -50,6 +50,10 @@ on:
         description: "💬 Telegram user ID"
         required: true
         type: string
+      builder_username:
+        description: "🔗 Telegram username (without leading @)"
+        required: false
+        type: string
       request_id:
         description: "🆔 DeadZone controlled build request ID"
         required: true
@@ -74,6 +78,7 @@ jobs:
       DEADZONE_CONTROLLED_BUILD: "1"
       DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
       DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+      DEADZONE_BUILDER_USERNAME: ${{ inputs.builder_username }}
       DEADZONE_SOURCE_REPOSITORY: ${{ github.repository }}
       # The ROM URL is intentionally NOT pushed into the job-level
       # environment; it is only handed to the steps that need it via

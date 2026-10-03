@@ -44,6 +44,10 @@ on:
         description: "💬 Telegram user ID"
         required: false
         type: string
+      builder_username:
+        description: "🔗 Telegram username (without leading @)"
+        required: false
+        type: string
       request_id:
         description: "🆔 DeadZone controlled build request ID"
         required: true
@@ -69,6 +73,7 @@ jobs:
       DEADZONE_INPUT_URL: ${{ inputs.input_url }}
       DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
       DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+      DEADZONE_BUILDER_USERNAME: ${{ inputs.builder_username }}
       DEADZONE_SOURCE_REPOSITORY: ${{ github.repository }}
       # Temporary: keep secondary mirrors disabled while Google Drive is
       # the only active upload destination. Flip to "1" to re-enable.

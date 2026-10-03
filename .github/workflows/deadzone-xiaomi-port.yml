@@ -33,6 +33,10 @@ on:
         description: "Telegram builder ID"
         required: true
         type: string
+      builder_username:
+        description: "🔗 Telegram username (without leading @)"
+        required: false
+        type: string
       request_id:
         description: "DeadZone Port build request ID"
         required: true
@@ -59,6 +63,7 @@ jobs:
       DEADZONE_PORT_ROM_URL: ${{ inputs.port_rom_url }}
       DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
       DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+      DEADZONE_BUILDER_USERNAME: ${{ inputs.builder_username }}
       DEADZONE_SOURCE_REPOSITORY: ${{ github.repository }}
       DEADZONE_ENABLE_SECONDARY_MIRRORS: "0"
 
@@ -271,6 +276,40 @@ jobs:
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Port engine build finished" || true
+          # Port dual identity: the engine writes the sanitized
+          # stock + port device codenames and base ROM versions
+          # into `bin/port/`. We forward each non-empty value as
+          # its own `--stock-*` / `--port-*` flag so the bot's
+          # live panel can render the two framed sub-sections
+          # (Stock info / Port info). Missing files produce
+          # fabricated "Unknown" placeholders if the workflow
+          # would echo them; the empty-array check below ensures
+          # we only forward what the engine actually emitted.
+          stock_args=()
+          port_args=()
+          if [[ -s bin/port/stock_device_f.txt ]]; then
+            stock_device_codename="$(tr '[:lower:]' '[:upper:]' < bin/port/stock_device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+            [[ -n "$stock_device_codename" ]] && stock_args+=(--stock-device-name "$stock_device_codename")
+          fi
+          if [[ -s bin/port/stock_base_rom_code.txt ]]; then
+            stock_rom_version="$(tr -d '\r\n' < bin/port/stock_base_rom_code.txt)"
+            [[ -n "$stock_rom_version" ]] && stock_args+=(--stock-rom-version "$stock_rom_version")
+          fi
+          if [[ -s bin/port/port_device_f.txt ]]; then
+            port_device_codename="$(tr '[:lower:]' '[:upper:]' < bin/port/port_device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+            [[ -n "$port_device_codename" ]] && port_args+=(--port-device-name "$port_device_codename")
+          fi
+          if [[ -s bin/port/port_base_rom_code.txt ]]; then
+            port_rom_version="$(tr -d '\r\n' < bin/port/port_base_rom_code.txt)"
+            [[ -n "$port_rom_version" ]] && port_args+=(--port-rom-version "$port_rom_version")
+          fi
+          if (( ${#stock_args[@]} + ${#port_args[@]} > 0 )); then
+            python3 runtime/build_stage.py reading_rom \
+              --project port_xiaomi \
+              --request-id "$DEADZONE_REQUEST_ID" \
+              --message "Port dual identity captured" \
+              "${stock_args[@]}" "${port_args[@]}" || true
+          fi
 
       - name: "📦 Pack Port ROM"
         working-directory: toolbuild
