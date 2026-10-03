@@ -7,9 +7,21 @@
 # GitHub Actions run; Fastboot is NOT routed through any generic
 # dispatcher.
 #
-# Engine source: DeadZone-Offical/DeadZone-SuperInspector (loaded
-# through the central runtime `FASTBOOT_ENGINE_REPOSITORY` key in
-# DeadZone-Offical/DeadZone-File/projects.env, never hard-coded).
+# User-facing contract (post Fastboot ROM-URL migration):
+#   - input_url      — direct HTTPS ROM download URL (REQUIRED, validated)
+#   - builder_name   — display name from Telegram (REQUIRED for the
+#                       signed-event correlation)
+#   - builder_id     — Telegram numeric user id (REQUIRED)
+#   - request_id     — `fastboot_[A-Za-z0-9]{8,80}` correlation id
+#                       minted by the bot (REQUIRED)
+#   - callback_url   — signed DeadZone build-event endpoint (REQUIRED)
+#
+# The engine repository stays fixed at
+# `DeadZone-Offical/DeadZone-SuperInspector` and is always checked out
+# at `main`. No `doctor_ref` is accepted: legacy sessions that try to
+# pass one fail closed because the workflow no longer declares that
+# input. The user supplies ONE HTTPS ROM URL and the workflow handles
+# the rest.
 
 name: DeadZone-Fastboot
 
@@ -26,18 +38,17 @@ concurrency:
 on:
   workflow_dispatch:
     inputs:
-      doctor_ref:
-        description: "Fastboot Inspector branch or tag to build"
+      input_url:
+        description: "📥 Direct HTTPS ROM download URL (validated server-side)"
         required: true
-        default: "main"
         type: string
       builder_name:
         description: "👤 Builder name"
-        required: false
+        required: true
         type: string
       builder_id:
         description: "💬 Telegram user ID"
-        required: false
+        required: true
         type: string
       request_id:
         description: "🆔 DeadZone controlled build request ID"
@@ -64,11 +75,17 @@ jobs:
       DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
       DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
       DEADZONE_SOURCE_REPOSITORY: ${{ github.repository }}
+      # The ROM URL is intentionally NOT pushed into the job-level
+      # environment; it is only handed to the steps that need it via
+      # step-level `env:`, so a stray log of `${{ env.* }}` never
+      # reveals the URL.
+      DEADZONE_INPUT_URL: ${{ inputs.input_url }}
 
     steps:
       - name: "🧾 Validate controlled request"
         shell: python
         env:
+          INPUT_URL: ${{ inputs.input_url }}
           REQUEST_ID: ${{ inputs.request_id }}
           CALLBACK_URL: ${{ inputs.callback_url }}
         run: |
@@ -80,11 +97,36 @@ jobs:
           if not re.fullmatch(r"fastboot_[A-Za-z0-9]{8,80}", request_id):
               raise SystemExit("Invalid DeadZone request ID")
 
-          for name in ("CALLBACK_URL",):
+          # Strict HTTPS-only validation that mirrors the bot's
+          # `validateRomUrl` contract:
+          #   - scheme must be exactly `https:`
+          #   - hostname must be present and not loopback / RFC1918 / link-local
+          #   - no embedded credentials
+          #   - no whitespace / control characters
+          # This is the final fail-closed boundary; the bot already
+          # validates the same shape, so a doubly-bad value never reaches
+          # the workflow at all in practice.
+          for name in ("INPUT_URL", "CALLBACK_URL"):
               value = os.environ[name].strip()
+              if not value:
+                  raise SystemExit(f"{name} must not be empty")
+              if any(ch.isspace() for ch in value):
+                  raise SystemExit(f"{name} must not contain whitespace")
               parsed = urlparse(value)
               if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
                   raise SystemExit(f"{name} must be a safe HTTPS URL")
+              hostname = parsed.hostname.lower()
+              if (
+                  hostname == "localhost"
+                  or hostname.endswith(".localhost")
+                  or hostname == "::1"
+                  or hostname.startswith("127.")
+                  or hostname.startswith("10.")
+                  or hostname.startswith("169.254.")
+                  or hostname.startswith("192.168.")
+                  or any(hostname.startswith(f"172.{n}.") for n in range(16, 32))
+              ):
+                  raise SystemExit(f"{name} hostname is not allowed: {hostname}")
 
       - name: "🔐 Validate launcher credentials"
         env:
@@ -169,10 +211,67 @@ jobs:
         with:
           repository: ${{ steps.runtime.outputs.engine_repository }}
           token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
-          ref: ${{ inputs.doctor_ref || 'main' }}
+          # The engine checkout ref is owned by this workflow: the bot
+          # does not collect a ref from the user, and no `doctor_ref`
+          # input is declared. Always pin to the canonical `main` so
+          # builds are reproducible.
+          ref: main
           path: super-inspector
           fetch-depth: 1
           persist-credentials: false
+
+      - name: "📥 Download ROM"
+        shell: pwsh
+        env:
+          ROM_URL: ${{ inputs.input_url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "$env:ROM_URL"
+          if ([string]::IsNullOrWhiteSpace($url)) {
+            throw "ROM_URL is empty"
+          }
+          $parsed = [System.Uri]::new($url)
+          if ($parsed.Scheme -ne 'https') {
+            throw "ROM_URL must use https:// (got $($parsed.Scheme))"
+          }
+
+          $romDir = Join-Path $PWD 'super-inspector\rom'
+          New-Item -ItemType Directory -Path $romDir -Force | Out-Null
+
+          # Derive a safe filename from the URL path. URLs frequently
+          # carry signed query parameters that we MUST NOT echo into
+          # logs or filenames, so we only consume the last path
+          # segment and sanitize it.
+          $segment = ($parsed.Segments | Select-Object -Last 1).Trim('/')
+          if ([string]::IsNullOrWhiteSpace($segment)) {
+            $segment = 'fastboot-rom.bin'
+          }
+          $safeName = ($segment -replace '[^A-Za-z0-9._-]', '_')
+          if ($safeName.Length -gt 96) { $safeName = $safeName.Substring(0, 96) }
+          $dest = Join-Path $romDir $safeName
+
+          Write-Host "::notice::Downloading ROM from $($parsed.Host) (length masked)"
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $url -OutFile $dest -MaximumRedirection 5 -ErrorAction Stop
+
+          if (-not (Test-Path $dest -PathType Leaf)) {
+            throw "ROM download did not produce a file at $dest"
+          }
+          $size = (Get-Item $dest).Length
+          if ($size -le 0) {
+            throw "Downloaded ROM is empty (0 bytes)"
+          }
+          Write-Host "::notice::ROM downloaded: $safeName ($size bytes)"
+
+          # Mask the URL anywhere it might appear in subsequent step
+          # output, and publish only the on-disk path + a fingerprint
+          # the engine can consume.
+          Write-Host "::add-mask::$url"
+          $sha = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
+          "ROM_PATH=$dest"          | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ROM_FILENAME=$safeName"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ROM_SHA256=$sha"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ROM_URL=$url"            | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: "🛠️ Set up Python"
         uses: actions/setup-python@v5
@@ -181,6 +280,9 @@ jobs:
 
       - name: "📦 Install build dependencies"
         shell: pwsh
+        env:
+          ROM_PATH: ${{ env.ROM_PATH }}
+          ROM_URL: ${{ env.ROM_URL }}
         run: |
           python -m pip install --upgrade pip
           if (Test-Path "super-inspector/requirements.txt") {
@@ -190,6 +292,8 @@ jobs:
 
       - name: "🔍 Validate project structure"
         shell: pwsh
+        env:
+          ROM_URL: ${{ env.ROM_URL }}
         run: |
           # SuperInspector is a Python package with an entry point; the
           # workflow only requires that the source tree, the build
@@ -237,6 +341,10 @@ jobs:
 
       - name: "🛠️ Build Inspector distribution"
         shell: bash
+        env:
+          ROM_PATH: ${{ env.ROM_PATH }}
+          ROM_URL: ${{ env.ROM_URL }}
+          ROM_SHA256: ${{ env.ROM_SHA256 }}
         run: |
           set -euo pipefail
           if [[ -x super-inspector/build.sh ]]; then
@@ -247,6 +355,8 @@ jobs:
 
       - name: "🗜️ Package artifact"
         shell: pwsh
+        env:
+          ROM_URL: ${{ env.ROM_URL }}
         run: |
           $artifact = "super-inspector/dist/DeadZoneFastbootInspector-Windows.zip"
           $distRoot = "super-inspector/dist"
@@ -283,6 +393,7 @@ jobs:
           DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
           DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+          ROM_URL: ${{ env.ROM_URL }}
         run: |
           set -uo pipefail
           if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
@@ -318,13 +429,19 @@ jobs:
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
           DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+          ROM_FILENAME: ${{ env.ROM_FILENAME }}
+          ROM_SHA256: ${{ env.ROM_SHA256 }}
+          ROM_URL: ${{ env.ROM_URL }}
         run: |
           {
             echo "## 🩺 DeadZone-Fastboot build"
             echo
             echo "- Project: \`DeadZone-Fastboot\`"
-            echo "- Engine repository: \`DeadZone-Offical/DeadZone-SuperInspector\`"
+            echo "- Engine repository: \`DeadZone-Offical/DeadZone-SuperInspector\` (ref: \`main\`)"
             echo "- Request ID: \`${DEADZONE_REQUEST_ID}\`"
             echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
+            if [[ -n "${ROM_FILENAME:-}" ]]; then
+              echo "- ROM: \`${ROM_FILENAME}\` (sha256: \`${ROM_SHA256:-unknown}\`)"
+            fi
             echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } >> "$GITHUB_STEP_SUMMARY"
