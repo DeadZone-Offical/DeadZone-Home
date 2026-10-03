@@ -27,6 +27,11 @@ jobs:
           repository: DeadZone-Offical/DeadZone-Bot
           ref: main
           path: bot
+          # DEADZONE_BOT_TOKEN is a fine-grained PAT with
+          # `Contents: Read-only` on DeadZone-Bot; the auto-
+          # injected `GITHUB_TOKEN` cannot reach other
+          # repositories, even within the same org.
+          token: ${{ secrets.DEADZONE_BOT_TOKEN }}
 
       - name: "🔍 Query D1 user_flow + bot_dispatch_log + bot_observability"
         shell: bash
