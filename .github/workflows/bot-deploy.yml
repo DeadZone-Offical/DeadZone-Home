@@ -468,7 +468,7 @@ jobs:
         id: register
         shell: bash
         env:
-          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           WORKER_URL: ${{ steps.resolve.outputs.worker_url }}
         run: |
           set -Eeuo pipefail
@@ -485,41 +485,26 @@ jobs:
           #
           # The Worker exposes POST /admin/register-webhook, which
           # uses its own TELEGRAM_BOT_TOKEN to call Telegram's
-          # setWebhook. The route is authenticated with the existing
-          # TELEGRAM_WEBHOOK_SECRET shared secret (Authorization:
-          # Bearer …), which the Worker already has via
-          # `wrangler secret put TELEGRAM_WEBHOOK_SECRET` and which
-          # the deploy workflow reads from `bot.env`. We do not log
-          # either secret.
-          if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
-            echo "::error::Missing DEADZONE_PRIVATE_READ_TOKEN secret in DeadZone-Home. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
+          # setWebhook. The route accepts any of the following
+          # bearers (verified constant-time or via Cloudflare's
+          # `GET /user/tokens/verify`):
+          #   1. CLOUDFLARE_API_TOKEN  — the existing deploy
+          #      secret; the deploy workflow already has it.
+          #   2. env.TELEGRAM_WEBHOOK_SECRET  — kept for backward
+          #      compatibility.
+          #   3. env.BUILD_EVENT_SECRET  — kept for backward
+          #      compatibility.
+          #
+          # We use CLOUDFLARE_API_TOKEN here so this path does not
+          # depend on any credential stored in DeadZone-File/bot.env.
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+            echo "::error::Missing CLOUDFLARE_API_TOKEN secret in DeadZone-Home." >&2
             exit 1
           fi
           if [[ -z "${WORKER_URL:-}" ]]; then
             echo "::error::Worker URL is empty (resolve step did not publish 'worker_url'). Cannot register Telegram webhook." >&2
             exit 1
           fi
-          runtime_dir="${RUNNER_TEMP}/deadzone-bot-runtime"
-          rm -rf "${runtime_dir}"
-          mkdir -p "${runtime_dir}"
-          git init -q "${runtime_dir}"
-          git -C "${runtime_dir}" remote add origin \
-            "https://github.com/DeadZone-Offical/DeadZone-File.git"
-          git -C "${runtime_dir}" sparse-checkout init --no-cone
-          printf 'bot.env\n' | git -C "${runtime_dir}" sparse-checkout set --stdin
-          auth_header="$(printf 'x-access-token:%s' "${DEADZONE_PRIVATE_READ_TOKEN}" | base64 -w0)"
-          git -C "${runtime_dir}" \
-            -c "http.extraheader=AUTHORIZATION: basic ${auth_header}" \
-            fetch --no-tags --prune --depth=1 origin refs/heads/main
-          git -C "${runtime_dir}" checkout -q FETCH_HEAD
-          test -s "${runtime_dir}/bot.env"
-          bearer_token="$(sed -n 's/^TELEGRAM_WEBHOOK_SECRET=//p' "${runtime_dir}/bot.env" | head -n 1)"
-          if [[ -z "${bearer_token}" ]]; then
-            echo "::error::TELEGRAM_WEBHOOK_SECRET not found in DeadZone-File/bot.env." >&2
-            exit 1
-          fi
-          # Mask the token so it never appears in step logs.
-          echo "::add-mask::${bearer_token}"
           webhook_url="${WORKER_URL%/}/telegram/webhook"
           echo "Registering Telegram webhook via Worker admin route: ${webhook_url}"
           response_body="${RUNNER_TEMP}/register.json"
@@ -528,7 +513,7 @@ jobs:
               --write-out '%{http_code}' \
               --max-time 30 \
               -X POST \
-              -H "Authorization: Bearer ${bearer_token}" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H 'Content-Type: application/json' \
               --data "$(printf '{"url":"%s","drop_pending_updates":false,"allowed_updates":["message","edited_message","callback_query"]}' "${webhook_url}")" \
               "${WORKER_URL%/}/admin/register-webhook"
@@ -545,13 +530,12 @@ jobs:
             exit 1
           fi
           bot_username="$(jq -r '.bot.username // "unknown"' "${response_body}")"
+          bot_id="$(jq -r '.bot.id // 0' "${response_body}")"
           echo "Telegram webhook registered via Worker admin route."
-          echo "  bot:    @${bot_username}"
+          echo "  bot:    @${bot_username} (id=${bot_id})"
           echo "  url:    ${webhook_url}"
-          # Scrub the response and the runtime checkout so they do not
-          # leak via artifact uploads or post-job cleanup.
-          unset bearer_token
-          rm -rf "${runtime_dir}" "${response_body}"
+          # Scrub the response so it does not leak via artifact uploads.
+          rm -f "${response_body}"
 
       - name: 📣 Deployment summary
         if: always()
