@@ -486,8 +486,10 @@ jobs:
           # The Worker exposes POST /admin/register-webhook, which
           # uses its own TELEGRAM_BOT_TOKEN to call Telegram's
           # setWebhook. The route is authenticated with the existing
-          # BUILD_EVENT_SECRET shared secret, which the deploy
-          # workflow already pulls from `bot.env`. We do not log
+          # TELEGRAM_WEBHOOK_SECRET shared secret (Authorization:
+          # Bearer …), which the Worker already has via
+          # `wrangler secret put TELEGRAM_WEBHOOK_SECRET` and which
+          # the deploy workflow reads from `bot.env`. We do not log
           # either secret.
           if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
             echo "::error::Missing DEADZONE_PRIVATE_READ_TOKEN secret in DeadZone-Home. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
@@ -511,13 +513,13 @@ jobs:
             fetch --no-tags --prune --depth=1 origin refs/heads/main
           git -C "${runtime_dir}" checkout -q FETCH_HEAD
           test -s "${runtime_dir}/bot.env"
-          build_event_secret="$(sed -n 's/^BUILD_EVENT_SECRET=//p' "${runtime_dir}/bot.env" | head -n 1)"
-          if [[ -z "${build_event_secret}" ]]; then
-            echo "::error::BUILD_EVENT_SECRET not found in DeadZone-File/bot.env." >&2
+          bearer_token="$(sed -n 's/^TELEGRAM_WEBHOOK_SECRET=//p' "${runtime_dir}/bot.env" | head -n 1)"
+          if [[ -z "${bearer_token}" ]]; then
+            echo "::error::TELEGRAM_WEBHOOK_SECRET not found in DeadZone-File/bot.env." >&2
             exit 1
           fi
-          # Mask the secret so it never appears in step logs.
-          echo "::add-mask::${build_event_secret}"
+          # Mask the token so it never appears in step logs.
+          echo "::add-mask::${bearer_token}"
           webhook_url="${WORKER_URL%/}/telegram/webhook"
           echo "Registering Telegram webhook via Worker admin route: ${webhook_url}"
           response_body="${RUNNER_TEMP}/register.json"
@@ -526,7 +528,7 @@ jobs:
               --write-out '%{http_code}' \
               --max-time 30 \
               -X POST \
-              -H "Authorization: Bearer ${build_event_secret}" \
+              -H "Authorization: Bearer ${bearer_token}" \
               -H 'Content-Type: application/json' \
               --data "$(printf '{"url":"%s","drop_pending_updates":false,"allowed_updates":["message","edited_message","callback_query"]}' "${webhook_url}")" \
               "${WORKER_URL%/}/admin/register-webhook"
@@ -548,7 +550,7 @@ jobs:
           echo "  url:    ${webhook_url}"
           # Scrub the response and the runtime checkout so they do not
           # leak via artifact uploads or post-job cleanup.
-          unset build_event_secret
+          unset bearer_token
           rm -rf "${runtime_dir}" "${response_body}"
 
       - name: 📣 Deployment summary
