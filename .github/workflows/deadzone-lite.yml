@@ -284,6 +284,20 @@ jobs:
           set -euo pipefail
           python3 notify.py start "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
 
+      - name: "📡 Report starting stage to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 runtime/build_stage.py starting \
+            --project lite \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Runner allocated, fetching engine sources" || true
+
       - name: "🕒 Set Cairo timezone"
         run: sudo timedatectl set-timezone Africa/Cairo
 
@@ -345,12 +359,88 @@ jobs:
           set -Eeuo pipefail
           sudo -E bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" 2>&1 | tee build_action.log
 
+      - name: "📡 Report downloading + reading to bot"
+        if: success()
+        working-directory: toolbuild
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          # The build.sh script is opaque to the workflow layer,
+          # so we cannot emit a real `downloading` progress number
+          # from inside it. We emit the stage transition with no
+          # percentage: the renderer omits the line entirely when
+          # the workflow has not measured a number, so the live
+          # panel still shows "Stage: Downloading" without a fake
+          # percent.
+          python3 runtime/build_stage.py downloading \
+            --project lite \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "ROM download finished" || true
+          # After the build, the engine writes the sanitized
+          # device codename and base ROM code into bin/device/. We
+          # forward them verbatim — the live panel renders them as
+          # `Device:` and `ROM:` only when the engine actually
+          # produced a non-empty value.
+          codename=""
+          rom_version=""
+          if [[ -s bin/device/device_f.txt ]]; then
+            codename="$(tr '[:lower:]' '[:upper:]' < bin/device/device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+          fi
+          if [[ -s bin/device/base_rom_code.txt ]]; then
+            rom_version="$(tr -d '\r\n' < bin/device/base_rom_code.txt)"
+          fi
+          # Build the args list defensively so an empty field does
+          # not turn into an empty --device '' that the stage
+          # reporter would still encode.
+          extra_args=()
+          [[ -n "$codename" ]] && extra_args+=(--device "$codename")
+          [[ -n "$rom_version" ]] && extra_args+=(--rom "$rom_version")
+          python3 runtime/build_stage.py reading_rom \
+            --project lite \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "ROM metadata extracted" \
+            "${extra_args[@]}" || true
+
+      - name: "📡 Report building completion to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 runtime/build_stage.py building \
+            --project lite \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 70 \
+            --message "Engine build finished" || true
+
       - name: "📦 Pack Super"
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
           sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
+
+      - name: "📡 Report packaging completion to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 runtime/build_stage.py packaging \
+            --project lite \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 90 \
+            --message "Super packed" || true
 
       - name: "🗜️ Package and upload Google Drive"
         working-directory: toolbuild
@@ -372,8 +462,13 @@ jobs:
           final_zip="${final_zips[0]}"
           final_name="$(basename "$final_zip")"
           final_size_bytes="$(stat -c '%s' "$final_zip")"
-          printf 'DEADZONE_FILE_SIZE=%s\nDEADZONE_INTEGRITY_VERIFIED=1\nDEADZONE_RESULT_NAME=%s\n' \
-            "$final_size_bytes" "$final_name" >> "$GITHUB_ENV"
+          # Real SHA-256 of the preserved final ZIP. The bot's live
+          # panel forwards this as the `checksum` field on the
+          # succeeded terminal event when the central reporter
+          # reads it from DEADZONE_INTEGRITY_SHA256.
+          final_sha256="$(sha256sum "$final_zip" | awk '{print $1}')"
+          printf 'DEADZONE_FILE_SIZE=%s\nDEADZONE_INTEGRITY_VERIFIED=1\nDEADZONE_RESULT_NAME=%s\nDEADZONE_INTEGRITY_SHA256=%s\nDEADZONE_INTEGRITY_SHA256=%s\n' \
+            "$final_size_bytes" "$final_name" "$final_sha256" "$final_sha256" >> "$GITHUB_ENV"
 
           google_status="${DEADZONE_GOOGLE_UPLOAD_STATUS:-1}"
           drive_url=""
@@ -419,9 +514,27 @@ jobs:
       - name: "✅ Send success notification"
         if: success()
         working-directory: toolbuild
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
           python3 notify.py success "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "lite" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
+          # Terminal succeeded event. The central reporter reads
+          # DEADZONE_RESULT_NAME, DEADZONE_FILE_SIZE, and
+          # DEADZONE_INTEGRITY_SHA256 from the environment and
+          # forwards them as the live panel's output metadata. The
+          # helper is best-effort: a callback failure must not fail
+          # a build that already produced a usable artifact.
+          python3 runtime/build_stage.py uploading \
+            --project lite \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 95 \
+            --message "Upload complete" || true
+          python3 runtime/report_build_event.py succeeded \
+            --project lite \
+            --message "DeadZone Lite build complete." || true
 
       - name: "❌ Send failure notification"
         if: failure()

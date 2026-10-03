@@ -224,6 +224,9 @@ jobs:
         shell: pwsh
         env:
           ROM_URL: ${{ inputs.input_url }}
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           $ErrorActionPreference = 'Stop'
           $url = "$env:ROM_URL"
@@ -272,6 +275,52 @@ jobs:
           "ROM_FILENAME=$safeName"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ROM_SHA256=$sha"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ROM_URL=$url"            | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ROM_SIZE=$size"          | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: "📡 Report starting + downloading to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+          ROM_FILENAME: ${{ env.ROM_FILENAME }}
+          ROM_SHA256: ${{ env.ROM_SHA256 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
+            set -a
+            # shellcheck disable=SC1091
+            source runtime/build.env
+            set +a
+            export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:-}"
+          fi
+          python3 runtime/build_stage.py starting \
+            --project fastboot \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Runner allocated, fetching engine sources" || true
+          # The download step measures the ROM size in bytes, but a
+          # percentage requires a total expected size the workflow
+          # does not know up front. Emit the stage transition with
+          # no percentage so the live panel shows the stage without
+          # fabricating one.
+          python3 runtime/build_stage.py downloading \
+            --project fastboot \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "ROM download finished" || true
+          # After the download, the engine has the real file name
+          # and sha256. Forward them as device metadata: the live
+          # panel renders them as `Device` (filename) and a stage
+          # check point the operator can confirm.
+          extra_args=()
+          if [[ -n "${ROM_FILENAME:-}" ]]; then
+            extra_args+=(--device "${ROM_FILENAME}")
+          fi
+          python3 runtime/build_stage.py reading_rom \
+            --project fastboot \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "ROM metadata extracted" \
+            "${extra_args[@]}" || true
 
       - name: "🛠️ Set up Python"
         uses: actions/setup-python@v5
@@ -345,6 +394,9 @@ jobs:
           ROM_PATH: ${{ env.ROM_PATH }}
           ROM_URL: ${{ env.ROM_URL }}
           ROM_SHA256: ${{ env.ROM_SHA256 }}
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
           if [[ -x super-inspector/build.sh ]]; then
@@ -352,11 +404,19 @@ jobs:
           else
             echo "::notice::No build.sh on this ref; packaging source distribution only."
           fi
+          python3 runtime/build_stage.py building \
+            --project fastboot \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 60 \
+            --message "Inspector build finished" || true
 
       - name: "🗜️ Package artifact"
         shell: pwsh
         env:
           ROM_URL: ${{ env.ROM_URL }}
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           $artifact = "super-inspector/dist/DeadZoneFastbootInspector-Windows.zip"
           $distRoot = "super-inspector/dist"
@@ -376,6 +436,37 @@ jobs:
           if (-not (Test-Path $artifact -PathType Leaf)) {
             throw "Artifact package was not created."
           }
+          $artifactSize = (Get-Item $artifact).Length
+          $artifactSha = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLower()
+          # Real SHA-256 + size of the Fastboot Inspector ZIP. The
+          # bot's live panel forwards them as the output metadata
+          # on the succeeded terminal event when the central
+          # reporter reads them from the environment.
+          "DEADZONE_RESULT_NAME=DeadZoneFastbootInspector-Windows.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DEADZONE_FILE_SIZE=$artifactSize"                          | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DEADZONE_INTEGRITY_SHA256=$artifactSha"                    | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: "📡 Report packaging completion to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
+            set -a
+            # shellcheck disable=SC1091
+            source runtime/build.env
+            set +a
+            export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:-}"
+          fi
+          python3 runtime/build_stage.py packaging \
+            --project fastboot \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 90 \
+            --message "Inspector packaged" || true
 
       - name: "⬆️ Upload Windows artifact"
         uses: actions/upload-artifact@v4
@@ -384,6 +475,40 @@ jobs:
           path: super-inspector/dist/DeadZoneFastbootInspector-Windows.zip
           if-no-files-found: error
           retention-days: 30
+
+      - name: "✅ Report successful Fastboot build"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+          DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -uo pipefail
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
+            set -a
+            # shellcheck disable=SC1091
+            source runtime/build.env
+            set +a
+            export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:-}"
+          fi
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" ]]; then
+            echo '::warning::Terminal Fastboot event cannot be signed because the central event secret is unavailable.' >&2
+            exit 0
+          fi
+          if [[ ! -s runtime/report_build_event.py ]]; then
+            echo '::warning::Central runtime report_build_event.py is missing; skipping the terminal success callback.' >&2
+            exit 0
+          fi
+          python3 runtime/build_stage.py uploading \
+            --project fastboot \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 95 \
+            --message "Artifact upload complete" || true
+          python3 runtime/report_build_event.py succeeded \
+            --project fastboot \
+            --message "DeadZone Fastboot Inspector build complete." || true
 
       - name: "❌ Report failed Fastboot build"
         if: failure()

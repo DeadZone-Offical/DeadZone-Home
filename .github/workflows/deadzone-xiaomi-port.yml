@@ -175,6 +175,20 @@ jobs:
         run: |
           python3 notify.py start "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
 
+      - name: "📡 Report starting stage to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 runtime/build_stage.py starting \
+            --project port_xiaomi \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Runner allocated, fetching engine sources" || true
+
       - name: "🕒 Set Cairo timezone"
         run: sudo timedatectl set-timezone Africa/Cairo
 
@@ -226,6 +240,40 @@ jobs:
             "$DEADZONE_BUILDER_ID" \
             2>&1 | tee build_action.log
 
+      - name: "📡 Report per-ROM stage progress to bot"
+        if: success()
+        working-directory: toolbuild
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          # The Xiaomi Port engine's build.sh is opaque to the
+          # workflow layer, so we cannot emit a real per-ROM
+          # progress number. We emit stage transitions with no
+          # percentage so the live panel still surfaces them
+          # without a fake percent.
+          python3 runtime/build_stage.py downloading_stock \
+            --project port_xiaomi \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Stock ROM download finished" || true
+          python3 runtime/build_stage.py downloading_port \
+            --project port_xiaomi \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Port ROM download finished" || true
+          python3 runtime/build_stage.py building_stock \
+            --project port_xiaomi \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 40 \
+            --message "Stock engine build finished" || true
+          python3 runtime/build_stage.py building_port \
+            --project port_xiaomi \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 75 \
+            --message "Port engine build finished" || true
+
       - name: "📦 Pack Port ROM"
         working-directory: toolbuild
         env:
@@ -234,6 +282,21 @@ jobs:
           set -Eeuo pipefail
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
           sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
+
+      - name: "📡 Report packaging completion to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 runtime/build_stage.py packaging \
+            --project port_xiaomi \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 90 \
+            --message "Port Super packed" || true
 
       - name: "🗜️ Package and upload Google Drive"
         working-directory: toolbuild
@@ -256,7 +319,14 @@ jobs:
 
           final_zip="${final_zips[0]}"
           final_name="$(basename "$final_zip")"
-          printf 'DEADZONE_RESULT_NAME=%s\n' "$final_name" >> "$GITHUB_ENV"
+          # Real SHA-256 of the preserved final ZIP. The bot's live
+          # panel renders it as the `checksum` field on the
+          # succeeded terminal event when the central reporter
+          # reads it from DEADZONE_INTEGRITY_SHA256.
+          final_sha256="$(sha256sum "$final_zip" | awk '{print $1}')"
+          final_size_bytes="$(stat -c '%s' "$final_zip")"
+          printf 'DEADZONE_RESULT_NAME=%s\nDEADZONE_FILE_SIZE=%s\nDEADZONE_INTEGRITY_SHA256=%s\n' \
+            "$final_name" "$final_size_bytes" "$final_sha256" >> "$GITHUB_ENV"
 
           google_status="${DEADZONE_GOOGLE_UPLOAD_STATUS:-1}"
           if (( google_status != 0 )); then
@@ -272,6 +342,17 @@ jobs:
         run: |
           set -euo pipefail
           python3 notify.py success "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
+          # Terminal succeeded event with the output metadata. The
+          # helper is best-effort: a callback failure must not
+          # fail a build that already produced a usable artifact.
+          python3 runtime/build_stage.py uploading \
+            --project port_xiaomi \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --progress 95 \
+            --message "Upload complete" || true
+          python3 runtime/report_build_event.py succeeded \
+            --project port_xiaomi \
+            --message "Port build complete." || true
 
       - name: "❌ Report failed Port build"
         if: failure()
