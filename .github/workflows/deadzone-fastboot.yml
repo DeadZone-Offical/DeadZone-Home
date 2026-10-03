@@ -407,7 +407,6 @@ jobs:
           python3 runtime/build_stage.py building \
             --project fastboot \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 60 \
             --message "Inspector build finished" || true
 
       - name: "🗜️ Package artifact"
@@ -465,7 +464,6 @@ jobs:
           python3 runtime/build_stage.py packaging \
             --project fastboot \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 90 \
             --message "Inspector packaged" || true
 
       - name: "⬆️ Upload Windows artifact"
@@ -504,7 +502,6 @@ jobs:
           python3 runtime/build_stage.py uploading \
             --project fastboot \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 95 \
             --message "Artifact upload complete" || true
           python3 runtime/report_build_event.py succeeded \
             --project fastboot \

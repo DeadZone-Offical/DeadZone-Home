@@ -417,7 +417,6 @@ jobs:
           python3 runtime/build_stage.py building \
             --project lite \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 70 \
             --message "Engine build finished" || true
 
       - name: "📦 Pack Super"
@@ -439,7 +438,6 @@ jobs:
           python3 runtime/build_stage.py packaging \
             --project lite \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 90 \
             --message "Super packed" || true
 
       - name: "🗜️ Package and upload Google Drive"
@@ -530,7 +528,6 @@ jobs:
           python3 runtime/build_stage.py uploading \
             --project lite \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 95 \
             --message "Upload complete" || true
           python3 runtime/report_build_event.py succeeded \
             --project lite \

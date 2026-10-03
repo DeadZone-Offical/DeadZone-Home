@@ -266,12 +266,10 @@ jobs:
           python3 runtime/build_stage.py building_stock \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 40 \
             --message "Stock engine build finished" || true
           python3 runtime/build_stage.py building_port \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 75 \
             --message "Port engine build finished" || true
 
       - name: "📦 Pack Port ROM"
@@ -295,7 +293,6 @@ jobs:
           python3 runtime/build_stage.py packaging \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 90 \
             --message "Port Super packed" || true
 
       - name: "🗜️ Package and upload Google Drive"
@@ -348,7 +345,6 @@ jobs:
           python3 runtime/build_stage.py uploading \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --progress 95 \
             --message "Upload complete" || true
           python3 runtime/report_build_event.py succeeded \
             --project port_xiaomi \
