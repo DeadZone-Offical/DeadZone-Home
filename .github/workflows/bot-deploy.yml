@@ -519,6 +519,29 @@ jobs:
               "${WORKER_URL%/}/admin/register-webhook"
           )"
           echo "  worker responded HTTP ${http_code}"
+          if [[ "${http_code}" == "401" ]]; then
+            # Run the diagnostics route to surface why the bearer was
+            # rejected, and include the result in the deploy log. This
+            # does NOT print any portion of the token; only the verify
+            # status, success flag, and the Cloudflare error chain.
+            diag_body="${RUNNER_TEMP}/diag.json"
+            diag_code="$(
+              curl --silent --show-error --output "${diag_body}" \
+                --write-out '%{http_code}' \
+                --max-time 30 \
+                -X POST \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H 'Content-Type: application/json' \
+                --data '{}' \
+                "${WORKER_URL%/}/admin/diagnostics"
+            )"
+            echo "  diagnostics route responded HTTP ${diag_code}:"
+            sed -E 's/^/  | /' "${diag_body}" || true
+            rm -f "${diag_body}"
+            echo "::error::Worker /admin/register-webhook returned HTTP ${http_code}." >&2
+            sed -E 's/^/  | /' "${response_body}" >&2 || true
+            exit 1
+          fi
           if [[ "${http_code}" != "200" ]]; then
             echo "::error::Worker /admin/register-webhook returned HTTP ${http_code}." >&2
             sed -E 's/^/  | /' "${response_body}" >&2 || true
