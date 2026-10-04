@@ -476,7 +476,131 @@ test_disabled_mirror_does_not_mask_drive_failure() {
     rm -rf "$root"
 }
 
-echo "1..7"
+# ---------------------------------------------------------------------------
+# Test 8: regression for run 37229640251.
+#
+# The engine (DeadZone-xiaomi_Port uploadROM.sh) resolves the Drive share link
+# itself and exports it as DEADZONE_GOOGLE_DRIVE_URL, yet the launcher ignored
+# that value and re-derived the link with its own `rclone link` call. In that
+# run the engine had already logged
+#   [UPLOADING] - Google Drive link resolved: https://drive.google.com/open?id=...
+# and exported DEADZONE_RESULT_URL, but the launcher's redundant lookup returned
+# nothing, so it discarded a perfectly good URL, escalated to the mirror, got a
+# no-op, and failed a 9.9 GB build that had in fact published successfully.
+#
+# The launcher must trust the URL the engine already produced. The `rclone link`
+# call is only a fallback for engines that predate the export, and must never
+# override a URL that is already in $GITHUB_ENV.
+# ---------------------------------------------------------------------------
+test_engine_exported_link_is_trusted() {
+    local root output status env
+    root="$(mktemp -d)"
+    make_sandbox "$root" >/dev/null
+    install_engine_stub "$root" ok
+    # The launcher's own re-derivation fails, exactly as it did in the real run.
+    install_rclone_stub "$root" ""
+    install_mirror_stub "$root" ""
+    : > "$root/github_env"
+    printf '%s' "$(extract_upload_step)" > "$root/step_body.sh"
+
+    # Model the engine having exported its resolved link, as uploadROM.sh does
+    # via write_github_env after its own `rclone link`.
+    printf 'DEADZONE_GOOGLE_DRIVE_URL=https://drive.google.com/open?id=ENGINE01\n' \
+        > "$root/github_env"
+    printf 'DEADZONE_RESULT_URL=https://drive.google.com/open?id=ENGINE01\n' \
+        >> "$root/github_env"
+
+    output="$(run_upload_step "$root")"
+    status="$(cat "$root/reply_status")"
+    env="$(cat "$root/github_env")"
+
+    if (( status == 0 )); then
+        pass "engine-link: a Drive upload with an engine-exported link stays green"
+    else
+        fail "engine-link: a Drive upload with an engine-exported link stays green" \
+            "exited ${status}"
+    fi
+    assert_contains "$env" "DEADZONE_RESULT_URL=https://drive.google.com/open?id=ENGINE01" \
+        "engine-link: the engine's URL is preserved as the result URL"
+    assert_not_contains "$output" "No upload destination succeeded" \
+        "engine-link: a resolvable engine link is not treated as a total failure"
+    assert_contains "$output" "https://drive.google.com/open?id=ENGINE01" \
+        "engine-link: the resolved URL is reported in the step output"
+
+    rm -rf "$root"
+}
+
+# ---------------------------------------------------------------------------
+# Test 9: a URL recovered from the environment must be validated before it is
+# published. An empty value, a bare host, or a non-HTTP scheme is not a usable
+# download URL and must not be reported as success.
+# ---------------------------------------------------------------------------
+test_result_url_is_validated() {
+    local root output status body
+    for bad in "" "   " "not-a-url" "ftp://drive.google.com/open?id=X" "/local/path/file.zip"; do
+        root="$(mktemp -d)"
+        make_sandbox "$root" >/dev/null
+        install_engine_stub "$root" ok
+        install_rclone_stub "$root" ""
+        install_mirror_stub "$root" ""
+        printf 'DEADZONE_GOOGLE_DRIVE_URL=%s\n' "$bad" > "$root/github_env"
+        printf '%s' "$(extract_upload_step)" > "$root/step_body.sh"
+
+        output="$(run_upload_step "$root")"
+        status="$(cat "$root/reply_status")"
+
+        if (( status != 0 )); then
+            pass "validate: unusable URL '${bad:-<empty>}' does not count as success"
+        else
+            fail "validate: unusable URL '${bad:-<empty>}' does not count as success" \
+                "exited 0 and accepted an invalid URL"
+        fi
+        body="$(cat "$root/github_env")"
+        if grep -qE '^DEADZONE_RESULT_URL=not-a-url' <<< "$body"; then
+            fail "validate: '${bad:-<empty>}' is never exported as the result URL" \
+                "invalid URL was written to DEADZONE_RESULT_URL"
+        else
+            pass "validate: '${bad:-<empty>}' is never exported as the result URL"
+        fi
+        rm -rf "$root"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Test 10: credentials must never reach the logs or the summary. The launcher
+# echoes the resolved URL and writes it to $GITHUB_STEP_SUMMARY, so a signed or
+# tokenized URL must be stripped before it is printed.
+# ---------------------------------------------------------------------------
+test_no_credentials_in_output() {
+    local root output summary
+    root="$(mktemp -d)"
+    make_sandbox "$root" >/dev/null
+    install_engine_stub "$root" ok
+    install_rclone_stub "$root" ""
+    install_mirror_stub "$root" ""
+    : > "$root/github_env"
+    printf '%s' "$(extract_upload_step)" > "$root/step_body.sh"
+
+    # A signed-URL-shaped value with secret material in the query string.
+    printf 'DEADZONE_GOOGLE_DRIVE_URL=https://drive.example.com/d/ABC?token=SECRETTOKEN123&signature=LEAKEDSIG\n' \
+        > "$root/github_env"
+
+    output="$(run_upload_step "$root")"
+    summary="$(cat "$root/step_summary" 2>/dev/null || true)"
+
+    assert_not_contains "$output" "SECRETTOKEN123" \
+        "secrets: a token in the resolved URL is not echoed to the log"
+    assert_not_contains "$output" "LEAKEDSIG" \
+        "secrets: a signature in the resolved URL is not echoed to the log"
+    assert_not_contains "$summary" "SECRETTOKEN123" \
+        "secrets: a token in the resolved URL is not echoed to the summary"
+    assert_not_contains "$summary" "LEAKEDSIG" \
+        "secrets: a signature in the resolved URL is not echoed to the summary"
+
+    rm -rf "$root"
+}
+
+echo "1..10"
 test_success_preserved
 test_github_env_status_not_reread
 test_launcher_does_not_double_run_engine
@@ -484,6 +608,9 @@ test_fallback_mirror_used
 test_all_destinations_failed_reports_reason
 test_drive_success_without_link
 test_disabled_mirror_does_not_mask_drive_failure
+test_engine_exported_link_is_trusted
+test_result_url_is_validated
+test_no_credentials_in_output
 
 echo
 if (( failures == 0 )); then

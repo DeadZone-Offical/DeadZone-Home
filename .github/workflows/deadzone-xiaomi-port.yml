@@ -388,6 +388,34 @@ jobs:
           # taken above and keep the env read only as a fallback.
           google_status="${google_status:-${DEADZONE_GOOGLE_UPLOAD_STATUS:-1}}"
 
+          # A download URL is only usable if it is an absolute http(s) URL with a
+          # host. Rejecting anything else here is what stops a stray value such as
+          # "not-a-url" or a local path from being published as the result and
+          # handed to users by the bot.
+          is_valid_result_url() {
+            local candidate="${1:-}"
+            [[ -n "$candidate" ]] || return 1
+            [[ "$candidate" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/|\?|$) ]]
+          }
+
+          # Strip secret query material from any URL before it reaches a log line
+          # or the step summary. Drive share links carry no token, but a mirror
+          # may hand back a signed URL, and this step echoes and exports whatever
+          # it is given. The replacement must discard the captured value
+          # entirely, not append a marker to it.
+          redact_url() {
+            sed -E 's#([?&](token|access_token|id_token|refresh_token|signature|key|secret|auth|password)=)[^&[:space:]]*#\1REDACTED#gI'
+          }
+
+          # Read a variable from the file the current step (and the engine child
+          # process) wrote. $GITHUB_ENV is only applied to *subsequent* steps, so
+          # these values are invisible to the environment of the running step.
+          read_from_github_env() {
+            local key="$1"
+            [[ -s "${GITHUB_ENV:-}" ]] || return 0
+            grep -E "^${key}=" "$GITHUB_ENV" | tail -n1 | cut -d= -f2- || true
+          }
+
           # Drive coordinates, resolved on both paths: the mirror call below runs
           # whether or not Drive succeeded, so these must never be left unbound
           # under `set -u`.
@@ -421,15 +449,42 @@ jobs:
             echo "::warning::Could not resolve Port Drive coordinates from engine state (codename='${codename}' os_folder='${os_folder}'); the mirror upload will be skipped."
           fi
 
-          # Resolve the Drive link when the upload succeeded. A missing link is a
-          # warning: the bytes are already on Drive.
+          # Resolve the Drive link. Run 37229640251 failed here even though the
+          # upload had succeeded: the engine (DeadZone-xiaomi_Port uploadROM.sh)
+          # resolves the share link itself and exports it as
+          # DEADZONE_GOOGLE_DRIVE_URL, but the launcher ignored that value and
+          # re-derived the link with its own `rclone link`. That redundant call
+          # returned nothing, so the launcher discarded a valid URL, escalated to
+          # the mirror, received a no-op, and failed a published 9.9 GB artifact.
+          #
+          # Order of trust: the engine's own export first, then the launcher's
+          # re-derivation for engines that predate the export, and only then
+          # escalation to the mirror.
           drive_url=""
-          if (( google_status == 0 )) && [[ -n "$codename" && -n "$os_folder" ]]; then
-            drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Port/${codename}/${os_folder}/${final_name}"
-            drive_url="$(rclone --config="$PWD/rclone.conf" link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+          if (( google_status == 0 )); then
+            candidate_url="$(read_from_github_env DEADZONE_GOOGLE_DRIVE_URL)"
+            if is_valid_result_url "$candidate_url"; then
+              drive_url="$candidate_url"
+              echo "Reusing the share link resolved by the upload engine."
+            elif [[ -n "$candidate_url" ]]; then
+              echo "::warning::The upload engine exported an unusable result URL; ignoring it and re-resolving."
+            else
+              if [[ -n "$codename" && -n "$os_folder" ]]; then
+                drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Port/${codename}/${os_folder}/${final_name}"
+                set +e
+                candidate_url="$(rclone --config="$PWD/rclone.conf" link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+                set -e
+                if is_valid_result_url "$candidate_url"; then
+                  drive_url="$candidate_url"
+                fi
+              else
+                echo "::warning::Could not re-resolve the Drive link because the Port identity state is unavailable."
+              fi
+            fi
+
             if [[ -n "$drive_url" ]]; then
               printf 'DEADZONE_GOOGLE_DRIVE_URL=%s\nDEADZONE_RESULT_URL=%s\n' "$drive_url" "$drive_url" >> "$GITHUB_ENV"
-              echo "Google Drive URL: $drive_url"
+              echo "Google Drive URL: $(printf '%s' "$drive_url" | redact_url)"
             else
               echo "::warning::Google Drive upload succeeded but the share link could not be resolved."
             fi
@@ -458,9 +513,15 @@ jobs:
               # Read the mirror URLs straight out of the file the mirror helper
               # just appended to. Reading the environment would not work: the
               # GITHUB_ENV values are not visible until the next step.
-              if [[ -s "$GITHUB_ENV" ]]; then
-                mirror_url="$(grep -E '^(DEADZONE_SOURCEFORGE_URL|DEADZONE_PIXELDRAIN_URL)=' "$GITHUB_ENV" \
-                  | tail -n1 | cut -d= -f2- || true)"
+              mirror_url="$(read_from_github_env DEADZONE_SOURCEFORGE_URL)"
+              if ! is_valid_result_url "$mirror_url"; then
+                mirror_url="$(read_from_github_env DEADZONE_PIXELDRAIN_URL)"
+              fi
+              # A mirror that published something unparseable is treated the same
+              # as one that published nothing: the build has no usable download.
+              if [[ -n "$mirror_url" ]] && ! is_valid_result_url "$mirror_url"; then
+                echo "::warning::The fallback mirror published an unusable URL; it will not be advertised."
+                mirror_url=""
               fi
               if [[ -n "$mirror_url" ]]; then
                 # `upload-mirrors.sh` only promotes its own URL to
@@ -471,7 +532,7 @@ jobs:
                 # link regardless of the mirror helper's internal default.
                 export DEADZONE_SET_RESULT_URL=1
                 printf 'DEADZONE_RESULT_URL=%s\n' "$mirror_url" >> "$GITHUB_ENV"
-                echo "Fallback mirror published the artifact: $mirror_url"
+                echo "Fallback mirror published the artifact: $(printf '%s' "$mirror_url" | redact_url)"
               else
                 echo "::warning::The fallback mirror reported status ${mirror_status} but published no URL."
               fi
@@ -590,7 +651,26 @@ jobs:
             echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
             [[ -n "${DEADZONE_RESULT_NAME:-}" ]] && echo "- Final ZIP: \`${DEADZONE_RESULT_NAME}\`"
             [[ -n "${DEADZONE_GOOGLE_UPLOAD_STATUS:-}" ]] && echo "- Google Drive status: \`${DEADZONE_GOOGLE_UPLOAD_STATUS}\`"
-            [[ -n "${DEADZONE_GOOGLE_DRIVE_URL:-}" ]] && echo "- Drive URL: ${DEADZONE_GOOGLE_DRIVE_URL}"
-            [[ -n "${DEADZONE_RESULT_URL:-}" ]] && echo "- Download URL: ${DEADZONE_RESULT_URL}"
+            # Re-validate here as well. The summary is generated in a later step
+            # from the exported environment, so it is the last place a malformed
+            # value could still be shown to users, and it must not print secret
+            # query material even if a mirror ever returns a signed URL.
+            redact_summary_url() {
+              sed -E 's#([?&](token|access_token|id_token|refresh_token|signature|key|secret|auth|password)=)[^&[:space:]]*#\1REDACTED#gI'
+            }
+            if [[ -n "${DEADZONE_GOOGLE_DRIVE_URL:-}" ]]; then
+              if [[ "${DEADZONE_GOOGLE_DRIVE_URL}" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/|\?|$) ]]; then
+                echo "- Drive URL: $(printf '%s' "$DEADZONE_GOOGLE_DRIVE_URL" | redact_summary_url)"
+              else
+                echo "- Drive URL: _(unusable URL was produced and withheld)_"
+              fi
+            fi
+            if [[ -n "${DEADZONE_RESULT_URL:-}" ]]; then
+              if [[ "${DEADZONE_RESULT_URL}" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/|\?|$) ]]; then
+                echo "- Download URL: $(printf '%s' "$DEADZONE_RESULT_URL" | redact_summary_url)"
+              else
+                echo "- Download URL: _(unusable URL was produced and withheld)_"
+              fi
+            fi
             echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } >> "$GITHUB_STEP_SUMMARY"
