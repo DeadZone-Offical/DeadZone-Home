@@ -138,6 +138,7 @@ jobs:
             build.env
             rclone.conf
             load-build.sh
+            build_stage.py
             report_build_event.py
             upload.env
             upload-mirrors.sh
@@ -157,14 +158,14 @@ jobs:
           DEADZONE_CONTROLLED_BUILD: "1"
         run: |
           set -euo pipefail
-          for runtime_file in projects.env build.env rclone.conf load-build.sh report_build_event.py upload.env upload-mirrors.sh publish-website-release.py; do
+          for runtime_file in projects.env build.env rclone.conf load-build.sh build_stage.py report_build_event.py upload.env upload-mirrors.sh publish-website-release.py; do
             if [[ ! -s "runtime/${runtime_file}" ]]; then
               echo "::error::Central runtime file is missing or empty: ${runtime_file}"
               exit 1
             fi
           done
           chmod 700 runtime/load-build.sh runtime/upload-mirrors.sh
-          python3 -m py_compile runtime/report_build_event.py runtime/publish-website-release.py
+          python3 -m py_compile runtime/build_stage.py runtime/report_build_event.py runtime/publish-website-release.py
           runtime/load-build.sh lite
 
       - name: "✅ Validate loaded runtime"
@@ -381,7 +382,7 @@ jobs:
           # the workflow has not measured a number, so the live
           # panel still shows "Stage: Downloading" without a fake
           # percent.
-          python3 runtime/build_stage.py downloading \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" downloading \
             --project lite \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "ROM download finished" || true
@@ -404,7 +405,7 @@ jobs:
           extra_args=()
           [[ -n "$codename" ]] && extra_args+=(--device "$codename")
           [[ -n "$rom_version" ]] && extra_args+=(--rom "$rom_version")
-          python3 runtime/build_stage.py reading_rom \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" reading_rom \
             --project lite \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "ROM metadata extracted" \
@@ -419,7 +420,7 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
-          python3 runtime/build_stage.py building \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" building \
             --project lite \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Engine build finished" || true
@@ -440,7 +441,7 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
-          python3 runtime/build_stage.py packaging \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" packaging \
             --project lite \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Super packed" || true
@@ -530,11 +531,11 @@ jobs:
           # forwards them as the live panel's output metadata. The
           # helper is best-effort: a callback failure must not fail
           # a build that already produced a usable artifact.
-          python3 runtime/build_stage.py uploading \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" uploading \
             --project lite \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Upload complete" || true
-          python3 runtime/report_build_event.py succeeded \
+          python3 "$GITHUB_WORKSPACE/runtime/report_build_event.py" succeeded \
             --project lite \
             --message "DeadZone Lite build complete." || true
 

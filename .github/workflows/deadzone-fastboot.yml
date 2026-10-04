@@ -162,6 +162,7 @@ jobs:
             projects.env
             build.env
             load-build.sh
+            build_stage.py
             report_build_event.py
           sparse-checkout-cone-mode: false
 
@@ -173,14 +174,14 @@ jobs:
           DEADZONE_CONTROLLED_BUILD: "1"
         run: |
           set -euo pipefail
-          for runtime_file in projects.env build.env load-build.sh report_build_event.py; do
+          for runtime_file in projects.env build.env load-build.sh build_stage.py report_build_event.py; do
             if [[ ! -s "runtime/${runtime_file}" ]]; then
               echo "::error::Central runtime file is missing or empty: ${runtime_file}"
               exit 1
             fi
           done
           chmod 700 runtime/load-build.sh
-          python3 -m py_compile runtime/report_build_event.py
+          python3 -m py_compile runtime/build_stage.py runtime/report_build_event.py
           runtime/load-build.sh fastboot
 
       - name: "✅ Validate loaded runtime"
