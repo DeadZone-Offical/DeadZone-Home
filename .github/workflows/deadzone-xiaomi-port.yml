@@ -107,13 +107,13 @@ jobs:
           fi
 
       - name: "📥 Checkout DeadZone launcher"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
           fetch-depth: 1
 
       - name: "🔐 Load DeadZone central runtime"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: DeadZone-Offical/DeadZone-File
           token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
@@ -133,6 +133,17 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # The fallback-mirror path is only usable when the central runtime
+          # actually shipped its uploader. Validate the file up front so a
+          # missing mirror is a clear configuration error rather than a late
+          # "No such file" in the middle of the upload step.
+          for runtime_file in build_stage.py upload-mirrors.sh; do
+            [[ -s "runtime/${runtime_file}" ]] || {
+              echo "::error::Central runtime file is missing or empty: ${runtime_file}"
+              echo "::error::The Port fallback mirror cannot run without it. Re-run after DeadZone-File@main provides it."
+              exit 1
+            }
+          done
           required=(
             DEADZONE_ENGINE_REPOSITORY
             RCLONE_REMOTE_NAME
@@ -163,7 +174,7 @@ jobs:
           remove-haskell: "true"
 
       - name: "📥 Checkout private Port engine"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ steps.central.outputs.engine_repository }}
           token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
@@ -198,7 +209,7 @@ jobs:
         run: sudo timedatectl set-timezone Africa/Cairo
 
       - name: "☕ Prepare Java 17"
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -340,7 +351,12 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
         run: |
           set -Eeuo pipefail
-          python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
+          # notify.py is a best-effort Telegram notifier. The engine already
+          # swallows its own delivery errors and returns 0, but if the file is
+          # missing or Python is unhappy a notification failure must not abort
+          # a build that is about to publish a finished artifact.
+          python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || \
+            echo "::warning::Upload notification could not be delivered; continuing with the upload."
           set +e
           sudo -E bash bin/port/uploadROM.sh 2>&1 | tee -a build_action.log
           google_status=${PIPESTATUS[0]}
@@ -349,7 +365,7 @@ jobs:
 
           mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Port_*.zip' -print 2>/dev/null)
           if (( ${#final_zips[@]} != 1 )); then
-            echo "::error::Expected exactly one preserved final Port ZIP; found ${#final_zips[@]}"
+            echo "::error::Expected exactly one preserved final Port ZIP; found ${#final_zips[@]}" | tee -a build_action.log
             exit 1
           fi
 
@@ -364,9 +380,117 @@ jobs:
           printf 'DEADZONE_RESULT_NAME=%s\nDEADZONE_FILE_SIZE=%s\nDEADZONE_INTEGRITY_SHA256=%s\n' \
             "$final_name" "$final_size_bytes" "$final_sha256" >> "$GITHUB_ENV"
 
-          google_status="${DEADZONE_GOOGLE_UPLOAD_STATUS:-1}"
-          if (( google_status != 0 )); then
-            echo "::error::Google Drive upload failed and no secondary mirrors are enabled"
+          # `$GITHUB_ENV` is applied to *subsequent* steps only, so re-reading
+          # `DEADZONE_GOOGLE_UPLOAD_STATUS` here always returned empty and fell
+          # through to the failure default. That is what failed run 37216287331:
+          # the engine had already reported "Google Drive upload completed", and
+          # this branch then discarded that success. Trust the PIPESTATUS capture
+          # taken above and keep the env read only as a fallback.
+          google_status="${google_status:-${DEADZONE_GOOGLE_UPLOAD_STATUS:-1}}"
+
+          # Drive coordinates, resolved on both paths: the mirror call below runs
+          # whether or not Drive succeeded, so these must never be left unbound
+          # under `set -u`.
+          codename=""
+          os_folder=""
+          for candidate in \
+            "$PWD/build/.port_state/stock/ddevice/device_f.txt" \
+            "$PWD/bin/port/stock_device_f.txt"; do
+            if [[ -s "$candidate" ]]; then
+              codename="$(tr '[:lower:]' '[:upper:]' < "$candidate" | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+              [[ -n "$codename" ]] && break
+            fi
+          done
+          for candidate in \
+            "$PWD/build/.port_state/port/ddevice/base_rom_code.txt" \
+            "$PWD/bin/port/port_base_rom_code.txt"; do
+            if [[ -s "$candidate" ]]; then
+              rom_version="$(tr -d '\r\n' < "$candidate")"
+              if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
+                os_folder="${BASH_REMATCH[1]}"
+              elif [[ "$rom_version" =~ ^[Vv]([0-9]+) ]]; then
+                os_folder="MIUI${BASH_REMATCH[1]}"
+              fi
+              [[ -n "$os_folder" ]] && break
+            fi
+          done
+
+          if [[ -n "$codename" && -n "$os_folder" ]]; then
+            echo "Resolved Port Drive coordinates: codename=${codename} os_folder=${os_folder}"
+          else
+            echo "::warning::Could not resolve Port Drive coordinates from engine state (codename='${codename}' os_folder='${os_folder}'); the mirror upload will be skipped."
+          fi
+
+          # Resolve the Drive link when the upload succeeded. A missing link is a
+          # warning: the bytes are already on Drive.
+          drive_url=""
+          if (( google_status == 0 )) && [[ -n "$codename" && -n "$os_folder" ]]; then
+            drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Port/${codename}/${os_folder}/${final_name}"
+            drive_url="$(rclone --config="$PWD/rclone.conf" link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+            if [[ -n "$drive_url" ]]; then
+              printf 'DEADZONE_GOOGLE_DRIVE_URL=%s\nDEADZONE_RESULT_URL=%s\n' "$drive_url" "$drive_url" >> "$GITHUB_ENV"
+              echo "Google Drive URL: $drive_url"
+            else
+              echo "::warning::Google Drive upload succeeded but the share link could not be resolved."
+            fi
+          fi
+
+          # Secondary mirrors are attempted whenever Drive did not yield a usable
+          # public link.
+          #
+          # `upload-mirrors.sh` exits 0 as a deliberate no-op pass while
+          # DEADZONE_ENABLE_SECONDARY_MIRRORS is not "1", so its exit status
+          # cannot be used to decide whether a fallback actually served the
+          # artifact. Relying on it would report a build as published when
+          # nothing was uploaded at all. The only trustworthy signal is whether
+          # it published a URL, which it appends to $GITHUB_ENV.
+          mirror_status=0
+          mirror_url=""
+          if (( google_status != 0 )) || [[ -z "$drive_url" ]]; then
+            if [[ -n "$codename" && -n "$os_folder" ]]; then
+              echo "Google Drive is not a usable destination; attempting the configured fallback mirror."
+              set +e
+              bash "$GITHUB_WORKSPACE/runtime/upload-mirrors.sh" \
+                "Port" "$codename" "$os_folder" "$final_zip" "$final_name" \
+                2>&1 | tee -a build_action.log
+              mirror_status=${PIPESTATUS[0]}
+              set -e
+              # Read the mirror URLs straight out of the file the mirror helper
+              # just appended to. Reading the environment would not work: the
+              # GITHUB_ENV values are not visible until the next step.
+              if [[ -s "$GITHUB_ENV" ]]; then
+                mirror_url="$(grep -E '^(DEADZONE_SOURCEFORGE_URL|DEADZONE_PIXELDRAIN_URL)=' "$GITHUB_ENV" \
+                  | tail -n1 | cut -d= -f2- || true)"
+              fi
+              if [[ -n "$mirror_url" ]]; then
+                # `upload-mirrors.sh` only promotes its own URL to
+                # DEADZONE_RESULT_URL when DEADZONE_SET_RESULT_URL=1, and it is
+                # invoked here precisely in the case where Drive did not produce
+                # a link. Export the flag and also write the URL directly so the
+                # downstream reporter and the build summary both see a download
+                # link regardless of the mirror helper's internal default.
+                export DEADZONE_SET_RESULT_URL=1
+                printf 'DEADZONE_RESULT_URL=%s\n' "$mirror_url" >> "$GITHUB_ENV"
+                echo "Fallback mirror published the artifact: $mirror_url"
+              else
+                echo "::warning::The fallback mirror reported status ${mirror_status} but published no URL."
+              fi
+            else
+              echo "::warning::Skipping the fallback mirror because the Port identity state is unavailable."
+            fi
+          else
+            echo "Google Drive succeeded; secondary mirrors are not required."
+          fi
+
+          # Terminal verdict. The artifact counts as published only when a Drive
+          # link or a mirror URL was actually produced; otherwise report which
+          # destinations were tried and fail.
+          if [[ -z "$drive_url" && -z "$mirror_url" ]]; then
+            if (( google_status != 0 )); then
+              echo "::error::No upload destination succeeded. Google Drive failed (status ${google_status}); the fallback mirror published no URL (DEADZONE_ENABLE_SECONDARY_MIRRORS=${DEADZONE_ENABLE_SECONDARY_MIRRORS:-0}). The artifact was built and checksummed but is not publicly reachable."
+            else
+              echo "::error::Google Drive reported success (status 0) but no shareable link could be resolved, and the fallback mirror published no URL. The artifact is not publicly reachable."
+            fi
             exit 1
           fi
 
@@ -433,8 +557,18 @@ jobs:
         if: always()
         run: |
           set -Euo pipefail
-          rm -rf toolbuild runtime
-          rm -f toolbuild/rclone.conf
+          # The build tree is created by sudo'd steps, so the runner user cannot
+          # remove it. A cleanup failure must never mask the real build verdict
+          # (this step previously reported "Permission denied" for tens of
+          # thousands of files and turned every build red), so it escalates
+          # through sudo and then downgrades to a warning.
+          sudo -E rm -rf toolbuild runtime 2>/dev/null || true
+          if [[ -e toolbuild/rclone.conf ]]; then
+            sudo -E rm -f toolbuild/rclone.conf 2>/dev/null || true
+          fi
+          if [[ -d toolbuild || -d runtime ]]; then
+            echo "::warning::Port workspace cleanup was incomplete; the runner is ephemeral so no action is required."
+          fi
 
       - name: "📣 Build summary"
         if: always()
@@ -443,6 +577,9 @@ jobs:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
           DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
           DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
+          DEADZONE_GOOGLE_UPLOAD_STATUS: ${{ env.DEADZONE_GOOGLE_UPLOAD_STATUS }}
+          DEADZONE_GOOGLE_DRIVE_URL: ${{ env.DEADZONE_GOOGLE_DRIVE_URL }}
+          DEADZONE_RESULT_URL: ${{ env.DEADZONE_RESULT_URL }}
         run: |
           {
             echo "## 🔂 DeadZone-Xiaomi-Port build"
@@ -452,5 +589,8 @@ jobs:
             echo "- Request ID: \`${DEADZONE_REQUEST_ID}\`"
             echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
             [[ -n "${DEADZONE_RESULT_NAME:-}" ]] && echo "- Final ZIP: \`${DEADZONE_RESULT_NAME}\`"
+            [[ -n "${DEADZONE_GOOGLE_UPLOAD_STATUS:-}" ]] && echo "- Google Drive status: \`${DEADZONE_GOOGLE_UPLOAD_STATUS}\`"
+            [[ -n "${DEADZONE_GOOGLE_DRIVE_URL:-}" ]] && echo "- Drive URL: ${DEADZONE_GOOGLE_DRIVE_URL}"
+            [[ -n "${DEADZONE_RESULT_URL:-}" ]] && echo "- Download URL: ${DEADZONE_RESULT_URL}"
             echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } >> "$GITHUB_STEP_SUMMARY"
