@@ -1,0 +1,645 @@
+# DeadZone-Home Ninja
+#
+# Independent Telegram-dispatch workflow for the DeadZone Ninja ROM
+# engine (Android 17 Ninja). This file is invoked directly by
+# `DeadZone-Offical/DeadZone-Bot` via `workflow_dispatch` whenever a
+# user picks "Ninja". Each dispatch creates its own GitHub Actions
+# run; Ninja is NOT routed through any generic dispatcher.
+#
+# Concurrency model
+# ----------------
+# Each `workflow_dispatch` invocation creates a fresh GitHub Actions
+# run with its own runner, its own workspace, its own `toolbuild/`
+# checkout, and its own log/artifact uploads. The request-id-scoped
+# key cancels a previous Ninja build for the SAME Telegram request
+# but does NOT serialize across different requests. The same user
+# re-pressing Build for the same request_id cancels their previous
+# run, which is the only safe semantic.
+
+name: 🥷 DeadZone Ninja
+
+run-name: "🥷 DeadZone-Ninja · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}"
+
+concurrency:
+  # Per-request concurrency key: two different users can dispatch Ninja
+  # at the same time and they run in parallel. The same user re-pressing
+  # Build for the same request_id cancels their previous run, which is
+  # the only safe semantic.
+  group: deadzone-home-ninja-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_url:
+        description: "📥 ROM download URL"
+        required: true
+        type: string
+      builder_name:
+        description: "👤 Builder name"
+        required: false
+        type: string
+      builder_id:
+        description: "💬 Telegram user ID"
+        required: false
+        type: string
+      builder_username:
+        description: "🔗 Telegram username (without leading @)"
+        required: false
+        type: string
+      request_id:
+        description: "🆔 DeadZone controlled build request ID"
+        required: true
+        type: string
+      callback_url:
+        description: "🔗 Signed DeadZone build-event endpoint"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "🥷 Build Ninja ROM"
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+      DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+      DEADZONE_PROJECT: ninja
+      DEADZONE_CONTROLLED_BUILD: "1"
+      DEADZONE_INPUT_URL: ${{ inputs.input_url }}
+      DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+      DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+      DEADZONE_BUILDER_USERNAME: ${{ inputs.builder_username }}
+      DEADZONE_SOURCE_REPOSITORY: ${{ github.repository }}
+      # Temporary: keep secondary mirrors disabled while Google Drive is
+      # the only active upload destination. Flip to "1" to re-enable.
+      DEADZONE_ENABLE_SECONDARY_MIRRORS: "0"
+
+    steps:
+      - name: "🧾 Validate controlled request"
+        shell: python
+        env:
+          INPUT_URL: ${{ inputs.input_url }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          import os
+          import re
+          from urllib.parse import urlparse
+
+          request_id = os.environ["REQUEST_ID"].strip()
+          if not re.fullmatch(r"ninja_[A-Za-z0-9]{8,80}", request_id):
+              raise SystemExit("Invalid DeadZone request ID")
+
+          for name in ("INPUT_URL", "CALLBACK_URL"):
+              value = os.environ[name].strip()
+              parsed = urlparse(value)
+              if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                  raise SystemExit(f"{name} must be a safe HTTPS URL")
+
+      - name: "🔐 Validate launcher credentials"
+        env:
+          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Required: a dedicated fine-grained GitHub PAT with
+          # Contents: Read-only on every private engine repository
+          # listed in `projects.env` plus `DeadZone-Offical/DeadZone-File`.
+          # It MUST NOT be the bot dispatch token (`GITHUB_BUILD_TOKEN`)
+          # or any other write-capable credential. The workflow fails
+          # fast if the secret is missing so a misconfigured secret
+          # surfaces immediately instead of producing a 403 later.
+          if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
+            echo "::error::Missing required launcher secret: DEADZONE_PRIVATE_READ_TOKEN. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
+            exit 1
+          fi
+
+      - name: "📥 Checkout DeadZone launcher"
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: "📥 Checkout private runtime"
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-File
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: runtime
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            projects.env
+            build.env
+            rclone.conf
+            load-build.sh
+            build_stage.py
+            report_build_event.py
+            upload.env
+            upload-mirrors.sh
+            publish-website-release.py
+          sparse-checkout-cone-mode: false
+
+      - name: "⚙️ Load central runtime"
+        id: runtime
+        env:
+          # The fine-grained PAT is the single source-of-truth credential
+          # for private source checkouts. load-build.sh reads the engine
+          # bootstrap token from DEADZONE_PRIVATE_TOKEN first, then
+          # PRIVATE_REPO_TOKEN, then GH_TOKEN. Expose the PAT under all
+          # three names so the central runtime can open the private
+          # registry and engine repos without a write-capable fallback.
+          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          DEADZONE_CONTROLLED_BUILD: "1"
+        run: |
+          set -euo pipefail
+          for runtime_file in projects.env build.env rclone.conf load-build.sh build_stage.py report_build_event.py upload.env upload-mirrors.sh publish-website-release.py; do
+            if [[ ! -s "runtime/${runtime_file}" ]]; then
+              echo "::error::Central runtime file is missing or empty: ${runtime_file}"
+              exit 1
+            fi
+          done
+          chmod 700 runtime/load-build.sh runtime/upload-mirrors.sh
+          python3 -m py_compile runtime/build_stage.py runtime/report_build_event.py runtime/publish-website-release.py
+          runtime/load-build.sh ninja
+
+      - name: "✅ Validate loaded runtime"
+        env:
+          ENGINE_REPOSITORY: ${{ steps.runtime.outputs.engine_repository }}
+        run: |
+          set -euo pipefail
+          required=(
+            ENGINE_REPOSITORY
+            DEADZONE_ENGINE_REPOSITORY
+            BUILD_PROGRESS_SECRET
+            RCLONE_REMOTE_NAME
+            RCLONE_UPLOAD_DIR
+          )
+          for variable_name in "${required[@]}"; do
+            if [[ -z "${!variable_name:-}" ]]; then
+              echo "::error::Central runtime value is missing: ${variable_name}"
+              exit 1
+            fi
+          done
+          if [[ "$ENGINE_REPOSITORY" != "DeadZone-Offical/DeadZone-xiaomi_Ninja" ]]; then
+            echo "::error::Unexpected Ninja engine: $ENGINE_REPOSITORY"
+            exit 1
+          fi
+          if [[ "$ENGINE_REPOSITORY" != "$DEADZONE_ENGINE_REPOSITORY" ]]; then
+            echo "::error::Runtime engine output does not match the loaded project map"
+            exit 1
+          fi
+          printf '::add-mask::%s\n' "$BUILD_PROGRESS_SECRET"
+          printf 'DEADZONE_EVENT_SECRET=%s\n' "$BUILD_PROGRESS_SECRET" >> "$GITHUB_ENV"
+
+      - name: "💾 Maximize build space"
+        uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
+        with:
+          build-mount-path: ${{ github.workspace }}/toolbuild
+          swap-size-mb: 1024
+          root-reserve-mb: 512
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+
+      - name: "🧹 Clean unused runner packages"
+        run: |
+          set -euo pipefail
+          docker image prune --all --force || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android || true
+          sudo apt-get purge -y azure-cli "ghc*" "zulu*" "hhvm*" "llvm*" firefox "google*" "dotnet*" powershell "mysql*" "php*" || true
+          sudo apt-get autoremove --purge -y || true
+          sudo apt-get clean
+
+      - name: "📦 Checkout private Ninja engine"
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.runtime.outputs.engine_repository }}
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: toolbuild
+          lfs: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "🔍 Verify Ninja engine LFS objects"
+        working-directory: toolbuild
+        shell: bash
+        run: |
+          set -uo pipefail
+          # `actions/checkout@v4` with `lfs: true` retries the LFS
+          # fetch three times (~35s) before failing with a stack of
+          # identical 404 lines. With `lfs: false` the checkout above
+          # leaves the LFS pointer files in place and we perform a
+          # single explicit fetch here so any missing objects surface
+          # as an actionable diagnostic in one attempt.
+          if ! command -v git-lfs >/dev/null 2>&1 && ! git lfs version >/dev/null 2>&1; then
+            echo "Installing git-lfs..."
+            curl -fsSL https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-linux-amd64-v3.5.1.tar.gz \
+              | tar -xz -C /tmp git-lfs \
+              && sudo install -m 0755 /tmp/git-lfs /usr/local/bin/git-lfs
+            git lfs install --local
+          fi
+          expected="$(git lfs ls-files 2>/dev/null | awk '{print $3}' || true)"
+          if [[ -z "$expected" ]]; then
+            echo "No LFS-tracked files in this checkout."
+            exit 0
+          fi
+          echo "LFS objects expected: $(echo "$expected" | wc -l)"
+          git lfs fetch origin main 2>&1 | tee /tmp/lfs-fetch.log || true
+          not_found="$(grep -oE '\[sha256:[0-9a-f]+\] Object does not exist on the server' /tmp/lfs-fetch.log | sort -u || true)"
+          if [[ -n "$not_found" ]]; then
+            echo
+            echo "::error::DeadZone Ninja engine is missing the following Git LFS objects on the server:"
+            echo "$not_found" | sed 's/^/  - /'
+            echo
+            echo "Push the corresponding binaries to DeadZone-Offical/DeadZone-xiaomi_Ninja and re-run."
+            exit 1
+          fi
+          echo "All LFS objects fetched successfully."
+
+      - name: "🧭 Validate Ninja engine layout"
+        working-directory: toolbuild
+        run: |
+          set -euo pipefail
+          required_engine_files=(
+            build.sh
+            functions.sh
+            notify.py
+            packROM.sh
+            uploadROM.sh
+          )
+          for engine_file in "${required_engine_files[@]}"; do
+            if [[ ! -s "$engine_file" ]]; then
+              echo "::error::Ninja engine file is missing or empty: ${engine_file}"
+              exit 1
+            fi
+          done
+          python3 -m py_compile notify.py
+          bash -n uploadROM.sh
+          bash -n packROM.sh
+
+      - name: "📣 Start live tracking"
+        working-directory: toolbuild
+        run: |
+          set -euo pipefail
+          python3 notify.py start "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "ninja" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
+
+      - name: "📡 Report starting stage to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 runtime/build_stage.py starting \
+            --project ninja \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Runner allocated, fetching engine sources" || true
+
+      - name: "🕒 Set Cairo timezone"
+        run: sudo timedatectl set-timezone Africa/Cairo
+
+      - name: "☕ Install OpenJDK"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: "🧰 Install Ninja dependencies"
+        working-directory: toolbuild
+        run: |
+          set -Eeuo pipefail
+
+          chrome_source_pattern='dl.google.com/linux/chrome-stable/deb'
+          while IFS= read -r source_file; do
+            echo "::notice::Disabling unused Chrome APT source: $source_file"
+            sudo mv -- "$source_file" "${source_file}.disabled"
+          done < <(
+            grep -Rls --include='*.list' --include='*.sources' \
+              "$chrome_source_pattern" /etc/apt/sources.list.d 2>/dev/null || true
+          )
+
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get purge -y device-tree-compiler || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            aria2 jq rclone python-is-python3 wget python3 python3-pip \
+            lz4 xxhash xz-utils zlib1g-dev gcc g++ libc6 libstdc++6 \
+            busybox zip unzip p7zip-full zipalign zstd bc erofs-utils \
+            android-sdk-libsparse-utils xmlstarlet aapt rsync openssh-client curl
+          sudo pip3 install --break-system-packages --no-cache-dir ConfigObj lz4 zstandard setuptools || \
+            sudo pip3 install --no-cache-dir ConfigObj lz4 zstandard setuptools
+
+      - name: "🔓 Grant builder permissions"
+        working-directory: toolbuild
+        run: chmod -R u+rwX,go+rX .
+
+      - name: "☁️ Install central Rclone configuration"
+        working-directory: toolbuild
+        run: |
+          set -euo pipefail
+          source_file="$GITHUB_WORKSPACE/runtime/rclone.conf"
+          target_file="$PWD/rclone.conf"
+          [[ -s "$source_file" ]] || {
+            echo "::error::Central rclone.conf is missing or empty"
+            exit 1
+          }
+          install -m 600 "$source_file" "$target_file"
+          if ! rclone --config="$target_file" listremotes | sed 's/:$//' | grep -Fxq "$RCLONE_REMOTE_NAME"; then
+            echo "::error::Central rclone.conf does not define expected remote: ${RCLONE_REMOTE_NAME}"
+            exit 1
+          fi
+          rclone version
+
+      - name: "🚀 Build ROM"
+        working-directory: toolbuild
+        run: |
+          set -Eeuo pipefail
+          sudo -E bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "ninja" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" 2>&1 | tee build_action.log
+
+      - name: "📡 Report downloading + reading to bot"
+        if: success()
+        working-directory: toolbuild
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          # The build.sh script is opaque to the workflow layer,
+          # so we cannot emit a real `downloading` progress number
+          # from inside it. We emit the stage transition with no
+          # percentage: the renderer omits the line entirely when
+          # the workflow has not measured a number, so the live
+          # panel still shows "Stage: Downloading" without a fake
+          # percent.
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" downloading \
+            --project ninja \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "ROM download finished" || true
+          # After the build, the engine writes the sanitized
+          # device codename and base ROM code into bin/device/. We
+          # forward them verbatim — the live panel renders them as
+          # `Device:` and `ROM:` only when the engine actually
+          # produced a non-empty value.
+          codename=""
+          rom_version=""
+          if [[ -s bin/device/device_f.txt ]]; then
+            codename="$(tr '[:lower:]' '[:upper:]' < bin/device/device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+          fi
+          if [[ -s bin/device/base_rom_code.txt ]]; then
+            rom_version="$(tr -d '\r\n' < bin/device/base_rom_code.txt)"
+          fi
+          # Build the args list defensively so an empty field does
+          # not turn into an empty --device '' that the stage
+          # reporter would still encode.
+          extra_args=()
+          [[ -n "$codename" ]] && extra_args+=(--device "$codename")
+          [[ -n "$rom_version" ]] && extra_args+=(--rom "$rom_version")
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" reading_rom \
+            --project ninja \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "ROM metadata extracted" \
+            "${extra_args[@]}" || true
+
+      - name: "📡 Report building completion to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" building \
+            --project ninja \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Engine build finished" || true
+
+      - name: "📦 Pack Super"
+        working-directory: toolbuild
+        run: |
+          set -Eeuo pipefail
+          python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "ninja" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
+          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
+
+      - name: "📡 Report packaging completion to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" packaging \
+            --project ninja \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Super packed" || true
+
+      - name: "🗜️ Package and upload Google Drive"
+        working-directory: toolbuild
+        run: |
+          set -Eeuo pipefail
+          python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "ninja" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
+          set +e
+          sudo -E bash uploadROM.sh 2>&1 | tee -a build_action.log
+          google_status=${PIPESTATUS[0]}
+          set -e
+          printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
+
+          mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Ninja_*.zip' -print 2>/dev/null)
+          if (( ${#final_zips[@]} != 1 )); then
+            echo "::error::Expected exactly one preserved final Ninja ZIP; found ${#final_zips[@]}" | tee -a build_action.log
+            exit 1
+          fi
+
+          final_zip="${final_zips[0]}"
+          final_name="$(basename "$final_zip")"
+          final_size_bytes="$(stat -c '%s' "$final_zip")"
+          # Real SHA-256 of the preserved final ZIP. The bot's live
+          # panel forwards this as the `checksum` field on the
+          # succeeded terminal event when the central reporter
+          # reads it from DEADZONE_INTEGRITY_SHA256.
+          final_sha256="$(sha256sum "$final_zip" | awk '{print $1}')"
+          printf 'DEADZONE_FILE_SIZE=%s\nDEADZONE_INTEGRITY_VERIFIED=1\nDEADZONE_RESULT_NAME=%s\nDEADZONE_INTEGRITY_SHA256=%s\nDEADZONE_INTEGRITY_SHA256=%s\n' \
+            "$final_size_bytes" "$final_name" "$final_sha256" "$final_sha256" >> "$GITHUB_ENV"
+
+          # GITHUB_ENV is only applied to subsequent steps. Keep the
+          # status captured above for this step and use the exported value
+          # only as a fallback when this block is reused independently.
+          google_status="${google_status:-${DEADZONE_GOOGLE_UPLOAD_STATUS:-1}}"
+          codename="$(tr '[:lower:]' '[:upper:]' < "$PWD/bin/device/device_f.txt" | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+          rom_version="$(tr -d '\r\n' < "$PWD/bin/device/base_rom_code.txt")"
+          if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
+            os_folder="${BASH_REMATCH[1]}"
+          elif [[ "$rom_version" =~ ^[Vv]([0-9]+) ]]; then
+            os_folder="MIUI${BASH_REMATCH[1]}"
+          else
+            os_folder=""
+          fi
+
+          drive_url=""
+          if (( google_status == 0 )); then
+            drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Ninja/${codename}/${os_folder}/${final_name}"
+            drive_url="$(rclone --config="$PWD/rclone.conf" link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+            if [[ -n "$drive_url" ]]; then
+              printf 'DEADZONE_GOOGLE_DRIVE_URL=%s\nDEADZONE_RESULT_URL=%s\n' "$drive_url" "$drive_url" >> "$GITHUB_ENV"
+            fi
+          fi
+
+          if (( google_status == 0 )) && [[ -n "$drive_url" ]]; then
+            export DEADZONE_SET_RESULT_URL=0
+          else
+            echo "::warning::Google Drive is unavailable as a final public link"
+            export DEADZONE_SET_RESULT_URL=1
+          fi
+
+          set +e
+          bash "$GITHUB_WORKSPACE/runtime/upload-mirrors.sh" \
+            "Ninja" "$codename" "$os_folder" "$final_zip" "$final_name" \
+            2>&1 | tee -a build_action.log
+          mirror_status=${PIPESTATUS[0]}
+          set -e
+
+          if (( google_status != 0 )); then
+            echo "::error::Google Drive upload failed and no secondary mirrors are enabled"
+            exit 1
+          fi
+          if (( mirror_status != 0 )); then
+            echo "::warning::upload-mirrors.sh exited with status ${mirror_status}; continuing because Google Drive succeeded"
+          fi
+
+      - name: "✅ Send success notification"
+        if: success()
+        working-directory: toolbuild
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python3 notify.py success "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "ninja" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
+          # Terminal succeeded event. The central reporter reads
+          # DEADZONE_RESULT_NAME, DEADZONE_FILE_SIZE, and
+          # DEADZONE_INTEGRITY_SHA256 from the environment and
+          # forwards them as the live panel's output metadata. The
+          # helper is best-effort: a callback failure must not fail
+          # a build that already produced a usable artifact.
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" uploading \
+            --project ninja \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Upload complete" || true
+          python3 "$GITHUB_WORKSPACE/runtime/report_build_event.py" succeeded \
+            --project ninja \
+            --message "DeadZone Ninja build complete." || true
+
+      - name: "❌ Send failure notification"
+        if: failure()
+        shell: bash
+        run: |
+          set -uo pipefail
+          # The central-runtime checkout may have failed (or never
+          # ran) before this step executes, so `runtime/` may be
+          # absent. `DEADZONE_EVENT_SECRET` is also already in the
+          # environment from the successful runtime-load step, so the
+          # conditional source is best-effort.
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
+            set -a
+            # shellcheck disable=SC1091
+            source runtime/build.env
+            set +a
+            export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:-}"
+          fi
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" ]]; then
+            echo '::warning::Terminal Ninja event cannot be signed because the central event secret is unavailable.' >&2
+            exit 0
+          fi
+          if [[ ! -s runtime/report_build_event.py ]]; then
+            echo '::warning::Central runtime report_build_event.py is missing; skipping the terminal failure callback.' >&2
+            exit 0
+          fi
+          python3 runtime/report_build_event.py failed \
+            --project ninja \
+            --message "DeadZone Ninja ROM build failed." || true
+
+      - name: "⛔ Send cancellation notification"
+        if: cancelled()
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
+            set -a
+            # shellcheck disable=SC1091
+            source runtime/build.env
+            set +a
+            export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:-}"
+          fi
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" ]]; then
+            echo '::warning::Terminal Ninja event cannot be signed because the central event secret is unavailable.' >&2
+            exit 0
+          fi
+          if [[ ! -s runtime/report_build_event.py ]]; then
+            echo '::warning::Central runtime report_build_event.py is missing; skipping the terminal cancellation callback.' >&2
+            exit 0
+          fi
+          python3 runtime/report_build_event.py cancelled \
+            --project ninja \
+            --message "DeadZone Ninja ROM build cancelled." || true
+
+      - name: "🧽 Cleanup Ninja workspace"
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          # `toolbuild` may be busy if Maximize-build-space mounted an
+          # LVM volume on it, and `runtime` may not exist if the
+          # private-runtime checkout failed before completing. Both
+          # conditions are expected after a failed Ninja build, so the
+          # cleanup is best-effort and never fails the job.
+          if mountpoint -q toolbuild 2>/dev/null; then
+            echo "Unmounting toolbuild (was a build-space mount point)"
+            sudo umount toolbuild || true
+          fi
+          rm -rf toolbuild runtime 2>/dev/null || true
+          rm -f toolbuild/rclone.conf 2>/dev/null || true
+          echo "Ninja workspace cleanup complete"
+
+      - name: "📋 Upload debug logs"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-ninja-${{ github.run_number }}
+          path: |
+            toolbuild/build_action.log
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: "📣 Build summary"
+        if: always()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+          DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
+          DEADZONE_GOOGLE_DRIVE_URL: ${{ env.DEADZONE_GOOGLE_DRIVE_URL }}
+        run: |
+          {
+            echo "## 🥷 DeadZone-Ninja build"
+            echo
+            echo "- Project: \`DeadZone-Ninja\`"
+            echo "- Engine repository: \`DeadZone-Offical/DeadZone-xiaomi_Ninja\`"
+            echo "- Request ID: \`${DEADZONE_REQUEST_ID}\`"
+            echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
+            [[ -n "${DEADZONE_RESULT_NAME:-}" ]] && echo "- Final ZIP: \`${DEADZONE_RESULT_NAME}\`"
+            [[ -n "${DEADZONE_GOOGLE_DRIVE_URL:-}" ]] && echo "- Drive URL: ${DEADZONE_GOOGLE_DRIVE_URL}"
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"
