@@ -414,6 +414,66 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
+          # ---- pre-build diagnostics (Lite-style: pwd / versions / files) ----
+          echo "::group::Build environment"
+          pwd
+          echo "uname: $(uname -a 2>/dev/null || echo 'uname unavailable')"
+          echo "git:   $(git --version 2>/dev/null || echo 'git unavailable')"
+          echo "python: $(python3 --version 2>&1 || echo 'python3 missing')"
+          echo "pip:    $(python3 -m pip --version 2>&1 || echo 'pip missing')"
+          echo "node:   $(node --version 2>/dev/null || echo 'node unavailable')"
+          echo "bash:   ${BASH_VERSION:-unset}"
+          echo
+          echo "Top-level workspace:"
+          ls -la
+          echo
+          echo "Engine checkout (super-inspector):"
+          if [[ -d super-inspector ]]; then
+            ls -la super-inspector
+            echo
+            if [[ -f super-inspector/pyproject.toml ]]; then
+              echo "Engine metadata (pyproject.toml head):"
+              head -40 super-inspector/pyproject.toml || true
+            fi
+          else
+            echo "::error::super-inspector checkout is missing; the engine was not materialised."
+            exit 1
+          fi
+          echo
+          echo "Required runtime files (ROM + tools + central runtime):"
+          for required in \
+            "$ROM_PATH" \
+            "super-inspector/deadzone_superinspector" \
+            "super-inspector/build.sh" \
+            "super-inspector/tools/platform-tools/adb.exe" \
+            "super-inspector/tools/platform-tools/fastboot.exe" \
+            "runtime/build_stage.py" \
+            "runtime/report_build_event.py"; do
+            if [[ -e "$required" ]]; then
+              printf '  [ok]   %s\n' "$required"
+            else
+              printf '  [MISS] %s\n' "$required"
+            fi
+          done
+          echo
+          echo "Secret presence (values never printed):"
+          for var in DEADZONE_PRIVATE_READ_TOKEN DEADZONE_EVENT_SECRET BUILD_PROGRESS_SECRET RCLONE_CONFIG_BASE64; do
+            value="${!var:-}"
+            if [[ -n "$value" ]]; then
+              printf '  [set]   %s (length=%d)\n' "$var" "${#value}"
+            else
+              printf '  [unset] %s\n' "$var"
+            fi
+          done
+          echo
+          echo "Engine Python environment (selected packages):"
+          python3 -c "import sys; print('python-prefix:', sys.prefix)" 2>&1 || true
+          python3 -c "import deadzone_superinspector; print('deadzone_superinspector version:', deadzone_superinspector.__version__)" 2>&1 || true
+          for pkg in pyinstaller pip setuptools wheel; do
+            python3 -m pip show "$pkg" 2>/dev/null | head -3 | sed "s/^/  $pkg: /" || echo "  $pkg: not installed"
+          done
+          echo "::endgroup::"
+          # ---- end diagnostics ----
           if [[ -x super-inspector/build.sh ]]; then
             bash super-inspector/build.sh
           else
