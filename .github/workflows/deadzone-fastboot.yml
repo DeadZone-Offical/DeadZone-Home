@@ -161,6 +161,7 @@ jobs:
           sparse-checkout: |
             projects.env
             build.env
+            rclone.conf
             load-build.sh
             build_stage.py
             report_build_event.py
@@ -174,15 +175,23 @@ jobs:
           DEADZONE_CONTROLLED_BUILD: "1"
         run: |
           set -euo pipefail
-          for runtime_file in projects.env build.env load-build.sh build_stage.py report_build_event.py; do
+          for runtime_file in projects.env build.env rclone.conf load-build.sh build_stage.py report_build_event.py; do
             if [[ ! -s "runtime/${runtime_file}" ]]; then
               echo "::error::Central runtime file is missing or empty: ${runtime_file}"
+              echo "::error::This usually means the sparse-checkout list in .github/workflows/deadzone-fastboot.yml does not include the file, or DeadZone-File@main no longer ships it."
               exit 1
             fi
           done
           chmod 700 runtime/load-build.sh
           python3 -m py_compile runtime/build_stage.py runtime/report_build_event.py
+          set +e
           runtime/load-build.sh fastboot
+          rc=$?
+          set -e
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::runtime/load-build.sh fastboot exited with status ${rc}"
+            exit $rc
+          fi
 
       - name: "✅ Validate loaded runtime"
         shell: bash
