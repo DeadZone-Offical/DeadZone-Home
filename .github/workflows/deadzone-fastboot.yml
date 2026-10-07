@@ -595,6 +595,21 @@ jobs:
             # Inline Python (one-liner) so we keep the YAML block scalar literal.
             codename="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); print(str(d.get('device_id') or ''))" "$device_json" 2>/dev/null || true)"
           fi
+          # The analyzer can fall back to device_id="device" when it cannot
+          # extract a codename from the ROM's preloader filenames. The
+          # DeadZone-Fastbot convention is `<codename>_<region>_images_...tgz`,
+          # so the first `_`-separated segment of the ROM filename is the
+          # codename we want. Use it as a hint when the analyzer did not.
+          rom_filename="${{ env.ROM_FILENAME }}"
+          if [[ -z "$codename" || "$codename" == "device" || "$codename" == "unknown" ]]; then
+            if [[ -n "$rom_filename" ]]; then
+              hint="${rom_filename%%_*}"
+              if [[ -n "$hint" && "$hint" != "OS"* && "$hint" =~ ^[A-Za-z][A-Za-z0-9._-]*$ ]]; then
+                echo "::notice::Analyzer returned codename=${codename:-empty}; overriding with ROM-filename hint '${hint}'."
+                codename="$hint"
+              fi
+            fi
+          fi
           printf 'codename=%s\n' "$codename" >> "$GITHUB_OUTPUT"
           printf 'profile_dir=%s\n' "$(dirname "$device_json")" >> "$GITHUB_OUTPUT"
           echo "codename: ${codename:-unknown}"
@@ -627,14 +642,20 @@ jobs:
           fi
           echo "::group::Publishing per-build tree"
           echo "codename       : ${codename:-unknown}"
-          echo "profile_dir   : $profile_dir"
+          echo "profile_dir    : $profile_dir"
           python3 -m deadzone_superinspector publish-rom-repo "$profile_dir" \
             --device-id "${codename}" \
             --build-id "${DEADZONE_REQUEST_ID}" \
             --branch main \
             --author-name "$DEADZONE_ROM_REPO_AUTHOR_NAME" \
             --author-email "$DEADZONE_ROM_REPO_AUTHOR_EMAIL" \
-            --json --out ./fastboot-profile/rom_repo_publish.json
+            --json 2> ./fastboot-profile/rom_repo_publish.stderr \
+            >  ./fastboot-profile/rom_repo_publish.json || true
+          echo "rom_repo_publish.json:"
+          head -100 ./fastboot-profile/rom_repo_publish.json || true
+          if [[ -s rom_repo_publish.stderr ]] && grep -qE 'Traceback|error:' rom_repo_publish.stderr; then
+            echo '::warning::publish-rom-repo emitted diagnostics on stderr; see artifact.'
+          fi
           echo "::endgroup::"
 
       - name: "📚 Publish central metadata registry entry"
@@ -665,10 +686,12 @@ jobs:
           echo "remote      : DeadZone-Offical/DeadZone-ROM-Repository"
           python3 -m deadzone_superinspector publish-central "$ROM_PATH" \
             --branch main \
+            --device-id "${{ steps.analyze.outputs.codename }}" \
             --promoter deadzone-bot \
             --author-name "$DEADZONE_ROM_REPO_AUTHOR_NAME" \
             --author-email "$DEADZONE_ROM_REPO_AUTHOR_EMAIL" \
-            --json --out ./fastboot-profile/central_publish.json
+            --json 2> ./fastboot-profile/central_publish.stderr \
+            >  ./fastboot-profile/central_publish.json
           rc=$?
           set -e
           echo "::endgroup::"
