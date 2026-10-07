@@ -684,6 +684,7 @@ jobs:
           echo "codename    : ${{ steps.analyze.outputs.codename }}"
           echo "branch      : main"
           echo "remote      : DeadZone-Offical/DeadZone-ROM-Repository"
+          set +e
           python3 -m deadzone_superinspector publish-central "$ROM_PATH" \
             --branch main \
             --device-id "${{ steps.analyze.outputs.codename }}" \
@@ -697,6 +698,18 @@ jobs:
           echo "::endgroup::"
           if [[ $rc -ne 0 ]]; then
             echo "::error::publish-central exited with status ${rc}"
+            echo "::error::stderr (from central_publish.stderr):"
+            if [[ -s ./fastboot-profile/central_publish.stderr ]]; then
+              head -100 ./fastboot-profile/central_publish.stderr >&2
+            else
+              echo "(empty)" >&2
+            fi
+            echo "::error::stdout (from central_publish.json, if any):"
+            if [[ -s ./fastboot-profile/central_publish.json ]]; then
+              head -100 ./fastboot-profile/central_publish.json >&2
+            else
+              echo "(empty)" >&2
+            fi
             exit $rc
           fi
           # Surface the central-publish outcome through step outputs.
