@@ -352,6 +352,13 @@ jobs:
           if (Test-Path "super-inspector/requirements.txt") {
             python -m pip install -r super-inspector/requirements.txt
           }
+          # Install the engine package itself so `python -m deadzone_superinspector`
+          # is importable from every later step (analyze, publish-rom-repo,
+          # publish-central). The build.sh script handles its own PYTHONPATH,
+          # but the new publish flow uses `-m` directly.
+          if (Test-Path "super-inspector/pyproject.toml") {
+            python -m pip install -e super-inspector --no-deps
+          }
           python -m pip install pyinstaller
 
       - name: "🔍 Validate project structure"
@@ -484,6 +491,250 @@ jobs:
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Inspector build finished" || true
 
+      - name: "🔍 Resolve publish credentials"
+        id: publish_creds
+        shell: bash
+        env:
+          DEADZONE_ROM_REPO_TOKEN: ${{ secrets.DEADZONE_ROM_REPO_TOKEN }}
+          ROM_REPO_PUSH_TOKEN: ${{ secrets.ROM_REPO_PUSH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Canonical: DEADZONE_ROM_REPO_TOKEN.
+          # Deprecated fallback: ROM_REPO_PUSH_TOKEN (legacy alias).
+          # Last-resort fallback: GH_TOKEN (the existing PAT).
+          if [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
+            printf '::notice::Using canonical DEADZONE_ROM_REPO_TOKEN for central push.\n'
+            export DEADZONE_ROM_REPO_TOKEN
+            printf 'publish_token_source=DEADZONE_ROM_REPO_TOKEN\n' >> "$GITHUB_OUTPUT"
+          elif [[ -n "${ROM_REPO_PUSH_TOKEN:-}" ]]; then
+            echo '::warning::Using deprecated ROM_REPO_PUSH_TOKEN; please migrate to DEADZONE_ROM_REPO_TOKEN.'
+            export ROM_REPO_PUSH_TOKEN
+            printf 'publish_token_source=ROM_REPO_PUSH_TOKEN (deprecated)\n' >> "$GITHUB_OUTPUT"
+          elif [[ -n "${GH_TOKEN:-}" ]]; then
+            echo '::warning::Using GH_TOKEN as a last-resort fallback for the central push; provision DEADZONE_ROM_REPO_TOKEN to silence this warning.'
+            export DEADZONE_ROM_REPO_TOKEN="$GH_TOKEN"
+            printf 'publish_token_source=GH_TOKEN (fallback)\n' >> "$GITHUB_OUTPUT"
+          else
+            echo '::notice::No publish token is configured. The publish steps will run in --dry-run mode.'
+            printf 'publish_token_source=none\n' >> "$GITHUB_OUTPUT"
+          fi
+          if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
+            echo '::warning::DEADZONE_PRIVATE_READ_TOKEN is unset; downstream publish will fail unless the engine checkout uses an unauthenticated path.'
+          fi
+          # Normalize the ROM path to a POSIX form so python on Windows
+          # (which accepts both styles) gets a clean argument. MSYS path
+          # translation is disabled so the value matches the on-disk path.
+          ROM_PATH_POSIX="${ROM_PATH:-}"
+          if [[ -n "$ROM_PATH_POSIX" && "$ROM_PATH_POSIX" != /* ]]; then
+            ROM_PATH_POSIX="$(cygpath -u "$ROM_PATH_POSIX" 2>/dev/null || echo "$ROM_PATH_POSIX")"
+          fi
+          printf 'rom_path_posix=%s\n' "$ROM_PATH_POSIX" >> "$GITHUB_OUTPUT"
+          printf 'publish_token_present=%s\n' "$([[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          if [[ ! -e "$ROM_PATH_POSIX" ]]; then
+            echo "::warning::ROM is not present at ${ROM_PATH_POSIX}. The publish steps will run in --dry-run mode."
+            printf 'rom_present=false\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'rom_present=true\n' >> "$GITHUB_OUTPUT"
+            printf 'rom_size_bytes=%s\n' "$(stat -c%s "$ROM_PATH_POSIX" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "📊 Analyze ROM and emit device profile"
+        id: analyze
+        shell: bash
+        env:
+          ROM_PATH: ${{ steps.publish_creds.outputs.rom_path_posix }}
+          DEADZONE_ROM_REPO_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.DEADZONE_ROM_REPO_TOKEN || '' }}
+          ROM_REPO_PUSH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.ROM_REPO_PUSH_TOKEN || '' }}
+          GH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.GH_TOKEN || '' }}
+          # If no token, fall back to GH_TOKEN (works because the workflow's
+          # GH_TOKEN has admin on the org).
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+          DEADZONE_ROM_REPO_AUTHOR_NAME: 'deadzone-bot'
+          DEADZONE_ROM_REPO_AUTHOR_EMAIL: 'bot@deadzone.offical'
+        run: |
+          set -euo pipefail
+          # Normalize token name into the canonical env var the engine reads.
+          if [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
+            : # canonical already set
+          elif [[ -n "${ROM_REPO_PUSH_TOKEN:-}" ]]; then
+            export DEADZONE_ROM_REPO_TOKEN="$ROM_REPO_PUSH_TOKEN"
+          elif [[ -n "${GH_TOKEN:-}" ]]; then
+            export DEADZONE_ROM_REPO_TOKEN="$GH_TOKEN"
+          fi
+          ROM_PRESENT="${{ steps.publish_creds.outputs.rom_present }}"
+          TOKEN_PRESENT="${{ steps.publish_creds.outputs.publish_token_present }}"
+          if [[ "$ROM_PRESENT" != "true" || "$TOKEN_PRESENT" != "true" ]]; then
+            echo "::notice::Skipping ROM analysis: rom_present=${ROM_PRESENT}, token_present=${TOKEN_PRESENT}. Run in dry-run mode."
+            mkdir -p fastboot-profile
+            printf 'fastboot-profile/DRY_RUN.txt' > fastboot-profile/DRY_RUN.txt
+            printf 'no ROM or token; nothing analyzed\n' > fastboot-profile/DRY_RUN.txt
+            printf 'codename=\n' >> "$GITHUB_OUTPUT"
+            printf 'profile_dir=\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p fastboot-profile
+          echo "::group::ROM analysis"
+          echo "rom_path: $ROM_PATH"
+          python3 -m deadzone_superinspector analyze "$ROM_PATH" \
+            --output ./fastboot-profile \
+            --json \
+            --build-id "${DEADZONE_REQUEST_ID}" || true
+          echo "::endgroup::"
+          # Discover the codename + profile dir from the analyzer's output.
+          # The analyzer writes profile paths under
+          #   <out_base>/devices/<device_id>/<profile_id>/device.json
+          # but the exact device_id is unknown until analyze runs.
+          # We find the device.json by walking at most 5 levels deep.
+          device_json="$(find ./fastboot-profile -type f -name 'device.json' 2>/dev/null | head -1 || true)"
+          codename=""
+          if [[ -n "$device_json" ]] && command -v python3 >/dev/null 2>&1; then
+            # Inline Python (one-liner) so we keep the YAML block scalar literal.
+            codename="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); print(str(d.get('device_id') or ''))" "$device_json" 2>/dev/null || true)"
+          fi
+          printf 'codename=%s\n' "$codename" >> "$GITHUB_OUTPUT"
+          printf 'profile_dir=%s\n' "$(dirname "$device_json")" >> "$GITHUB_OUTPUT"
+          echo "codename: ${codename:-unknown}"
+          echo "profile_dir: $(dirname "$device_json" 2>/dev/null || echo unknown)"
+
+      - name: "📤 Publish per-build tree to DeadZone-ROM-Repository"
+        if: steps.publish_creds.outputs.publish_token_present == 'true' && steps.publish_creds.outputs.rom_present == 'true'
+        shell: bash
+        env:
+          DEADZONE_ROM_REPO_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.DEADZONE_ROM_REPO_TOKEN || '' }}
+          ROM_REPO_PUSH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.ROM_REPO_PUSH_TOKEN || '' }}
+          GH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.GH_TOKEN || '' }}
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_ROM_REPO_AUTHOR_NAME: 'deadzone-bot'
+          DEADZONE_ROM_REPO_AUTHOR_EMAIL: 'bot@deadzone.offical'
+        run: |
+          set -euo pipefail
+          if [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
+            : # canonical
+          elif [[ -n "${ROM_REPO_PUSH_TOKEN:-}" ]]; then
+            export DEADZONE_ROM_REPO_TOKEN="$ROM_REPO_PUSH_TOKEN"
+          elif [[ -n "${GH_TOKEN:-}" ]]; then
+            export DEADZONE_ROM_REPO_TOKEN="$GH_TOKEN"
+          fi
+          profile_dir="${{ steps.analyze.outputs.profile_dir }}"
+          codename="${{ steps.analyze.outputs.codename }}"
+          if [[ -z "$profile_dir" || ! -d "$profile_dir" ]]; then
+            echo '::error::Profile directory is missing; cannot publish the per-build tree.'
+            exit 1
+          fi
+          echo "::group::Publishing per-build tree"
+          echo "codename       : ${codename:-unknown}"
+          echo "profile_dir   : $profile_dir"
+          python3 -m deadzone_superinspector publish-rom-repo "$profile_dir" \
+            --device-id "${codename}" \
+            --build-id "${DEADZONE_REQUEST_ID}" \
+            --branch main \
+            --author-name "$DEADZONE_ROM_REPO_AUTHOR_NAME" \
+            --author-email "$DEADZONE_ROM_REPO_AUTHOR_EMAIL" \
+            --json --out ./fastboot-profile/rom_repo_publish.json
+          echo "::endgroup::"
+
+      - name: "📚 Publish central metadata registry entry"
+        if: steps.publish_creds.outputs.publish_token_present == 'true' && steps.publish_creds.outputs.rom_present == 'true'
+        id: publish_central
+        shell: bash
+        env:
+          DEADZONE_ROM_REPO_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.DEADZONE_ROM_REPO_TOKEN || '' }}
+          ROM_REPO_PUSH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.ROM_REPO_PUSH_TOKEN || '' }}
+          GH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.GH_TOKEN || '' }}
+          ROM_PATH: ${{ steps.publish_creds.outputs.rom_path_posix }}
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_ROM_REPO_AUTHOR_NAME: 'deadzone-bot'
+          DEADZONE_ROM_REPO_AUTHOR_EMAIL: 'bot@deadzone.offical'
+        run: |
+          set -euo pipefail
+          if [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
+            : # canonical
+          elif [[ -n "${ROM_REPO_PUSH_TOKEN:-}" ]]; then
+            export DEADZONE_ROM_REPO_TOKEN="$ROM_REPO_PUSH_TOKEN"
+          elif [[ -n "${GH_TOKEN:-}" ]]; then
+            export DEADZONE_ROM_REPO_TOKEN="$GH_TOKEN"
+          fi
+          echo "::group::Publishing central registry entry"
+          echo "rom_path    : $ROM_PATH"
+          echo "codename    : ${{ steps.analyze.outputs.codename }}"
+          echo "branch      : main"
+          echo "remote      : DeadZone-Offical/DeadZone-ROM-Repository"
+          python3 -m deadzone_superinspector publish-central "$ROM_PATH" \
+            --branch main \
+            --promoter deadzone-bot \
+            --author-name "$DEADZONE_ROM_REPO_AUTHOR_NAME" \
+            --author-email "$DEADZONE_ROM_REPO_AUTHOR_EMAIL" \
+            --json --out ./fastboot-profile/central_publish.json
+          rc=$?
+          set -e
+          echo "::endgroup::"
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::publish-central exited with status ${rc}"
+            exit $rc
+          fi
+          # Surface the central-publish outcome through step outputs.
+          commit_sha="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/central_publish.json')); print(d.get('commit_sha',''))" 2>/dev/null || true)"
+          codename="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/central_publish.json')); print(d.get('codename',''))" 2>/dev/null || true)"
+          destination="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/central_publish.json')); print(d.get('destination_path',''))" 2>/dev/null || true)"
+          no_op="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/central_publish.json')); print(str(bool(d.get('no_op'))).lower())" 2>/dev/null || echo true)"
+          printf 'commit_sha=%s\n' "$commit_sha" >> "$GITHUB_OUTPUT"
+          printf 'codename=%s\n' "$codename" >> "$GITHUB_OUTPUT"
+          printf 'destination_path=%s\n' "$destination" >> "$GITHUB_OUTPUT"
+          printf 'no_op=%s\n' "$no_op" >> "$GITHUB_OUTPUT"
+          echo "commit_sha   : $commit_sha"
+          echo "codename     : $codename"
+          echo "destination  : $destination"
+          echo "no_op        : $no_op"
+
+      - name: "📣 Report publish results to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
+            set -a
+            # shellcheck disable=SC1091
+            source runtime/build.env
+            set +a
+            export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:-}"
+          fi
+          codename="${{ steps.analyze.outputs.codename }}"
+          commit_sha="${{ steps.publish_central.outputs.commit_sha }}"
+          destination="${{ steps.publish_central.outputs.destination_path }}"
+          msg="Inspector build finished"
+          if [[ -n "$codename" && -n "$commit_sha" ]]; then
+            msg="Inspector build finished; published ${codename} → ${destination} (${commit_sha:0:7})"
+          elif [[ -n "$codename" ]]; then
+            msg="Inspector build finished; central publish was a no-op for ${codename}"
+          fi
+          python3 runtime/build_stage.py building \
+            --project fastboot \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "$msg" || true
+
+      - name: "📦 Upload profile tree as debug artifact"
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d fastboot-profile ]]; then
+            echo "Profile tree contents:"
+            find fastboot-profile -maxdepth 4 -type f | head -40 || true
+            echo
+            echo "Profile tree size:"
+            du -sh fastboot-profile 2>/dev/null || echo "unknown"
+          else
+            echo "::warning::No fastboot-profile directory was produced."
+          fi
+
       - name: "🗜️ Package artifact"
         shell: pwsh
         env:
@@ -547,6 +798,15 @@ jobs:
           name: DeadZoneFastbootInspector-Windows
           path: super-inspector/dist/DeadZoneFastbootInspector-Windows.zip
           if-no-files-found: error
+          retention-days: 30
+
+      - name: "⬆️ Upload profile tree as debug artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZoneFastbootInspector-Profile
+          path: |
+            fastboot-profile/**
+          if-no-files-found: ignore
           retention-days: 30
 
       - name: "✅ Report successful Fastboot build"
@@ -617,7 +877,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          rm -rf super-inspector runtime 2>/dev/null || true
+          rm -rf super-inspector runtime fastboot-profile 2>/dev/null || true
           echo "Fastboot workspace cleanup complete"
 
       - name: "📣 Build summary"
@@ -629,6 +889,11 @@ jobs:
           ROM_FILENAME: ${{ env.ROM_FILENAME }}
           ROM_SHA256: ${{ env.ROM_SHA256 }}
           ROM_URL: ${{ env.ROM_URL }}
+          PUBLISH_CODENAME: ${{ steps.analyze.outputs.codename }}
+          PUBLISH_COMMIT_SHA: ${{ steps.publish_central.outputs.commit_sha }}
+          PUBLISH_DESTINATION: ${{ steps.publish_central.outputs.destination_path }}
+          PUBLISH_NO_OP: ${{ steps.publish_central.outputs.no_op }}
+          PUBLISH_TOKEN_SOURCE: ${{ steps.publish_creds.outputs.publish_token_source }}
         run: |
           {
             echo "## 🩺 DeadZone-Fastboot build"
@@ -639,6 +904,18 @@ jobs:
             echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
             if [[ -n "${ROM_FILENAME:-}" ]]; then
               echo "- ROM: \`${ROM_FILENAME}\` (sha256: \`${ROM_SHA256:-unknown}\`)"
+            fi
+            if [[ -n "${PUBLISH_CODENAME:-}" ]]; then
+              echo "- Central registry codename: \`${PUBLISH_CODENAME}\`"
+            fi
+            if [[ -n "${PUBLISH_TOKEN_SOURCE:-}" ]]; then
+              echo "- Publish token source: \`${PUBLISH_TOKEN_SOURCE}\`"
+            fi
+            if [[ -n "${PUBLISH_COMMIT_SHA:-}" ]]; then
+              echo "- Central commit: \`${PUBLISH_COMMIT_SHA:0:12}\` (no-op: \`${PUBLISH_NO_OP:-true}\`)"
+              echo "- Central destination: \`${PUBLISH_DESTINATION:-metadata/devices/${PUBLISH_CODENAME}.json}\`"
+            elif [[ -n "${PUBLISH_CODENAME:-}" ]]; then
+              echo "- Central publish: dry-run (no token or ROM)"
             fi
             echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } >> "$GITHUB_STEP_SUMMARY"
