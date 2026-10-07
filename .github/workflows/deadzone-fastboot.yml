@@ -685,12 +685,13 @@ jobs:
           echo "branch      : main"
           echo "remote      : DeadZone-Offical/DeadZone-ROM-Repository"
           set +e
+          # publish-central picks up --author-name / --author-email via env
+          # (DEADZONE_ROM_REPO_AUTHOR_NAME / DEADZONE_ROM_REPO_AUTHOR_EMAIL)
+          # not via CLI flags.
           python3 -m deadzone_superinspector publish-central "$ROM_PATH" \
             --branch main \
             --device-id "${{ steps.analyze.outputs.codename }}" \
             --promoter deadzone-bot \
-            --author-name "$DEADZONE_ROM_REPO_AUTHOR_NAME" \
-            --author-email "$DEADZONE_ROM_REPO_AUTHOR_EMAIL" \
             --json 2> ./fastboot-profile/central_publish.stderr \
             >  ./fastboot-profile/central_publish.json
           rc=$?
