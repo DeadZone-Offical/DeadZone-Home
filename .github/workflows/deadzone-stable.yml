@@ -379,6 +379,7 @@ jobs:
 
       - name: "📤 Publish Stable device profile"
         if: success() && inputs.publish_profile == true
+        id: publish_central_profile
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -424,6 +425,80 @@ jobs:
           DEADZONE_DIR="build/.deadzone" \
             bash bin/deviceprofile/run_device_profile_publish.sh \
               --codename "$codename" \
+              --build-id "stable-${codename}-${DEADZONE_REQUEST_ID}" \
+              --promoter "DeadZone-Xiaomi-Stable"
+
+      - name: "📤 Publish Stable device profile to Stable engine repository"
+        if: success() && inputs.publish_profile == true
+        id: publish_stable_profile
+        working-directory: toolbuild
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+          DEADZONE_STABLE_REPO_TOKEN: ${{ secrets.DEADZONE_STABLE_REPO_TOKEN }}
+          DEADZONE_ROM_REPO_TOKEN: ${{ secrets.DEADZONE_ROM_REPO_TOKEN }}
+          DEADZONE_STABLE_REPO_AUTHOR_NAME: deadzone-bot
+          DEADZONE_STABLE_REPO_AUTHOR_EMAIL: bot@deadzone.local
+        run: |
+          set -Eeuo pipefail
+          # The Stable engine repository itself receives a per-codename
+          # profile JSON at bin/DeviceConfig/<codename>/<codename>.json.
+          # This is a separate writer from the central-registry one
+          # above; the two repos have different ownership and
+          # different token scopes. The writer uses
+          # DEADZONE_STABLE_REPO_TOKEN (Contents: read+write on
+          # DeadZone-Offical/DeadZone-Xiaomi-Stable) and falls back to
+          # DEADZONE_ROM_REPO_TOKEN for one cycle so existing launchers
+          # keep working.
+          if [[ -z "${DEADZONE_STABLE_REPO_TOKEN:-}" ]] && [[ -z "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
+            echo "::error::DEADZONE_STABLE_REPO_TOKEN (or the deprecated DEADZONE_ROM_REPO_TOKEN fallback) is required to publish the Stable engine profile. Provision a fine-grained PAT scoped to DeadZone-Offical/DeadZone-Xiaomi-Stable with Contents: read+write and expose it as the DEADZONE_STABLE_REPO_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
+            exit 1
+          fi
+          if [[ ! -x bin/deviceprofile/run_device_profile_publish_to_stable.sh ]]; then
+            echo "::error::Stable-repo device-profile publisher is missing or not executable: bin/deviceprofile/run_device_profile_publish_to_stable.sh" >&2
+            exit 1
+          fi
+          if [[ ! -s build/.deadzone/super_physical_size.txt ]] || [[ ! -s build/.deadzone/super_physical_size_known.txt ]]; then
+            echo "::error::Stable Stage 5 (super) state is missing; refusing to publish without an authoritative physical super size." >&2
+            exit 1
+          fi
+          codename=""
+          if [[ -s build/.deadzone/rom_metadata.json ]]; then
+            codename=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("device",{}).get("codename",""))' build/.deadzone/rom_metadata.json 2>/dev/null || true)
+          fi
+          if [[ -z "$codename" ]]; then
+            echo "::error::Could not determine Stable codename from build/.deadzone/rom_metadata.json; refusing to publish." >&2
+            exit 1
+          fi
+          # Pull the region and OS family from the build state. Both
+          # are required for the strict (codename, OS, region, ROM
+          # build) variant lookup. We never fall back to a default
+          # region or OS family; missing values are a hard error.
+          region=""
+          os_family=""
+          if [[ -s build/.deadzone/rom_metadata.json ]]; then
+            region=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("rom",{}).get("region","") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)
+            os_family=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=d.get("rom",{}).get("version","") or "";print(v.split(".")[0] if v.startswith("OS") else ("MIUI" if v.startswith("MIUI") or v.startswith("V") else "OS1"))' build/.deadzone/rom_metadata.json 2>/dev/null || echo OS1)
+          fi
+          if [[ -z "$region" ]]; then
+            echo "::error::Could not determine Stable region from build/.deadzone/rom_metadata.json; refusing to publish. The strict variant lookup requires a non-empty region." >&2
+            exit 1
+          fi
+          if [[ -z "$os_family" ]]; then
+            os_family="OS1"
+          fi
+          if [[ -n "${DEADZONE_STABLE_REPO_TOKEN:-}" ]]; then
+            printf '::add-mask::%s\n' "$DEADZONE_STABLE_REPO_TOKEN"
+          fi
+          if [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
+            printf '::add-mask::%s\n' "$DEADZONE_ROM_REPO_TOKEN"
+          fi
+          DEADZONE_DIR="build/.deadzone" \
+            bash bin/deviceprofile/run_device_profile_publish_to_stable.sh \
+              --codename "$codename" \
+              --region "$region" \
+              --os-family "$os_family" \
               --build-id "stable-${codename}-${DEADZONE_REQUEST_ID}" \
               --promoter "DeadZone-Xiaomi-Stable"
 
