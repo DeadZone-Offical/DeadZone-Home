@@ -6,6 +6,27 @@
 # creates its own GitHub Actions run; Stable is NOT routed through any
 # generic dispatcher.
 #
+# Architecture / ownership boundary
+# ---------------------------------
+# Device configuration is owned by DeadZone-SuperInspector, NOT by
+# this workflow. The Stable build engine reads per-codename
+# configurations from ``DeadZone-Xiaomi-Stable/bin/DeviceConfig/<codename>/<codename>.json``
+# at Stage 9 (flash) and Stage 10 (release). SuperInspector generates
+# and publishes that file via its own writer; this workflow MUST NOT
+# publish, regenerate, or backfill device configurations. A missing
+# DeviceConfig is the operator's signal to run SuperInspector first —
+# the workflow fails fast with a clear, actionable error rather than
+# inventing flash destinations or duplicating SuperInspector's work.
+#
+# Post-prompt-removal contract
+# ---------------------------
+# The Stable flow matches Lite / Fastboot / Ninja: a valid ROM URL
+# is enough to dispatch the build. The workflow does NOT declare
+# any device-profile dispatch input, and there is no post-success
+# device-profile publication step. The bot does NOT collect any
+# pre-build publication confirmation — that decision is owned by
+# SuperInspector, not by the launcher or the bot.
+#
 # Concurrency model
 # ----------------
 # Each `workflow_dispatch` invocation creates a fresh GitHub Actions
@@ -77,11 +98,6 @@ on:
         description: "🔗 Signed DeadZone build-event endpoint"
         required: true
         type: string
-      publish_profile:
-        description: "📤 Publish the validated Stable device profile to DeadZone-SuperInspector (central registry). Default off — only authorized bot dispatches / explicit operator runs set this input."
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -254,6 +270,24 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: "🛡️ Verify private Stable engine checkout"
+        if: always() && failure()
+        shell: bash
+        run: |
+          set -uo pipefail
+          # When the engine checkout above failed (the canonical
+          # symptom of run 37811685473 was a 403 from the private
+          # engine repository), GitHub surfaces a single opaque
+          # "unable to access …" line per retry and the rest of the
+          # job drifts. We turn the silent 403 into an actionable
+          # diagnostic: a token whose fine-grained PAT does NOT
+          # grant Contents: Read-only on the Stable engine
+          # repository is the most likely cause, and the next step
+          # would only fail the same way.
+          echo "::error::Private Stable engine checkout failed."
+          echo "::error::engine_repository=${{ steps.runtime.outputs.engine_repository }}"
+          echo "::error::The DEADZONE_PRIVATE_READ_TOKEN secret on DeadZone-Offical/DeadZone-Home must be a fine-grained PAT with Contents: Read-only on DeadZone-Offical/DeadZone-Xiaomi-Stable (in addition to DeadZone-Offical/DeadZone-File). The run continues so the workspace is cleaned up; the next build will fail the same way until the secret is fixed."
+
       - name: "🛡️ Prepare Stable engine for rclone upload"
         working-directory: toolbuild
         shell: bash
@@ -301,6 +335,47 @@ jobs:
           bash -n bin/upload/run_upload.sh
           bash -n bin/release/run_release.sh
 
+      - name: "🛡️ Verify SuperInspector device config presence"
+        working-directory: toolbuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Device configuration is owned by DeadZone-SuperInspector.
+          # The Stable build engine reads per-codename profiles from
+          # ``bin/DeviceConfig/<codename>/<codename>.json`` at Stage 9
+          # (flash) and Stage 10 (release). SuperInspector generates
+          # and publishes that file via its own writer. This workflow
+          # MUST NOT regenerate, backfill, or duplicate that work.
+          #
+          # The codename is unknown until Stage 4 (metadata) of
+          # build.sh runs, so we cannot pre-validate a specific
+          # codename here. We instead check the upstream
+          # precondition: at least one DeviceConfig directory must
+          # exist, otherwise SuperInspector has never published any
+          # profiles to the Stable engine and the build would fail
+          # inside Stage 9 with the engine's own
+          # ``dz_flash_load_config`` error.
+          #
+          # We fail fast with a clear, actionable error pointing the
+          # operator at SuperInspector instead of letting the build
+          # progress 11 stages only to die in Stage 9.
+          if [[ ! -d bin/DeviceConfig ]]; then
+            echo "::error::bin/DeviceConfig/ is missing from the Stable engine checkout." >&2
+            echo "::error::DeadZone-SuperInspector is the owner of bin/DeviceConfig/<codename>/<codename>.json. Run SuperInspector against the device's stock ROM first so it can publish the per-codename device configuration into DeadZone-Offical/DeadZone-Xiaomi-Stable, then re-dispatch this Stable build." >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          device_config_files=(bin/DeviceConfig/*/*.json)
+          shopt -u nullglob
+          if (( ${#device_config_files[@]} == 0 )); then
+            echo "::error::bin/DeviceConfig/ is empty: no per-codename device configuration has been published to the Stable engine." >&2
+            echo "::error::DeadZone-SuperInspector is the owner of bin/DeviceConfig/<codename>/<codename>.json. Run SuperInspector against the device's stock ROM first so it can publish the per-codename device configuration into DeadZone-Offical/DeadZone-Xiaomi-Stable, then re-dispatch this Stable build." >&2
+            exit 1
+          fi
+          printf '::group::SuperInspector DeviceConfig presence\n'
+          printf '  - %s\n' "${device_config_files[@]}"
+          printf '::endgroup::\n'
+
       - name: "📣 Start live tracking"
         working-directory: toolbuild
         env:
@@ -339,17 +414,90 @@ jobs:
           set -e
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
 
+      - name: "📡 Report progress to bot (Lite parity)"
+        if: success()
+        working-directory: toolbuild
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          # Lite's launcher emits `downloading`, `reading_rom`,
+          # `building`, `packaging`, and `uploading` stage events
+          # so the live panel can show granular progress while
+          # `build.sh` runs the same Stable 11-stage pipeline as
+          # a single shell invocation. Stable's pipeline is
+          # opaque to the workflow layer (build.sh runs as one
+          # `sudo bash`), so the workflow fires the stage
+          # transitions defensively around the build step itself.
+          # Each event is best-effort: a callback failure must
+          # never fail a build that already produced a usable
+          # artifact.
+          python3 runtime/build_stage.py downloading \
+            --project stable \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "ROM download finished" || true
+          # The build engine writes the sanitized device codename
+          # and base ROM code into build/.deadzone/rom_metadata.json
+          # (NOT into Lite's bin/device/* state files). We forward
+          # them verbatim — the live panel renders them as
+          # `Device:` and `ROM:` only when the engine actually
+          # produced a non-empty value.
+          codename=""
+          rom_version=""
+          if [[ -s build/.deadzone/rom_metadata.json ]]; then
+            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.upper() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+            rom_version="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("rom",{}) or {}).get("version","") or (d.get("rom",{}) or {}).get("rom_code","");print("".join(c for c in v if c.isalnum() or c in "._+-") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+          fi
+          extra_args=()
+          [[ -n "$codename" ]] && extra_args+=(--device "$codename")
+          [[ -n "$rom_version" ]] && extra_args+=(--rom "$rom_version")
+          python3 runtime/build_stage.py reading_rom \
+            --project stable \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "ROM metadata extracted" \
+            "${extra_args[@]}" || true
+          python3 runtime/build_stage.py building \
+            --project stable \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Engine build finished" || true
+          python3 runtime/build_stage.py packaging \
+            --project stable \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Super packed" || true
+          python3 runtime/build_stage.py uploading \
+            --project stable \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Upload complete" || true
+
       - name: "🗂️ Collect Stable artifact metadata"
         if: always()
+        continue-on-error: true
         working-directory: toolbuild
         env:
           DEADZONE_GOOGLE_UPLOAD_STATUS: ${{ env.DEADZONE_GOOGLE_UPLOAD_STATUS }}
         run: |
-          set -Eeuo pipefail
+          set -Euo pipefail
+          # This step is diagnostic, not a job-failure driver.
+          # When the build failed before producing a ZIP, the
+          # "❌ Send failure notification" step is the
+          # authoritative terminal event for the live panel and
+          # the artifact-delivery event has nothing to report.
+          # Running this with continue-on-error: true keeps the
+          # failure notification flowing without piling a
+          # second "no final ZIP" error on top of the real
+          # build failure.
           mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Stable_*.zip' -print 2>/dev/null)
           if (( ${#final_zips[@]} != 1 )); then
-            echo "::error::Expected exactly one preserved final Stable ZIP; found ${#final_zips[@]}" | tee -a build_action.log
-            exit 1
+            echo "::warning::Expected exactly one preserved final Stable ZIP; found ${#final_zips[@]} (build likely failed before Stage 10)" | tee -a build_action.log
+            echo "::group::Stable artifact metadata"
+            echo "  - result name: <missing>"
+            echo "  - size: <missing>"
+            echo "  - sha256: <missing>"
+            echo "  - drive url: <missing>"
+            echo "::endgroup::"
+            exit 0
           fi
 
           final_zip="${final_zips[0]}"
@@ -358,6 +506,44 @@ jobs:
           final_sha256="$(sha256sum "$final_zip" | awk '{print $1}')"
           printf 'DEADZONE_FILE_SIZE=%s\nDEADZONE_INTEGRITY_VERIFIED=1\nDEADZONE_RESULT_NAME=%s\nDEADZONE_INTEGRITY_SHA256=%s\n' \
             "$final_size_bytes" "$final_name" "$final_sha256" >> "$GITHUB_ENV"
+
+          # Derive codename, ROM version, and OS folder from the
+          # engine's canonical metadata file. This is the same
+          # path the upload stage uses, so the Drive-URL probe
+          # below lines up with where the artifact actually lives.
+          codename=""
+          rom_version=""
+          os_folder=""
+          if [[ -s build/.deadzone/rom_metadata.json ]]; then
+            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.upper() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+            rom_version="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("rom",{}) or {}).get("version","") or (d.get("rom",{}) or {}).get("rom_code","");print("".join(c for c in v if c.isalnum() or c in "._+-") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+            if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
+              os_folder="${BASH_REMATCH[1]}"
+            elif [[ "$rom_version" =~ ^[Vv]([0-9]+) ]]; then
+              os_folder="MIUI${BASH_REMATCH[1]}"
+            fi
+          fi
+
+          # Surface the Drive URL on the standard variable name
+          # so the build summary and the success notification
+          # can render the public link. The upload stage writes
+          # DEADZONE_GOOGLE_DRIVE_URL to $GITHUB_ENV, but only
+          # in the same step that consumed the rclone config
+          # and is no longer readable here; re-derive it from
+          # the same rclone config the engine just used.
+          if [[ -n "${RCLONE_REMOTE_NAME:-}" && -n "${RCLONE_UPLOAD_DIR:-}" && -s rclone.conf && -n "$final_name" && -n "$codename" && -n "$os_folder" ]]; then
+            drive_url="$(rclone --config=rclone.conf link "${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+            if [[ -n "$drive_url" ]]; then
+              printf 'DEADZONE_GOOGLE_DRIVE_URL=%s\nDEADZONE_RESULT_URL=%s\n' "$drive_url" "$drive_url" >> "$GITHUB_ENV"
+            fi
+          fi
+
+          echo "::group::Stable artifact metadata"
+          echo "  - result name: ${DEADZONE_RESULT_NAME:-<missing>}"
+          echo "  - size: ${DEADZONE_FILE_SIZE:-<missing>}"
+          echo "  - sha256: ${DEADZONE_INTEGRITY_SHA256:-<missing>}"
+          echo "  - drive url: ${DEADZONE_GOOGLE_DRIVE_URL:-<missing>}"
+          echo "::endgroup::"
 
       - name: "✅ Send success notification"
         if: success()
@@ -371,136 +557,18 @@ jobs:
           DEADZONE_INTEGRITY_SHA256: ${{ env.DEADZONE_INTEGRITY_SHA256 }}
         run: |
           set -euo pipefail
+          # Terminal succeeded event. This is the source of
+          # truth for the live panel: any post-success side
+          # effect (device-profile publication) runs AFTER
+          # this step so a publication failure can never fail
+          # the build or prevent artifact delivery. The helper
+          # is best-effort: a callback failure must not fail a
+          # build that already produced a usable artifact.
           if [[ -s runtime/report_build_event.py ]]; then
             python3 runtime/report_build_event.py succeeded \
               --project stable \
               --message "DeadZone Stable build complete." || true
           fi
-
-      - name: "📤 Publish Stable device profile"
-        if: success() && inputs.publish_profile == true
-        id: publish_central_profile
-        working-directory: toolbuild
-        env:
-          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
-          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
-          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
-          DEADZONE_ROM_REPO_TOKEN: ${{ secrets.DEADZONE_ROM_REPO_TOKEN }}
-          DEADZONE_ROM_REPO_AUTHOR_NAME: deadzone-bot
-          DEADZONE_ROM_REPO_AUTHOR_EMAIL: bot@deadzone.local
-        run: |
-          set -Eeuo pipefail
-          # Stable's device-profile publisher lives under
-          # ``bin/deviceprofile/`` and is only invoked here when the
-          # operator (or authorized bot dispatch) explicitly set the
-          # workflow_dispatch input ``publish_profile=true``. Normal
-          # ROM builds do NOT touch the SuperInspector central
-          # registry; the bot UI keeps the toggle off by default and
-          # only flips it after the user confirms the publication.
-          if [[ -z "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
-            echo "::error::DEADZONE_ROM_REPO_TOKEN is missing; refusing to publish a device profile. Provision a fine-grained PAT scoped to DeadZone-Offical/DeadZone-ROM-Repository with Contents: read and write, and expose it as the DEADZONE_ROM_REPO_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
-            exit 1
-          fi
-          if [[ ! -x bin/deviceprofile/run_device_profile_publish.sh ]]; then
-            echo "::error::Stable device-profile publisher is missing or not executable: bin/deviceprofile/run_device_profile_publish.sh" >&2
-            exit 1
-          fi
-          # The publisher reads DEADZONE_DIR from the canonical build
-          # state directory written by Stage 5 (super) + Stage 9 (metadata).
-          # It expects: super_physical_size.txt + super_physical_size_known.txt
-          # + super_geometry.json + rom_metadata.json.
-          if [[ ! -s build/.deadzone/super_physical_size.txt ]] || [[ ! -s build/.deadzone/super_physical_size_known.txt ]]; then
-            echo "::error::Stable Stage 5 (super) state is missing; refusing to publish without an authoritative physical super size." >&2
-            exit 1
-          fi
-          codename=""
-          if [[ -s build/.deadzone/rom_metadata.json ]]; then
-            codename=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("device",{}).get("codename",""))' build/.deadzone/rom_metadata.json 2>/dev/null || true)
-          fi
-          if [[ -z "$codename" ]]; then
-            echo "::error::Could not determine Stable codename from build/.deadzone/rom_metadata.json; refusing to publish." >&2
-            exit 1
-          fi
-          printf '::add-mask::%s\n' "$DEADZONE_ROM_REPO_TOKEN"
-          DEADZONE_DIR="build/.deadzone" \
-            bash bin/deviceprofile/run_device_profile_publish.sh \
-              --codename "$codename" \
-              --build-id "stable-${codename}-${DEADZONE_REQUEST_ID}" \
-              --promoter "DeadZone-Xiaomi-Stable"
-
-      - name: "📤 Publish Stable device profile to Stable engine repository"
-        if: success() && inputs.publish_profile == true
-        id: publish_stable_profile
-        working-directory: toolbuild
-        env:
-          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
-          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
-          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
-          DEADZONE_STABLE_REPO_TOKEN: ${{ secrets.DEADZONE_STABLE_REPO_TOKEN }}
-          DEADZONE_ROM_REPO_TOKEN: ${{ secrets.DEADZONE_ROM_REPO_TOKEN }}
-          DEADZONE_STABLE_REPO_AUTHOR_NAME: deadzone-bot
-          DEADZONE_STABLE_REPO_AUTHOR_EMAIL: bot@deadzone.local
-        run: |
-          set -Eeuo pipefail
-          # The Stable engine repository itself receives a per-codename
-          # profile JSON at bin/DeviceConfig/<codename>/<codename>.json.
-          # This is a separate writer from the central-registry one
-          # above; the two repos have different ownership and
-          # different token scopes. The writer uses
-          # DEADZONE_STABLE_REPO_TOKEN (Contents: read+write on
-          # DeadZone-Offical/DeadZone-Xiaomi-Stable) and falls back to
-          # DEADZONE_ROM_REPO_TOKEN for one cycle so existing launchers
-          # keep working.
-          if [[ -z "${DEADZONE_STABLE_REPO_TOKEN:-}" ]] && [[ -z "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
-            echo "::error::DEADZONE_STABLE_REPO_TOKEN (or the deprecated DEADZONE_ROM_REPO_TOKEN fallback) is required to publish the Stable engine profile. Provision a fine-grained PAT scoped to DeadZone-Offical/DeadZone-Xiaomi-Stable with Contents: read+write and expose it as the DEADZONE_STABLE_REPO_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
-            exit 1
-          fi
-          if [[ ! -x bin/deviceprofile/run_device_profile_publish_to_stable.sh ]]; then
-            echo "::error::Stable-repo device-profile publisher is missing or not executable: bin/deviceprofile/run_device_profile_publish_to_stable.sh" >&2
-            exit 1
-          fi
-          if [[ ! -s build/.deadzone/super_physical_size.txt ]] || [[ ! -s build/.deadzone/super_physical_size_known.txt ]]; then
-            echo "::error::Stable Stage 5 (super) state is missing; refusing to publish without an authoritative physical super size." >&2
-            exit 1
-          fi
-          codename=""
-          if [[ -s build/.deadzone/rom_metadata.json ]]; then
-            codename=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("device",{}).get("codename",""))' build/.deadzone/rom_metadata.json 2>/dev/null || true)
-          fi
-          if [[ -z "$codename" ]]; then
-            echo "::error::Could not determine Stable codename from build/.deadzone/rom_metadata.json; refusing to publish." >&2
-            exit 1
-          fi
-          # Pull the region and OS family from the build state. Both
-          # are required for the strict (codename, OS, region, ROM
-          # build) variant lookup. We never fall back to a default
-          # region or OS family; missing values are a hard error.
-          region=""
-          os_family=""
-          if [[ -s build/.deadzone/rom_metadata.json ]]; then
-            region=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("rom",{}).get("region","") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)
-            os_family=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=d.get("rom",{}).get("version","") or "";print(v.split(".")[0] if v.startswith("OS") else ("MIUI" if v.startswith("MIUI") or v.startswith("V") else "OS1"))' build/.deadzone/rom_metadata.json 2>/dev/null || echo OS1)
-          fi
-          if [[ -z "$region" ]]; then
-            echo "::error::Could not determine Stable region from build/.deadzone/rom_metadata.json; refusing to publish. The strict variant lookup requires a non-empty region." >&2
-            exit 1
-          fi
-          if [[ -z "$os_family" ]]; then
-            os_family="OS1"
-          fi
-          if [[ -n "${DEADZONE_STABLE_REPO_TOKEN:-}" ]]; then
-            printf '::add-mask::%s\n' "$DEADZONE_STABLE_REPO_TOKEN"
-          fi
-          if [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
-            printf '::add-mask::%s\n' "$DEADZONE_ROM_REPO_TOKEN"
-          fi
-          DEADZONE_DIR="build/.deadzone" \
-            bash bin/deviceprofile/run_device_profile_publish_to_stable.sh \
-              --codename "$codename" \
-              --region "$region" \
-              --os-family "$os_family" \
-              --build-id "stable-${codename}-${DEADZONE_REQUEST_ID}" \
-              --promoter "DeadZone-Xiaomi-Stable"
 
       - name: "❌ Send failure notification"
         if: failure()
@@ -592,14 +660,10 @@ jobs:
             echo
             echo "- Project: \`Deadzone-Stable\`"
             echo "- Engine repository: \`DeadZone-Offical/DeadZone-Xiaomi-Stable\`"
+            echo "- Device configuration source: \`DeadZone-Offical/DeadZone-SuperInspector\` → \`bin/DeviceConfig/<codename>/<codename>.json\`"
             echo "- Request ID: \`${DEADZONE_REQUEST_ID}\`"
             echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
             [[ -n "${DEADZONE_RESULT_NAME:-}" ]] && echo "- Final ZIP: \`${DEADZONE_RESULT_NAME}\`"
             [[ -n "${DEADZONE_GOOGLE_DRIVE_URL:-}" ]] && echo "- Drive URL: ${DEADZONE_GOOGLE_DRIVE_URL}"
-            if [[ "${{ inputs.publish_profile }}" == "true" ]]; then
-              echo "- Device profile publish: requested (SuperInspector central registry)"
-            else
-              echo "- Device profile publish: not requested"
-            fi
             echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } >> "$GITHUB_STEP_SUMMARY"
