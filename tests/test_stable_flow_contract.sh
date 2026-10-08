@@ -95,7 +95,7 @@ out = {
     "inputs": document[True]["workflow_dispatch"]["inputs"],
     "steps": steps,
 }
-sys.stdout.write(yaml.safe_dump(out, sort_keys=False))
+sys.stdout.write(yaml.safe_dump(out, sort_keys=False, allow_unicode=True))
 PY
 }
 
@@ -138,7 +138,7 @@ test_publish_profile_input_is_removed() {
     # declared. The bot dispatches the build as soon as the user
     # submits a valid ROM URL, exactly like Lite / Fastboot /
     # Ninja, with only the baseline correlation inputs.
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False))" < "$doc")"
+    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
     assert_not_contains "$step_yaml" "publish_profile" \
         "input: publish_profile is NOT a workflow_dispatch input (device configuration is owned by SuperInspector)"
 
@@ -146,9 +146,15 @@ test_publish_profile_input_is_removed() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 2: "🗂️ Collect Stable artifact metadata" is continue-on-error.
+# Test 2: "🗂️ Collect Stable artifact metadata" is a hard gate after
+# a successful build. When the Stable 11-stage pipeline completes
+# and there is NOT exactly one preserved final ZIP, the workflow
+# MUST fail with a precise ::error:: instead of degrading to a
+# warning. A successful build that produced 0 or 2+ ZIPs is a
+# real failure the operator has to act on, not a diagnostic
+# footnote that the build could finish past.
 # ---------------------------------------------------------------------------
-test_collect_metadata_is_continue_on_error() {
+test_collect_metadata_is_hard_gate() {
     local doc idx step_yaml
     doc="$(mktemp)"
     extract_workflow > "$doc"
@@ -159,9 +165,13 @@ test_collect_metadata_is_continue_on_error() {
         return
     fi
     pass "collect-metadata: step exists"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$idx], sort_keys=False))" < "$doc")"
-    assert_contains "$step_yaml" "continue-on-error: true" \
-        "collect-metadata: step has continue-on-error: true (no double-failure on missing ZIP)"
+    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$idx], sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
+    assert_contains "$step_yaml" "if: success()" \
+        "collect-metadata: step runs only after a successful build (if: success())"
+    assert_not_contains "$step_yaml" "continue-on-error: true" \
+        "collect-metadata: step is NOT marked continue-on-error (a successful build that produced the wrong ZIP count is a real failure)"
+    assert_contains "$step_yaml" "Expected exactly one preserved final Stable ZIP" \
+        "collect-metadata: step reports a precise error when the final ZIP is missing or duplicated"
 
     rm -f "$doc"
 }
@@ -175,7 +185,7 @@ test_no_post_success_publish_steps() {
     extract_workflow > "$doc"
 
     local step_yaml
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False))" < "$doc")"
+    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
     assert_not_contains "$step_yaml" "📤 Publish Stable device profile" \
         "no-publish: launcher does NOT include a 'Publish Stable device profile' post-success step (SuperInspector owns the registry)"
 
@@ -199,7 +209,7 @@ test_pre_build_superinspector_validation() {
         return
     fi
     pass "superinspector-validation: step exists"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$idx], sort_keys=False))" < "$doc")"
+    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$idx], sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
     assert_contains "$step_yaml" "bin/DeviceConfig" \
         "superinspector-validation: step probes bin/DeviceConfig"
     assert_contains "$step_yaml" "DeadZone-SuperInspector" \
@@ -216,14 +226,14 @@ test_build_step_uses_build_sh() {
     local doc build_idx step_yaml
     doc="$(mktemp)"
     extract_workflow > "$doc"
-    build_idx="$(step_index "$doc" "🛠️ Build, release, and upload Stable ROM" || true)"
+    build_idx="$(step_index "$doc" "🚀 Build, release, and upload Stable ROM" || true)"
     if [[ -z "$build_idx" ]]; then
         fail "build: step exists" "missing step"
         rm -f "$doc"
         return
     fi
     pass "build: step exists"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$build_idx], sort_keys=False))" < "$doc")"
+    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$build_idx], sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
     assert_contains "$step_yaml" "build.sh" \
         "build: step invokes build.sh (the Stable pipeline entrypoint)"
     assert_contains "$step_yaml" "--with-upload" \
@@ -239,7 +249,7 @@ test_progress_events_present() {
     local doc
     doc="$(mktemp)"
     extract_workflow > "$doc"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False))" < "$doc")"
+    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
     assert_contains "$step_yaml" "Report progress to bot (Lite parity)" \
         "progress: Lite-parity stage events step is present"
     assert_contains "$step_yaml" "downloading" \
@@ -273,7 +283,7 @@ test_engine_checkout_403_diagnostic() {
         return
     fi
     pass "403-diagnostic: step exists"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$idx], sort_keys=False))" < "$doc")"
+    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$idx], sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
     assert_contains "$step_yaml" "DEADZONE_PRIVATE_READ_TOKEN" \
         "403-diagnostic: step names the secret that must be re-provisioned"
     assert_contains "$step_yaml" "Contents: Read-only" \
@@ -284,14 +294,68 @@ test_engine_checkout_403_diagnostic() {
     rm -f "$doc"
 }
 
-echo "1..7"
+# ---------------------------------------------------------------------------
+# Test 8: the Stable preparation sequence mirrors the verified
+# Lite / Ninja layout. The accepted run 37817960658 failed at the
+# engine checkout (403) and never reached the engine validation
+# or build; the corrected workflow pins the full Lite / Ninja
+# preparation chain — LFS object fetch, engine layout check,
+# SuperInspector DeviceConfig presence, start live tracking,
+# report starting stage, Cairo timezone, OpenJDK 17, apt deps,
+# builder perms, and rclone config install — so a future operator
+# who lands on the page immediately sees where the pipeline was
+# stopped and which Lite-parity step is missing.
+# ---------------------------------------------------------------------------
+test_lite_parity_preparation_steps() {
+    local doc step_yaml
+    doc="$(mktemp)"
+    extract_workflow > "$doc"
+    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False, allow_unicode=True))" < "$doc")"
+
+    assert_contains "$step_yaml" "🛡️ Verify Stable engine LFS objects" \
+        "lite-parity: explicit LFS object verification step (matches Lite / Ninja)"
+    assert_contains "$step_yaml" "🧭 Validate Stable engine layout" \
+        "lite-parity: Stable-specific engine layout validation step (replaces the Lite 'functions.sh / packROM.sh / uploadROM.sh' check with Stable's bin/* layout)"
+    assert_contains "$step_yaml" "🛡️ Verify SuperInspector device config presence" \
+        "lite-parity: pre-build SuperInspector DeviceConfig check is mandatory"
+    assert_contains "$step_yaml" "📣 Start live tracking" \
+        "lite-parity: live tracking step (matches Lite / Ninja ordering)"
+    assert_contains "$step_yaml" "📡 Report starting stage to bot" \
+        "lite-parity: starting stage report (matches Lite / Ninja ordering)"
+    assert_contains "$step_yaml" "🕒 Set Cairo timezone" \
+        "lite-parity: Cairo timezone step (matches Lite / Ninja ordering)"
+    assert_contains "$step_yaml" "☕ Install OpenJDK" \
+        "lite-parity: OpenJDK 17 install step (matches Lite / Ninja)"
+    assert_contains "$step_yaml" "🧰 Install Stable dependencies" \
+        "lite-parity: full apt+pip dependency install step (matches Lite / Ninja)"
+    assert_contains "$step_yaml" "🔓 Grant builder permissions" \
+        "lite-parity: toolbuild chmod step (matches Lite / Ninja)"
+    assert_contains "$step_yaml" "☁️ Install central Rclone configuration" \
+        "lite-parity: rclone.conf install step (matches Lite / Ninja)"
+
+    # Defensive: the old "🛡️ Prepare Stable engine for rclone
+    # upload" step is gone because it conflated three concerns
+    # (rclone config install, the now-removed bin/device cleanup,
+    # and engine validation). The new step cleanly installs the
+    # rclone config and does not touch bin/device, which is owned
+    # by the engine's persist_state.sh and SuperInspector.
+    assert_not_contains "$step_yaml" "🛡️ Prepare Stable engine for rclone upload" \
+        "lite-parity: the old combined rclone+bin/device cleanup step is gone (it conflated concerns and could delete engine state files)"
+    assert_not_contains "$step_yaml" "bin/device -type f -delete" \
+        "lite-parity: no defensive find/delete over toolbuild/bin/device (the engine actively writes those state files for Lite compatibility)"
+
+    rm -f "$doc"
+}
+
+echo "1..8"
 test_publish_profile_input_is_removed
-test_collect_metadata_is_continue_on_error
+test_collect_metadata_is_hard_gate
 test_no_post_success_publish_steps
 test_pre_build_superinspector_validation
 test_build_step_uses_build_sh
 test_progress_events_present
 test_engine_checkout_403_diagnostic
+test_lite_parity_preparation_steps
 
 echo
 if (( failures == 0 )); then

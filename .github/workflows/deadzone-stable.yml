@@ -288,42 +288,61 @@ jobs:
           echo "::error::engine_repository=${{ steps.runtime.outputs.engine_repository }}"
           echo "::error::The DEADZONE_PRIVATE_READ_TOKEN secret on DeadZone-Offical/DeadZone-Home must be a fine-grained PAT with Contents: Read-only on DeadZone-Offical/DeadZone-Xiaomi-Stable (in addition to DeadZone-Offical/DeadZone-File). The run continues so the workspace is cleaned up; the next build will fail the same way until the secret is fixed."
 
-      - name: "🛡️ Prepare Stable engine for rclone upload"
+      - name: "🛡️ Verify Stable engine LFS objects"
         working-directory: toolbuild
         shell: bash
         run: |
-          set -Eeuo pipefail
-          # Stable's upload stage expects the rclone config at
-          # $WORK_DIR/rclone.conf. The file ships with the
-          # private runtime (rclone.conf), not with the Stable
-          # engine. We stage it under the engine so the upload
-          # stage can read it from the expected path; the
-          # upload stage removes it after the upload completes.
-          mkdir -p toolbuild
-          cp runtime/rclone.conf toolbuild/rclone.conf
-          chmod 600 toolbuild/rclone.conf
-          # The upload stage derives the final ZIP name and the
-          # codename from build/.deadzone/rom_metadata.json, NOT
-          # from bin/device/state files. Make sure those state
-          # files do not exist in the Stable engine — Lite's
-          # upload would read them and fail with a contract error.
-          # Stable's engine does not include any state files in
-          # bin/device/ by design; this step is purely
-          # defensive.
-          if [[ -d toolbuild/bin/device ]]; then
-            find toolbuild/bin/device -type f -delete || true
+          set -uo pipefail
+          # `actions/checkout@v4` with `lfs: true` retries the LFS
+          # fetch three times (~35s) before failing with a stack of
+          # identical 404 lines. With `lfs: false` the checkout above
+          # leaves the LFS pointer files in place and we perform a
+          # single explicit fetch here so any missing objects surface
+          # as an actionable diagnostic in one attempt. Mirrors the
+          # verified Lite / Ninja LFS verification step.
+          if ! command -v git-lfs >/dev/null 2>&1 && ! git lfs version >/dev/null 2>&1; then
+            echo "Installing git-lfs..."
+            curl -fsSL https://github.com/git-lfs/git-lfs/releases/download/v3.5.1/git-lfs-linux-amd64-v3.5.1.tar.gz \
+              | tar -xz -C /tmp git-lfs \
+              && sudo install -m 0755 /tmp/git-lfs /usr/local/bin/git-lfs
+            git lfs install --local
           fi
+          expected="$(git lfs ls-files 2>/dev/null | awk '{print $3}' || true)"
+          if [[ -z "$expected" ]]; then
+            echo "No LFS-tracked files in this checkout."
+            exit 0
+          fi
+          echo "LFS objects expected: $(echo "$expected" | wc -l)"
+          git lfs fetch origin main 2>&1 | tee /tmp/lfs-fetch.log || true
+          not_found="$(grep -oE '\[sha256:[0-9a-f]+\] Object does not exist on the server' /tmp/lfs-fetch.log | sort -u || true)"
+          if [[ -n "$not_found" ]]; then
+            echo
+            echo "::error::DeadZone Stable engine is missing the following Git LFS objects on the server:"
+            echo "$not_found" | sed 's/^/  - /'
+            echo
+            echo "Push the corresponding binaries to DeadZone-Offical/DeadZone-Xiaomi-Stable and re-run."
+            exit 1
+          fi
+          echo "All LFS objects fetched successfully."
 
-      - name: "🔍 Verify Stable engine layout"
+      - name: "🧭 Validate Stable engine layout"
         working-directory: toolbuild
         shell: bash
         run: |
           set -euo pipefail
+          # Stable's canonical layout is a thin shell pipeline under
+          # bin/, not Lite's flat root. The required files pin the
+          # build entrypoint, the release + upload stages, and the
+          # Lite-compatibility notify.py shim the launcher uses for
+          # start/pack/upload callbacks. Each missing file is a clear
+          # diagnostic with a path the operator can act on.
           required_engine_files=(
             build.sh
             Version
             bin/upload/run_upload.sh
             bin/release/run_release.sh
+            bin/flash/run_flash.sh
+            bin/release/naming.py
           )
           for engine_file in "${required_engine_files[@]}"; do
             if [[ ! -s "$engine_file" ]]; then
@@ -334,6 +353,7 @@ jobs:
           bash -n build.sh
           bash -n bin/upload/run_upload.sh
           bash -n bin/release/run_release.sh
+          python3 -m py_compile bin/release/naming.py
 
       - name: "🛡️ Verify SuperInspector device config presence"
         working-directory: toolbuild
@@ -391,7 +411,94 @@ jobs:
               --message "Stable build started" || true
           fi
 
-      - name: "🛠️ Build, release, and upload Stable ROM"
+      - name: "📡 Report starting stage to bot"
+        if: success()
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        run: |
+          set -euo pipefail
+          # Mirrors the Lite / Ninja "starting" stage: the workflow
+          # fires the event the moment the engine is on disk and
+          # validated, before any heavy work. The live panel renders
+          # the "Runner allocated, fetching engine sources" line so
+          # the user sees the build start cleanly.
+          python3 runtime/build_stage.py starting \
+            --project stable \
+            --request-id "$DEADZONE_REQUEST_ID" \
+            --message "Runner allocated, fetching engine sources" || true
+
+      - name: "🕒 Set Cairo timezone"
+        run: sudo timedatectl set-timezone Africa/Cairo
+
+      - name: "☕ Install OpenJDK"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: "🧰 Install Stable dependencies"
+        working-directory: toolbuild
+        run: |
+          set -Eeuo pipefail
+          # Mirrors the verified Lite / Ninja apt step exactly.
+          # Stable's bin/upload/run_upload.sh, bin/flash/render_fastboot.py,
+          # and bin/repack/super_image.sh all assume rclone, lz4, zstd,
+          # erofs-utils, aapt, sparse-utils, and the python3 ecosystem
+          # are present on PATH. apt source cleanup matches Lite so we
+          # do not pull the unrelated Google Chrome repo.
+          chrome_source_pattern='dl.google.com/linux/chrome-stable/deb'
+          while IFS= read -r source_file; do
+            echo "::notice::Disabling unused Chrome APT source: $source_file"
+            sudo mv -- "$source_file" "${source_file}.disabled"
+          done < <(
+            grep -Rls --include='*.list' --include='*.sources' \
+              "$chrome_source_pattern" /etc/apt/sources.list.d 2>/dev/null || true
+          )
+
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get purge -y device-tree-compiler || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            aria2 jq rclone python-is-python3 wget python3 python3-pip \
+            lz4 xz-utils zlib1g-dev gcc g++ libc6 libstdc++6 \
+            busybox zip unzip p7zip-full zipalign zstd bc erofs-utils \
+            android-sdk-libsparse-utils xmlstarlet aapt rsync openssh-client curl
+          sudo pip3 install --break-system-packages --no-cache-dir ConfigObj lz4 zstandard setuptools || \
+            sudo pip3 install --no-cache-dir ConfigObj lz4 zstandard setuptools
+
+      - name: "🔓 Grant builder permissions"
+        working-directory: toolbuild
+        run: chmod -R u+rwX,go+rX .
+
+      - name: "☁️ Install central Rclone configuration"
+        working-directory: toolbuild
+        run: |
+          set -euo pipefail
+          # Mirrors the verified Lite / Ninja rclone install step.
+          # Stable's bin/upload/run_upload.sh reads RCLONE_CONFIG
+          # (defaulting to $WORK_DIR/rclone.conf), so the file MUST
+          # land at $WORK_DIR/rclone.conf (= toolbuild/rclone.conf)
+          # with mode 600. The engine's own fetch_rclone_config
+          # helper is the fallback when the file is absent, but the
+          # pre-seeded path avoids a network round-trip and a token
+          # burn for the in-engine GitHub Contents API call.
+          source_file="$GITHUB_WORKSPACE/runtime/rclone.conf"
+          target_file="$PWD/rclone.conf"
+          [[ -s "$source_file" ]] || {
+            echo "::error::Central rclone.conf is missing or empty"
+            exit 1
+          }
+          install -m 600 "$source_file" "$target_file"
+          if ! rclone --config="$target_file" listremotes | sed 's/:$//' | grep -Fxq "$RCLONE_REMOTE_NAME"; then
+            echo "::error::Central rclone.conf does not define expected remote: ${RCLONE_REMOTE_NAME}"
+            exit 1
+          fi
+          rclone version
+
+      - name: "🚀 Build, release, and upload Stable ROM"
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -406,10 +513,16 @@ jobs:
           # Stable's pipeline is one script (build.sh) with 11 stages.
           # `--with-upload` enables Stage 11 (Google Drive upload) so
           # build.sh invokes bin/upload/run_upload.sh after the release
-          # stage has produced the final ZIP.
+          # stage has produced the final ZIP. We do NOT split the
+          # pipeline into separate pack / upload scripts the way Lite
+          # does — Stable's bin/ layout is canonical and replacing it
+          # with Lite's packROM.sh / uploadROM.sh would change build
+          # behavior. The upload stage uses the pre-seeded
+          # $WORK_DIR/rclone.conf (mode 600) and reuses the same
+          # RCLONE_REMOTE_NAME / RCLONE_UPLOAD_DIR runtime values.
           sudo -E bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" \
-            --with-upload 2>&1 | tee -a build_action.log
+            --with-upload 2>&1 | tee build_action.log
           google_status=${PIPESTATUS[0]}
           set -e
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
@@ -472,32 +585,30 @@ jobs:
             --message "Upload complete" || true
 
       - name: "🗂️ Collect Stable artifact metadata"
-        if: always()
-        continue-on-error: true
+        if: success()
         working-directory: toolbuild
         env:
           DEADZONE_GOOGLE_UPLOAD_STATUS: ${{ env.DEADZONE_GOOGLE_UPLOAD_STATUS }}
         run: |
           set -Euo pipefail
-          # This step is diagnostic, not a job-failure driver.
-          # When the build failed before producing a ZIP, the
-          # "❌ Send failure notification" step is the
-          # authoritative terminal event for the live panel and
-          # the artifact-delivery event has nothing to report.
-          # Running this with continue-on-error: true keeps the
-          # failure notification flowing without piling a
-          # second "no final ZIP" error on top of the real
-          # build failure.
+          # Mirrors the verified Lite / Ninja "Package and upload
+          # Google Drive" step: the workflow verifies that EXACTLY
+          # one preserved final Stable ZIP exists under
+          # $WORK_DIR/out/, computes its SHA-256 / size, and probes
+          # the canonical Drive URL. This step runs ONLY after a
+          # successful Stable build (if: success()) — a build that
+          # never produced a final ZIP already failed upstream and
+          # is reported by "❌ Send failure notification", not here.
+          # Wrong ZIP count is therefore a workflow-level error
+          # (exit 1) rather than a warning: if the engine's
+          # 11-stage pipeline ran end-to-end but did not write
+          # exactly one final artifact, that is a real failure the
+          # operator needs to act on.
           mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Stable_*.zip' -print 2>/dev/null)
           if (( ${#final_zips[@]} != 1 )); then
-            echo "::warning::Expected exactly one preserved final Stable ZIP; found ${#final_zips[@]} (build likely failed before Stage 10)" | tee -a build_action.log
-            echo "::group::Stable artifact metadata"
-            echo "  - result name: <missing>"
-            echo "  - size: <missing>"
-            echo "  - sha256: <missing>"
-            echo "  - drive url: <missing>"
-            echo "::endgroup::"
-            exit 0
+            echo "::error::Expected exactly one preserved final Stable ZIP; found ${#final_zips[@]}" | tee -a build_action.log 2>/dev/null || true
+            echo "::error::The Stable engine's release stage (Stage 10) did not write a single canonical DeadZone_Stable_*.zip to $PWD/out. The 11-stage build.sh pipeline ran to completion but the final artifact is missing or duplicated." >&2
+            exit 1
           fi
 
           final_zip="${final_zips[0]}"
