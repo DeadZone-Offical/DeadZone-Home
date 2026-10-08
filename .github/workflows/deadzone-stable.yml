@@ -464,7 +464,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             aria2 jq rclone python-is-python3 wget python3 python3-pip \
             lz4 xz-utils zlib1g-dev gcc g++ libc6 libstdc++6 \
-            busybox zip unzip p7zip-full zipalign zstd bc erofs-utils \
+            busybox zip unzip p7zip-full zipalign zstd bc erofs-utils erofsfuse \
             android-sdk-libsparse-utils xmlstarlet aapt rsync openssh-client curl
           sudo pip3 install --break-system-packages --no-cache-dir ConfigObj lz4 zstandard setuptools || \
             sudo pip3 install --no-cache-dir ConfigObj lz4 zstandard setuptools
@@ -566,10 +566,24 @@ jobs:
           extra_args=()
           [[ -n "$codename" ]] && extra_args+=(--device "$codename")
           [[ -n "$rom_version" ]] && extra_args+=(--rom "$rom_version")
+          # The partitions stage writes the canonical partition count
+          # to partition_prep.json after lpunpack / extract_partition
+          # finishes. We forward the count to the live panel so the
+          # user sees "Detected N partitions" alongside the codename
+          # and ROM version, matching the user-facing spec for the
+          # extraction phase.
+          partition_count=""
+          if [[ -s build/.deadzone/partition_prep.json ]]; then
+            partition_count="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(len(d.get("partitions") or []))' build/.deadzone/partition_prep.json 2>/dev/null || true)"
+          fi
+          reading_rom_message="ROM metadata extracted"
+          if [[ -n "$partition_count" && "$partition_count" -gt 0 ]]; then
+            reading_rom_message="ROM metadata extracted; detected $partition_count partition(s)"
+          fi
           python3 runtime/build_stage.py reading_rom \
             --project stable \
             --request-id "$DEADZONE_REQUEST_ID" \
-            --message "ROM metadata extracted" \
+            --message "$reading_rom_message" \
             "${extra_args[@]}" || true
           python3 runtime/build_stage.py building \
             --project stable \
@@ -684,6 +698,7 @@ jobs:
       - name: "❌ Send failure notification"
         if: failure()
         shell: bash
+        working-directory: toolbuild
         run: |
           set -uo pipefail
           if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
@@ -701,9 +716,55 @@ jobs:
             echo '::warning::Central runtime report_build_event.py is missing; skipping the terminal failure callback.' >&2
             exit 0
           fi
+          # Read the engine's per-stage failure marker so the
+          # notification can name the failed stage instead of
+          # emitting a generic "build failed" line. The engine
+          # writes $DEADZONE_DIR/failed_stage.txt before exit 1
+          # from inside its ERR trap; the path is gitignored and
+          # survives only for the lifetime of the runner.
+          failed_stage=""
+          if [[ -s build/.deadzone/failed_stage.txt ]]; then
+            failed_stage="$(tr -d '\r\n' < build/.deadzone/failed_stage.txt 2>/dev/null || true)"
+          fi
+          failure_message="DeadZone Stable ROM build failed."
+          case "$failed_stage" in
+            download)
+              failure_message="DeadZone Stable build failed at the download stage. Re-run the dispatch, or check the input URL."
+              ;;
+            classify)
+              failure_message="DeadZone Stable build failed at the ROM-format classification stage. The source archive is not a recognised payload / super / fastboot / OTA-DAT layout."
+              ;;
+            extract)
+              failure_message="DeadZone Stable build failed at the partition extraction stage. Inspect bin/extract/run_extract.sh logs; the extractor or a partition tool may be missing."
+              ;;
+            metadata)
+              failure_message="DeadZone Stable build failed at the metadata stage. install erofsfuse (apt) or vendor bin/Linux/x86_64/extract.erofs so partition EROFS images can be unpacked for build.prop."
+              ;;
+            super)
+              failure_message="DeadZone Stable build failed at the super-image inspection stage. The super.img / payload.bin layout was not parseable."
+              ;;
+            partitions)
+              failure_message="DeadZone Stable build failed at the partition preparation stage. Check the per-partition unpack errors in build_action.log."
+              ;;
+            mods)
+              failure_message="DeadZone Stable build failed at the mods stage. A mod script reported an error; check build_action.log for the failing mod."
+              ;;
+            repack)
+              failure_message="DeadZone Stable build failed at the repack stage. lpmake could not rebuild the super image from the staged partitions."
+              ;;
+            flash)
+              failure_message="DeadZone Stable build failed at the flash bundle generation stage. The final ZIP / META-INF could not be produced."
+              ;;
+            release)
+              failure_message="DeadZone Stable build failed at the release stage. The final ZIP did not pass the canonical naming / verification step."
+              ;;
+            upload)
+              failure_message="DeadZone Stable build failed at the upload stage. rclone could not deliver the final ZIP; check the rclone.conf secret and target."
+              ;;
+          esac
           python3 runtime/report_build_event.py failed \
             --project stable \
-            --message "DeadZone Stable ROM build failed." || true
+            --message "$failure_message" || true
 
       - name: "⛔ Send cancellation notification"
         if: cancelled()
