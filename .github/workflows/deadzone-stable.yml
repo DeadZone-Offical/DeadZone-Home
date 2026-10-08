@@ -270,6 +270,36 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: "📦 Checkout Lite engine (fix_selinux.py source)"
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-xiaomi_Lite
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: liteengine
+          sparse-checkout: |
+            bin/imaging/fix_selinux.py
+          lfs: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "🛡️ Verify Lite fix_selinux.py is present"
+        working-directory: toolbuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The Stable engine's bin/repack/selinux.sh resolves
+          # fix_selinux.py from $LITE_ENGINE_ROOT/bin/imaging/.
+          # We fail fast here (BEFORE the build starts) so a
+          # missing Lite script is reported as a launch-time
+          # diagnostic, not as a confusing repack-stage
+          # "fix_selinux.py not found" error 30 minutes later.
+          if [[ ! -s "$GITHUB_WORKSPACE/liteengine/bin/imaging/fix_selinux.py" ]]; then
+            echo "::error::Lite engine checkout is missing bin/imaging/fix_selinux.py."
+            echo "::error::The Stable engine's repack stage consumes the canonical Lite fix_selinux.py verbatim. The LITE_ENGINE_ROOT variable points at $GITHUB_WORKSPACE/liteengine; verify the Lite checkout above." >&2
+            exit 1
+          fi
+
       - name: "🛡️ Verify private Stable engine checkout"
         if: always() && failure()
         shell: bash
@@ -515,6 +545,12 @@ jobs:
           DEADZONE_GITHUB_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           DEADZONE_RCLONE_CONFIG_REPO: DeadZone-Offical/DeadZone-File
           DEADZONE_RCLONE_CONFIG_PATH: rclone.conf
+          # The Stable engine consumes the canonical Lite
+          # bin/imaging/fix_selinux.py at repack time. The launcher
+          # checked out the Lite engine sparsely to $GITHUB_WORKSPACE/liteengine
+          # above; expose its path so the engine's selinux.sh can
+          # resolve the tool without vendoring a duplicate copy.
+          LITE_ENGINE_ROOT: ${{ github.workspace }}/liteengine
         run: |
           set -Eeuo pipefail
           # Stable's pipeline is one script (build.sh) with 11 stages.
