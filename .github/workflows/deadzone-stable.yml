@@ -404,8 +404,15 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
-          if [[ -s runtime/build_stage.py ]]; then
-            python3 runtime/build_stage.py start \
+          # The central runtime is checked out at the workspace
+          # root, so look for build_stage.py under
+          # $GITHUB_WORKSPACE/runtime rather than a relative
+          # `runtime/build_stage.py` (which would resolve to
+          # `toolbuild/runtime/build_stage.py` under
+          # `working-directory: toolbuild` and silently miss).
+          runtime_dir="$GITHUB_WORKSPACE/runtime"
+          if [[ -s "$runtime_dir/build_stage.py" ]]; then
+            python3 "$runtime_dir/build_stage.py" start \
               --project stable \
               --request-id "$DEADZONE_REQUEST_ID" \
               --message "Stable build started" || true
@@ -546,8 +553,14 @@ jobs:
           # transitions defensively around the build step itself.
           # Each event is best-effort: a callback failure must
           # never fail a build that already produced a usable
-          # artifact.
-          python3 runtime/build_stage.py downloading \
+          # artifact. The central runtime is checked out at the
+          # workspace root, so we invoke the helper via the
+          # absolute path under $GITHUB_WORKSPACE rather than a
+          # relative `runtime/...` that would otherwise resolve
+          # against `toolbuild/` (where the helper does not
+          # exist) and silently skip the events.
+          runtime_dir="$GITHUB_WORKSPACE/runtime"
+          python3 "$runtime_dir/build_stage.py" downloading \
             --project stable \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "ROM download finished" || true
@@ -580,20 +593,20 @@ jobs:
           if [[ -n "$partition_count" && "$partition_count" -gt 0 ]]; then
             reading_rom_message="ROM metadata extracted; detected $partition_count partition(s)"
           fi
-          python3 runtime/build_stage.py reading_rom \
+          python3 "$runtime_dir/build_stage.py" reading_rom \
             --project stable \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "$reading_rom_message" \
             "${extra_args[@]}" || true
-          python3 runtime/build_stage.py building \
+          python3 "$runtime_dir/build_stage.py" building \
             --project stable \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Engine build finished" || true
-          python3 runtime/build_stage.py packaging \
+          python3 "$runtime_dir/build_stage.py" packaging \
             --project stable \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Super packed" || true
-          python3 runtime/build_stage.py uploading \
+          python3 "$runtime_dir/build_stage.py" uploading \
             --project stable \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Upload complete" || true
@@ -689,8 +702,13 @@ jobs:
           # the build or prevent artifact delivery. The helper
           # is best-effort: a callback failure must not fail a
           # build that already produced a usable artifact.
-          if [[ -s runtime/report_build_event.py ]]; then
-            python3 runtime/report_build_event.py succeeded \
+          # The central runtime is checked out at the workspace
+          # root, not under toolbuild, so use the absolute
+          # path rather than the relative `runtime/...` that
+          # would otherwise be resolved against toolbuild.
+          runtime_dir="$GITHUB_WORKSPACE/runtime"
+          if [[ -s "$runtime_dir/report_build_event.py" ]]; then
+            python3 "$runtime_dir/report_build_event.py" succeeded \
               --project stable \
               --message "DeadZone Stable build complete." || true
           fi
@@ -701,10 +719,21 @@ jobs:
         working-directory: toolbuild
         run: |
           set -uo pipefail
-          if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s runtime/build.env ]]; then
+          # The central runtime is checked out at the workspace
+          # root ($GITHUB_WORKSPACE/runtime), not under toolbuild,
+          # so relative `runtime/...` paths would silently miss
+          # the helper files when this step runs in
+          # `working-directory: toolbuild`. Pin the runtime paths
+          # to the workspace root so the terminal failure callback
+          # always reaches `report_build_event.py` regardless of
+          # the working directory; engine-relative paths
+          # (`build/.deadzone/failed_stage.txt`) still resolve via
+          # the working-directory.
+          runtime_dir="$GITHUB_WORKSPACE/runtime"
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" && -s "$runtime_dir/build.env" ]]; then
             set -a
             # shellcheck disable=SC1091
-            source runtime/build.env
+            source "$runtime_dir/build.env"
             set +a
             export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:-}"
           fi
@@ -712,7 +741,7 @@ jobs:
             echo '::warning::Terminal Stable event cannot be signed because the central event secret is unavailable.' >&2
             exit 0
           fi
-          if [[ ! -s runtime/report_build_event.py ]]; then
+          if [[ ! -s "$runtime_dir/report_build_event.py" ]]; then
             echo '::warning::Central runtime report_build_event.py is missing; skipping the terminal failure callback.' >&2
             exit 0
           fi
@@ -762,7 +791,7 @@ jobs:
               failure_message="DeadZone Stable build failed at the upload stage. rclone could not deliver the final ZIP; check the rclone.conf secret and target."
               ;;
           esac
-          python3 runtime/report_build_event.py failed \
+          python3 "$runtime_dir/report_build_event.py" failed \
             --project stable \
             --message "$failure_message" || true
 
