@@ -551,6 +551,20 @@ jobs:
           # above; expose its path so the engine's selinux.sh can
           # resolve the tool without vendoring a duplicate copy.
           LITE_ENGINE_ROOT: ${{ github.workspace }}/liteengine
+          # The bot reporter is invoked from inside the engine's
+          # background heartbeat (bin/logging/log.sh). When
+          # DEADZONE_CALLBACK_URL + DEADZONE_EVENT_SECRET are set
+          # (which they are, by the launcher), the heartbeat fires
+          # one non-terminal `reading_rom` event every
+          # DZ_HEARTBEAT_INTERVAL seconds while a long stage runs.
+          # That is what makes the live panel refresh instead of
+          # sitting on the last checkpoint the workflow fired before
+          # `bash build.sh` started. The helper is the canonical
+          # signed-event reporter the launcher already imports; we
+          # only point DZ_BOT_REPORTER at it so the engine does not
+          # have to know its absolute path under $GITHUB_WORKSPACE.
+          DZ_BOT_REPORTER: ${{ github.workspace }}/runtime/build_stage.py
+          DZ_HEARTBEAT_INTERVAL: "30"
         run: |
           set -Eeuo pipefail
           # Stable's pipeline is one script (build.sh) with 11 stages.
@@ -563,7 +577,20 @@ jobs:
           # behavior. The upload stage uses the pre-seeded
           # $WORK_DIR/rclone.conf (mode 600) and reuses the same
           # RCLONE_REMOTE_NAME / RCLONE_UPLOAD_DIR runtime values.
-          sudo -E bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "stable" \
+          #
+          # `stdbuf -oL -eL` forces line-buffered stdout + stderr
+          # for build.sh, bin/*, and the brand `dz_stage_*` heartbeat
+          # emitter. Without it, `tee build_action.log | cat` is
+          # block-buffered (4 KiB) and a stage that emits one line
+          # every few minutes will not appear in the Actions log for
+          # that whole window. This is the canonical fix for the
+          # 22-minute silent run (37868385704) where the user saw
+          # no progress between `[DeadZone] Preparing partitions —
+          # In progress` and the next stage transition.
+          # `unbuffer` would work too but is not in the apt cache;
+          # `stdbuf` ships with coreutils which is already on the
+          # runner image.
+          sudo -E stdbuf -oL -eL bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" \
             --with-upload 2>&1 | tee build_action.log
           google_status=${PIPESTATUS[0]}
