@@ -355,6 +355,68 @@ jobs:
           fi
           echo "All LFS objects fetched successfully."
 
+      - name: "🛡️ Mark Stable toolchain binaries executable"
+        working-directory: toolbuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Stable's vendor toolchain under bin/tools/linux_x86_64/
+          # is committed to the Stable engine as plain blobs (git
+          # index mode 100644) because git LFS does not preserve
+          # the executable bit. On a fresh `actions/checkout@v4`
+          # the runner materialises those files with mode 0644,
+          # so the very first EROFS partition the extract stage
+          # tries to unpack dies with
+          #   "bin/tools/linux_x86_64/extract.erofs: Permission denied"
+          # (the exact symptom of run 38060885738). `chmod -R u+rwX`
+          # in the next step only adds +x to directories and to
+          # files that ALREADY have it for some user, so it cannot
+          # repair 0644 toolchain blobs on its own. We therefore
+          # force +x on the canonical toolchain directory here,
+          # BEFORE the engine layout validator runs, and assert
+          # the canonical EROFS binary is now executable so a
+          # missing or renamed toolchain surfaces immediately
+          # instead of as a confusing mid-extract EROFS failure
+          # ten minutes into the build.
+          toolchain_dir="bin/tools/linux_x86_64"
+          if [[ ! -d "$toolchain_dir" ]]; then
+            echo "::error::Stable engine toolchain directory is missing: ${toolchain_dir}"
+            echo "::error::The DeadZone-Xiaomi-Stable engine is expected to vendor its ELF helpers (extract.erofs, lpunpack, lpmake, mkfs.erofs, ...) under ${toolchain_dir}. Re-push the engine with the bundled toolchain or update the engine source." >&2
+            exit 1
+          fi
+          # Mark every file in the toolchain executable. The vendor
+          # layout is intentionally a flat directory of ELF binaries
+          # plus a couple of sdat2img shims, so a blanket `chmod +x`
+          # is the correct contract.
+          find "$toolchain_dir" -maxdepth 1 -type f -exec chmod +x {} +
+          # Mark every shell entrypoint under bin/ executable so
+          # future regressions in any other vendor helper (e.g. a
+          # newly added `bin/foo/run_foo.sh`) do not reintroduce
+          # the same "Permission denied" class of failure.
+          find bin -maxdepth 4 -type f -name '*.sh' -exec chmod +x {} +
+          # Top-level engine entrypoint and notify shim are .sh / .py
+          # files that the build invokes directly. The python
+          # shebang does not require +x, but build.sh does.
+          [[ -f build.sh ]] && chmod +x build.sh || true
+          # Canonical binary assertion: the exact binary that
+          # triggered run 38060885738. If the toolchain is somehow
+          # not present, fail fast with a precise diagnostic
+          # instead of letting the failure surface ten minutes
+          # into the build.
+          canonical_bin="$toolchain_dir/extract.erofs"
+          if [[ ! -f "$canonical_bin" ]]; then
+            echo "::error::Canonical Stable toolchain binary is missing: ${canonical_bin}"
+            exit 1
+          fi
+          if [[ ! -x "$canonical_bin" ]]; then
+            echo "::error::Canonical Stable toolchain binary is not executable after chmod: ${canonical_bin}"
+            stat -c 'mode=%a owner=%U:%G' "$canonical_bin" || true
+            exit 1
+          fi
+          printf '::group::Stable toolchain permissions\n'
+          ls -l "$canonical_bin" "$toolchain_dir/lpunpack" "bin/upload/run_upload.sh" 2>/dev/null || true
+          printf '::endgroup::\n'
+
       - name: "🧭 Validate Stable engine layout"
         working-directory: toolbuild
         shell: bash
@@ -508,7 +570,28 @@ jobs:
 
       - name: "🔓 Grant builder permissions"
         working-directory: toolbuild
-        run: chmod -R u+rwX,go+rX .
+        run: |
+          set -euo pipefail
+          # Stable's vendor toolchain under bin/tools/linux_x86_64/
+          # is committed with mode 100644 (git LFS does not preserve
+          # the executable bit). The pre-build step above forces
+          # +x on that specific directory; this step is the broader
+          # "make every file the engine writes readable + executable
+          # for the runner" sweep. We deliberately use `u+rwx,go+rx`
+          # instead of `u+rwX,go+rX` so any other helper the engine
+          # vendors later (and any direct invocation from build.sh)
+          # is also executable by the runner, not just files that
+          # already had +x for some user.
+          chmod -R u+rwx,go+rx .
+          # rclone.conf is the one exception: it MUST stay at mode
+          # 0600 because it carries the Google Drive OAuth token.
+          # The "Install central Rclone configuration" step
+          # re-installs it at mode 600 below, but it is also
+          # defensive to enforce that here in case the engine
+          # copied its own rclone.conf into the workspace earlier.
+          if [[ -f rclone.conf ]]; then
+            chmod 600 rclone.conf
+          fi
 
       - name: "☁️ Install central Rclone configuration"
         working-directory: toolbuild
