@@ -188,6 +188,32 @@ jobs:
             upload-mirrors.sh
             publish-website-release.py
 
+      - name: "🛠️ Stage launcher-side helpers into runtime"
+        run: |
+          set -euo pipefail
+          # The launcher's tools/ directory ships helpers that
+          # the workflow invokes from inside the central
+          # runtime's working directory (e.g. the
+          # failure-only rom_metadata.json inspector under
+          # "🛡️ Diagnose Stable engine metadata
+          # persistence"). The central runtime itself lives
+          # at $GITHUB_WORKSPACE/runtime and is checked out
+          # by `📥 Checkout private runtime`; we copy each
+          # launcher-side helper next to it under
+          # `runtime/` so the downstream steps can use the
+          # same `$GITHUB_WORKSPACE/runtime/<helper>`
+          # convention as the rest of the launcher.
+          # Mirrors the SparseCheckout-by-name pattern the
+          # central runtime uses to expose build_stage.py
+          # and report_build_event.py.
+          for helper in inspect_rom_metadata.py; do
+            if [[ ! -s "tools/${helper}" ]]; then
+              echo "::error::Launcher-side helper is missing: tools/${helper}"
+              exit 1
+            fi
+            install -m 0755 "tools/${helper}" "runtime/${helper}"
+          done
+
       - name: "⚙️ Load central runtime"
         id: runtime
         env:
@@ -663,22 +689,59 @@ jobs:
           #
           # `stdbuf -oL -eL` forces line-buffered stdout + stderr
           # for build.sh, bin/*, and the brand `dz_stage_*` heartbeat
-          # emitter. Without it, `tee build_action.log | cat` is
-          # block-buffered (4 KiB) and a stage that emits one line
-          # every few minutes will not appear in the Actions log for
-          # that whole window. This is the canonical fix for the
-          # 22-minute silent run (37868385704) where the user saw
-          # no progress between `[DeadZone] Preparing partitions —
-          # In progress` and the next stage transition.
-          # `unbuffer` would work too but is not in the apt cache;
-          # `stdbuf` ships with coreutils which is already on the
-          # runner image.
+          # emitter. Without it, the engine's per-partition progress
+          # lines (one every few seconds) are block-buffered (4 KiB)
+          # and a stage that emits one line every few minutes will
+          # not appear in the Actions log for that whole window.
+          # This is the canonical fix for the 22-minute silent run
+          # (37868385704) where the user saw no progress between
+          # `[DeadZone] Preparing partitions — In progress` and the
+          # next stage transition. `unbuffer` would work too but is
+          # not in the apt cache; `stdbuf` ships with coreutils
+          # which is already on the runner image.
+          #
+          # The previous pipeline used `… 2>&1 | tee build_action.log`
+          # to mirror stdout to both the Actions log AND an on-disk
+          # log file. That had a subtle bug: when `bash build.sh`
+          # exited 1, the wrapper's `set -Eeuo pipefail` propagated
+          # the failure and `tee` was killed by SIGPIPE before it
+          # could flush the in-memory buffer to disk. The on-disk
+          # file was therefore either missing or empty, and the
+          # `📋 Upload debug logs` step below reported
+          # "No files were found with the provided path:
+          # toolbuild/build_action.log" (the canonical symptom of
+          # run 38063165985, which exited at the engine's metadata
+          # stage with a "Persisted metadata failed reload
+          # validation — missing device.name" error that we never
+          # got to read). We now route the engine's full output to
+          # `build_action.log` first (so the file is durable and
+          # SIGPIPE-safe — a `>` redirect is owned by the shell and
+          # not killed when its parent exits), and then mirror that
+          # file to stdout so the Actions live log still streams
+          # line-by-line. The exit status of the engine is captured
+          # from the backgrounded subshell and re-raised so the step
+          # still fails the workflow when `build.sh` fails.
+          log_path="$PWD/build_action.log"
+          : > "$log_path"
           sudo -E stdbuf -oL -eL bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" \
-            --with-upload 2>&1 | tee build_action.log
-          google_status=${PIPESTATUS[0]}
-          set -e
+            --with-upload > "$log_path" 2>&1 &
+          build_pid=$!
+          # Tail the log file to stdout so the Actions live log
+          # keeps showing progress. `tail -F --pid=$build_pid`
+          # exits as soon as the build process (or its sudo
+          # wrapper) disappears, which prevents a zombie `tail`
+          # from blocking the step on the SIGPIPE of the old
+          # `tee`-based pipeline.
+          tail -n +1 -F --pid="$build_pid" "$log_path" || true
+          wait "$build_pid"
+          google_status=$?
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
+          # Re-raise the engine exit code so a failure still
+          # propagates to the workflow even though the surrounding
+          # step is set -Eeuo pipefail. Without this, `tail` exits
+          # 0 and the workflow would mark the step as success.
+          exit "$google_status"
 
       - name: "📡 Report progress to bot (Lite parity)"
         if: success()
@@ -859,6 +922,51 @@ jobs:
               --message "DeadZone Stable build complete." || true
           fi
 
+      - name: "🛡️ Diagnose Stable engine metadata persistence (failure-only)"
+        if: failure()
+        working-directory: toolbuild
+        shell: bash
+        run: |
+          set -uo pipefail
+          # The engine's metadata persistence step writes
+          # build/.deadzone/rom_metadata.json and then a
+          # reload-validator re-reads it to confirm the
+          # JSON is well-formed and carries the fields the
+          # downstream stages (super, partitions, flash,
+          # release) consume. Run 38063165985 exposed a
+          # regression where the engine wrote a JSON that
+          # the reload-validator rejected with "Persisted
+          # metadata failed reload validation — missing
+          # device.name"; the previous launcher just
+          # forwarded the engine's generic "metadata
+          # stage failed" line and asked the operator to
+          # install erofsfuse, which was the symptom of
+          # the prior (now-fixed) toolchain-permission
+          # bug, not this one.
+          #
+          # This step inspects whatever the engine managed
+          # to persist and surfaces a precise ::error::
+          # annotation whenever the reload-validator would
+          # reject the JSON. We do NOT modify, fix-up, or
+          # backfill the JSON: silently substituting a
+          # device.name would let the build proceed against
+          # a wrong device profile and produce a
+          # brick-prone ROM, which is the exact failure
+          # mode the reload-validator exists to prevent.
+          # The launcher reports; the engine fixes.
+          rom_metadata_path="build/.deadzone/rom_metadata.json"
+          if [[ ! -s "$rom_metadata_path" ]]; then
+            # The engine never even persisted a JSON —
+            # likely a much earlier failure (download,
+            # classify, extract). The downstream
+            # failure-notification step already names the
+            # failed stage via build/.deadzone/failed_stage.txt;
+            # we only add a diagnostic when there is
+            # something to inspect.
+            exit 0
+          fi
+          python3 "$GITHUB_WORKSPACE/runtime/inspect_rom_metadata.py" "$rom_metadata_path" || true
+
       - name: "❌ Send failure notification"
         if: failure()
         shell: bash
@@ -901,6 +1009,39 @@ jobs:
           if [[ -s build/.deadzone/failed_stage.txt ]]; then
             failed_stage="$(tr -d '\r\n' < build/.deadzone/failed_stage.txt 2>/dev/null || true)"
           fi
+          # Surface the most relevant error line from
+          # build_action.log so the operator does not have to
+          # download the artifact to see the engine's actual
+          # diagnostic. We prefer the most recent line that
+          # looks like an [ERROR] / "Failed" / "failed"
+          # message; if none exists, we fall back to the very
+          # last non-empty line of the log so even a wholly
+          # unexpected build.sh crash still produces something
+          # actionable. The build step now writes the engine's
+          # full output to build_action.log durably (the prior
+          # `… | tee build_action.log` pipeline lost the file
+          # to SIGPIPE on the run that introduced the
+          # "missing device.name" metadata error), so this
+          # helper is reliable for the first time.
+          detail_line=""
+          if [[ -s build_action.log ]]; then
+            detail_line="$(
+              { grep -E '\[ERROR\]|failed|Failed|missing device\.|persisted metadata' build_action.log || true; } \
+                | tail -n 1 \
+                | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+                | tr -d '\r' \
+                | head -c 400
+            )"
+            if [[ -z "$detail_line" ]]; then
+              detail_line="$(
+                tail -n 50 build_action.log \
+                  | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+                  | grep -v '^[[:space:]]*$' \
+                  | tail -n 1 \
+                  | head -c 400
+              )"
+            fi
+          fi
           failure_message="DeadZone Stable ROM build failed."
           case "$failed_stage" in
             download)
@@ -913,7 +1054,46 @@ jobs:
               failure_message="DeadZone Stable build failed at the partition extraction stage. Inspect bin/extract/run_extract.sh logs; the extractor or a partition tool may be missing."
               ;;
             metadata)
-              failure_message="DeadZone Stable build failed at the metadata stage. install erofsfuse (apt) or vendor bin/Linux/x86_64/extract.erofs so partition EROFS images can be unpacked for build.prop."
+              # The metadata stage has two distinct failure modes
+              # the launcher has to distinguish:
+              #   1. The partition EROFS images could not be
+              #      unpacked so build.prop was never read. The
+              #      legacy fix was "install erofsfuse / vendor
+              #      bin/Linux/x86_64/extract.erofs". That fix
+              #      is in place (the toolchain chmod step is
+              #      mandatory) and the canonical symptom
+              #      (build_action.log shows zero "Extract:"
+              #      progress lines) no longer reproduces on
+              #      38063165985's lineage. We keep a short
+              #      pointer to it as a fallback, but it is no
+              #      longer the primary message.
+              #   2. The engine's own metadata persistence
+              #      step wrote a rom_metadata.json that its
+              #      reload-validator rejected, typically with
+              #      "Persisted metadata failed reload
+              #      validation — missing device.name" (the
+              #      symptom of run 38063165985, fixed in this
+              #      commit). That is an engine-internal bug
+              #      in bin/metadata/detect_props.sh, NOT
+              #      something the launcher can paper over by
+              #      substituting a device name. We refuse to
+              #      invent or silently backfill a device
+              #      name, because doing so would let the
+              #      build proceed against a wrong device
+              #      profile and produce a brick-prone ROM.
+              # The new message points the operator at the
+              #      engine's own log, names the failing
+              #      script, and does NOT ask the launcher
+              #      (or the operator) to invent a device
+              #      name. We still emit a short erofsfuse
+              #      fallback so an operator who cannot find
+              #      the persistence error in the log knows
+              #      what to look at next.
+              if [[ "$detail_line" == *"Persisted metadata"* || "$detail_line" == *"missing device."* || "$detail_line" == *"missing device\."* ]]; then
+                failure_message="DeadZone Stable build failed at the metadata persistence / validation stage: the engine wrote build/.deadzone/rom_metadata.json that its own reload-validator rejected ($detail_line). This is an engine bug in bin/metadata/detect_props.sh, not a launcher misconfiguration; do NOT invent or substitute a device name. Fix detect_props.sh so it persists a rom_metadata.json that satisfies the reload-validator (device.name, device.codename, and rom.version are all required)."
+              else
+                failure_message="DeadZone Stable build failed at the metadata stage. If the engine's log shows 'Persisted metadata failed reload validation', fix bin/metadata/detect_props.sh so it persists a valid rom_metadata.json (do NOT invent a device name). If the log shows partition EROFS images failed to unpack, install erofsfuse (apt) or vendor bin/Linux/x86_64/extract.erofs."
+              fi
               ;;
             super)
               failure_message="DeadZone Stable build failed at the super-image inspection stage. The super.img / payload.bin layout was not parseable."
@@ -937,6 +1117,16 @@ jobs:
               failure_message="DeadZone Stable build failed at the upload stage. rclone could not deliver the final ZIP; check the rclone.conf secret and target."
               ;;
           esac
+          # Append the most relevant error line we extracted
+          # above, when the per-stage message does not already
+          # inline it. We do this for every stage, not just
+          # metadata, so the failure callback is uniformly
+          # useful. The truncation at 400 chars keeps the
+          # event payload under the bot's reasonable size
+          # limit.
+          if [[ -n "$detail_line" && "$failure_message" != *"$detail_line"* ]]; then
+            failure_message="$failure_message | last error: $detail_line"
+          fi
           python3 "$runtime_dir/report_build_event.py" failed \
             --project stable \
             --message "$failure_message" || true

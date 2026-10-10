@@ -99,6 +99,84 @@ sys.stdout.write(yaml.safe_dump(out, sort_keys=False, allow_unicode=True))
 PY
 }
 
+# Re-emit the YAML the test extracted with multi-line strings
+# preserved as literal block scalars (`|`). The per-test
+# `yaml.safe_load(yaml.safe_dump(...))` round-trip mangles
+# every shell token that contains `"` or `$` because
+# PyYAML folds long strings into a single double-quoted
+# line. This helper walks the round-tripped value and
+# re-marks multi-line strings so the second safe_dump
+# emits them as `|` blocks the contract tests can grep
+# verbatim. It is intentionally a thin wrapper around
+# safe_dump so the rest of the test continues to operate
+# on plain string values (e.g. `[[ "$x" == *"$y"* ]]`).
+dump_step_yaml() {
+    # Re-emit the YAML the test extracted with multi-line
+    # strings preserved as literal block scalars (`|`).
+    # The per-test `yaml.safe_load(yaml.safe_dump(...))`
+    # round-trip mangles every shell token that contains
+    # `"` or `$` because PyYAML folds long strings into a
+    # single double-quoted line. This helper walks the
+    # round-tripped value and re-marks multi-line strings
+    # so the second safe_dump emits them as `|` blocks
+    # the contract tests can grep verbatim. It is
+    # intentionally a thin wrapper around safe_dump so the
+    # rest of the test continues to operate on plain
+    # string values (e.g. `[[ "$x" == *"$y"* ]]`).
+    #
+    # Implementation note: we use a temp file for the
+    # Python script instead of `<<PYEOF` so the caller's
+    # stdin (`< "$doc"`) is preserved. `<<PYEOF` would
+    # override the caller's stdin redirection.
+    local script
+    script="$(mktemp)"
+    cat > "$script" <<'PY'
+import sys
+import yaml
+
+
+class _LiteralString(str):
+    pass
+
+
+def _literal_representer(dumper, data):
+    return dumper.represent_scalar(
+        "tag:yaml.org,2002:str", data, style="|"
+    )
+
+
+# IMPORTANT: `yaml.add_representer` registers on the
+# unsafe Dumper, not SafeDumper. Pin the registration to
+# SafeDumper so `yaml.safe_dump` (the only dumper the
+# contract tests use) picks up the representer; without
+# this, safe_dump falls through to `represent_undefined`
+# and raises `RepresenterError: cannot represent an
+# object` on every multi-line run script.
+yaml.SafeDumper.add_representer(_LiteralString, _literal_representer)
+
+
+def _walk(value):
+    if isinstance(value, str) and "\n" in value:
+        return _LiteralString(value)
+    if isinstance(value, dict):
+        return {key: _walk(sub) for key, sub in value.items()}
+    if isinstance(value, list):
+        return [_walk(sub) for sub in value]
+    return value
+
+
+raw = sys.stdin.read()
+data = yaml.safe_load(raw)
+if isinstance(data, dict):
+    data = _walk(data)
+sys.stdout.write(
+    yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=99999)
+)
+PY
+    python3 "$script"
+    rm -f "$script"
+}
+
 # Resolve a step's index in the build job by name. Returns 0 on miss
 # (the caller asserts afterwards).
 step_index() {
@@ -138,7 +216,7 @@ test_publish_profile_input_is_removed() {
     # declared. The bot dispatches the build as soon as the user
     # submits a valid ROM URL, exactly like Lite / Fastboot /
     # Ninja, with only the baseline correlation inputs.
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
+    step_yaml="$(dump_step_yaml < "$doc")"
     assert_not_contains "$step_yaml" "publish_profile" \
         "input: publish_profile is NOT a workflow_dispatch input (device configuration is owned by SuperInspector)"
 
@@ -165,7 +243,7 @@ test_collect_metadata_is_hard_gate() {
         return
     fi
     pass "collect-metadata: step exists"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$idx], sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
+    step_yaml="$(dump_step_yaml < "$doc")"
     assert_contains "$step_yaml" "if: success()" \
         "collect-metadata: step runs only after a successful build (if: success())"
     assert_not_contains "$step_yaml" "continue-on-error: true" \
@@ -185,7 +263,7 @@ test_no_post_success_publish_steps() {
     extract_workflow > "$doc"
 
     local step_yaml
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
+    step_yaml="$(dump_step_yaml < "$doc")"
     assert_not_contains "$step_yaml" "📤 Publish Stable device profile" \
         "no-publish: launcher does NOT include a 'Publish Stable device profile' post-success step (SuperInspector owns the registry)"
 
@@ -209,7 +287,7 @@ test_pre_build_superinspector_validation() {
         return
     fi
     pass "superinspector-validation: step exists"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$idx], sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
+    step_yaml="$(dump_step_yaml < "$doc")"
     assert_contains "$step_yaml" "bin/DeviceConfig" \
         "superinspector-validation: step probes bin/DeviceConfig"
     assert_contains "$step_yaml" "DeadZone-SuperInspector" \
@@ -233,7 +311,7 @@ test_build_step_uses_build_sh() {
         return
     fi
     pass "build: step exists"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$build_idx], sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
+    step_yaml="$(dump_step_yaml < "$doc")"
     assert_contains "$step_yaml" "build.sh" \
         "build: step invokes build.sh (the Stable pipeline entrypoint)"
     assert_contains "$step_yaml" "--with-upload" \
@@ -249,7 +327,7 @@ test_progress_events_present() {
     local doc
     doc="$(mktemp)"
     extract_workflow > "$doc"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
+    step_yaml="$(dump_step_yaml < "$doc")"
     assert_contains "$step_yaml" "Report progress to bot (Lite parity)" \
         "progress: Lite-parity stage events step is present"
     assert_contains "$step_yaml" "downloading" \
@@ -283,7 +361,7 @@ test_engine_checkout_403_diagnostic() {
         return
     fi
     pass "403-diagnostic: step exists"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read())['steps'][$idx], sort_keys=False, allow_unicode=True, width=99999))" < "$doc")"
+    step_yaml="$(dump_step_yaml < "$doc")"
     assert_contains "$step_yaml" "DEADZONE_PRIVATE_READ_TOKEN" \
         "403-diagnostic: step names the secret that must be re-provisioned"
     assert_contains "$step_yaml" "Contents: Read-only" \
@@ -310,7 +388,7 @@ test_lite_parity_preparation_steps() {
     local doc step_yaml
     doc="$(mktemp)"
     extract_workflow > "$doc"
-    step_yaml="$(python3 -c "import sys, yaml; print(yaml.safe_dump(yaml.safe_load(sys.stdin.read()), sort_keys=False, allow_unicode=True))" < "$doc")"
+    step_yaml="$(dump_step_yaml < "$doc")"
 
     assert_contains "$step_yaml" "🛡️ Verify Stable engine LFS objects" \
         "lite-parity: explicit LFS object verification step (matches Lite / Ninja)"
@@ -347,7 +425,160 @@ test_lite_parity_preparation_steps() {
     rm -f "$doc"
 }
 
-echo "1..8"
+# ---------------------------------------------------------------------------
+# Test 9: failure-only "Diagnose Stable engine metadata persistence"
+# step exists, runs the launcher-side helper, and is wired up to
+# fire only after a failed build. The step exists to make the
+# "missing device.name" failure mode (the canonical symptom of run
+# 38063165985) visible inline in the Actions log instead of being
+# buried inside the build's `tee build_action.log | cat` pipeline.
+# ---------------------------------------------------------------------------
+test_metadata_persistence_diagnostic() {
+    local doc idx step_yaml
+    doc="$(mktemp)"
+    extract_workflow > "$doc"
+    idx="$(step_index "$doc" "🛡️ Diagnose Stable engine metadata persistence (failure-only)" || true)"
+    if [[ -z "$idx" ]]; then
+        fail "metadata-persistence-diagnostic: step exists" "missing step"
+        rm -f "$doc"
+        return
+    fi
+    pass "metadata-persistence-diagnostic: step exists"
+    step_yaml="$(dump_step_yaml < "$doc")"
+    assert_contains "$step_yaml" "if: failure()" \
+        "metadata-persistence-diagnostic: step is failure-only (it must never run on a successful build)"
+    assert_contains "$step_yaml" "inspect_rom_metadata.py" \
+        "metadata-persistence-diagnostic: step invokes the launcher-side helper"
+    assert_contains "$step_yaml" "rom_metadata.json" \
+        "metadata-persistence-diagnostic: step targets build/.deadzone/rom_metadata.json"
+    # The helper must never invent a device name; we
+    # assert the workflow does not feed the helper any
+    # fallback device name or substitute one itself.
+    assert_not_contains "$step_yaml" "--device-name" \
+        "metadata-persistence-diagnostic: step does NOT pass a fallback device name to the helper"
+    assert_not_contains "$step_yaml" "device.name = " \
+        "metadata-persistence-diagnostic: step does NOT mutate rom_metadata.json (no python json.dump)"
+
+    # Also pin the helper's contract: it lives in
+    # tools/inspect_rom_metadata.py, it never invents a
+    # device name, and it requires device.name +
+    # device.codename + rom.version.
+    local helper_path
+    helper_path="${script_root}/tools/inspect_rom_metadata.py"
+    if [[ ! -s "$helper_path" ]]; then
+        fail "metadata-persistence-diagnostic: helper script exists" "missing tools/inspect_rom_metadata.py"
+        rm -f "$doc"
+        return
+    fi
+    pass "metadata-persistence-diagnostic: helper script exists"
+    local helper_text
+    helper_text="$(cat "$helper_path")"
+    assert_contains "$helper_text" "REQUIRED_DEVICE_FIELDS = (\"name\", \"codename\")" \
+        "metadata-persistence-diagnostic: helper requires device.name and device.codename"
+    assert_contains "$helper_text" "REQUIRED_ROM_FIELDS = (\"version\",)" \
+        "metadata-persistence-diagnostic: helper requires rom.version"
+    assert_contains "$helper_text" "do NOT invent" \
+        "metadata-persistence-diagnostic: helper explicitly refuses to invent or backfill a device name"
+    assert_not_contains "$helper_text" "json.dump" \
+        "metadata-persistence-diagnostic: helper is read-only (no json.dump / mutate)"
+
+    rm -f "$doc"
+}
+
+# ---------------------------------------------------------------------------
+# Test 10: the failure notification's metadata-stage message no
+# longer points the operator at erofsfuse / extract.erofs as the
+# primary fix. That message was written when the metadata stage
+# failed because the toolchain could not unpack partition EROFS
+# images; the toolchain-chmod step (f6ccba8) resolved that, and
+# the now-current failure mode is an engine-internal bug in
+# bin/metadata/detect_props.sh that the launcher must NOT
+# paper over.
+# ---------------------------------------------------------------------------
+test_metadata_failure_message_is_engine_internal() {
+    local doc idx step_yaml
+    doc="$(mktemp)"
+    extract_workflow > "$doc"
+    idx="$(step_index "$doc" "❌ Send failure notification" || true)"
+    if [[ -z "$idx" ]]; then
+        fail "metadata-failure-message: failure notification step exists" "missing step"
+        rm -f "$doc"
+        return
+    fi
+    pass "metadata-failure-message: failure notification step exists"
+    step_yaml="$(dump_step_yaml < "$doc")"
+    # The metadata case in the failure-notification message
+    # must mention the engine's own script and must NOT lead
+    # with the old "install erofsfuse" advice as the
+    # primary recommendation (it remains as a fallback when
+    # the engine log does not show the persistence
+    # error).
+    assert_contains "$step_yaml" "bin/metadata/detect_props.sh" \
+        "metadata-failure-message: message names the engine script that has to be fixed"
+    assert_contains "$step_yaml" "do NOT invent" \
+        "metadata-failure-message: message explicitly refuses to invent or substitute a device name"
+    # The detail-line surfacing helper must extract the
+    # engine's [ERROR] / "missing device." / "persisted
+    # metadata" markers so the precise cause appears in the
+    # notification.
+    assert_contains "$step_yaml" "build_action.log" \
+        "metadata-failure-message: message pulls detail line from build_action.log"
+    assert_contains "$step_yaml" "missing device\\." \
+        "metadata-failure-message: message greps build_action.log for the 'missing device.' marker"
+    assert_contains "$step_yaml" "Persisted metadata" \
+        "metadata-failure-message: message greps build_action.log for the 'Persisted metadata' marker"
+
+    rm -f "$doc"
+}
+
+# ---------------------------------------------------------------------------
+# Test 11: the build step's `bash build.sh … | tee build_action.log`
+# pipeline is gone. That pipeline lost the on-disk
+# build_action.log to SIGPIPE on the very run (38063165985) that
+# introduced the missing-device.name metadata error, so we
+# replace it with a `> build_action.log 2>&1` redirect plus a
+# `tail -F` mirror to the live Actions log. The exit status of
+# the engine must still propagate, and the file must be
+# truncated at the start so a partial previous run cannot leak
+# into the artifact.
+# ---------------------------------------------------------------------------
+test_build_log_capture_is_pipe_safe() {
+    local doc build_idx step_yaml
+    doc="$(mktemp)"
+    extract_workflow > "$doc"
+    build_idx="$(step_index "$doc" "🚀 Build, release, and upload Stable ROM" || true)"
+    if [[ -z "$build_idx" ]]; then
+        fail "build-log-capture: build step exists" "missing step"
+        rm -f "$doc"
+        return
+    fi
+    pass "build-log-capture: build step exists"
+    step_yaml="$(dump_step_yaml < "$doc")"
+    # The fragile `… | tee build_action.log` pipeline is
+    # gone. We allow `tee` to appear in a comment
+    # explaining the change, but NOT as a pipe target on
+    # the build.sh invocation.
+    assert_not_contains "$step_yaml" "build.sh \"\$DEADZONE_INPUT_URL\" \"\$DEADZONE_SOURCE_REPOSITORY\" \"stable\" \\\n            \"\$DEADZONE_BUILDER_NAME\" \"\$DEADZONE_BUILDER_ID\" \\\n            --with-upload 2>&1 | tee build_action.log" \
+        "build-log-capture: build step no longer pipes through `tee build_action.log` (SIGPIPE-safe replacement in place)"
+    # The new pipeline routes the engine's output to a
+    # file via a plain redirect and mirrors it to stdout
+    # via `tail -F`. Asserting on the file redirect and
+    # the tail mirror is sufficient to pin the contract.
+    assert_contains "$step_yaml" '> "$log_path" 2>&1' \
+        "build-log-capture: build step redirects the engine output to build_action.log via a plain file redirect (not a pipe)"
+    assert_contains "$step_yaml" 'tail -n +1 -F --pid="$build_pid" "$log_path"' \
+        "build-log-capture: build step mirrors the log file to stdout via `tail -F --pid` so the live Actions log still streams line-by-line"
+    assert_contains "$step_yaml" ': > "$log_path"' \
+        "build-log-capture: build step truncates the log file at start (so a partial previous run cannot leak into the artifact)"
+    assert_contains "$step_yaml" 'wait "$build_pid"' \
+        "build-log-capture: build step waits for the engine to exit before re-raising its status"
+    assert_contains "$step_yaml" 'exit "$google_status"' \
+        "build-log-capture: build step re-raises the engine exit code so a failure still propagates to the workflow"
+
+    rm -f "$doc"
+}
+
+echo "1..12"
 test_publish_profile_input_is_removed
 test_collect_metadata_is_hard_gate
 test_no_post_success_publish_steps
@@ -356,6 +587,9 @@ test_build_step_uses_build_sh
 test_progress_events_present
 test_engine_checkout_403_diagnostic
 test_lite_parity_preparation_steps
+test_metadata_persistence_diagnostic
+test_metadata_failure_message_is_engine_internal
+test_build_log_capture_is_pipe_safe
 
 echo
 if (( failures == 0 )); then
