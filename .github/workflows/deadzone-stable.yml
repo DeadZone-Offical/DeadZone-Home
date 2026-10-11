@@ -163,13 +163,13 @@ jobs:
           fi
 
       - name: "📥 Checkout DeadZone launcher"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
           fetch-depth: 1
 
       - name: "📥 Checkout private runtime"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: DeadZone-Offical/DeadZone-File
           ref: main
@@ -187,32 +187,6 @@ jobs:
             upload.env
             upload-mirrors.sh
             publish-website-release.py
-
-      - name: "🛠️ Stage launcher-side helpers into runtime"
-        run: |
-          set -euo pipefail
-          # The launcher's tools/ directory ships helpers that
-          # the workflow invokes from inside the central
-          # runtime's working directory (e.g. the
-          # failure-only rom_metadata.json inspector under
-          # "🛡️ Diagnose Stable engine metadata
-          # persistence"). The central runtime itself lives
-          # at $GITHUB_WORKSPACE/runtime and is checked out
-          # by `📥 Checkout private runtime`; we copy each
-          # launcher-side helper next to it under
-          # `runtime/` so the downstream steps can use the
-          # same `$GITHUB_WORKSPACE/runtime/<helper>`
-          # convention as the rest of the launcher.
-          # Mirrors the SparseCheckout-by-name pattern the
-          # central runtime uses to expose build_stage.py
-          # and report_build_event.py.
-          for helper in inspect_rom_metadata.py; do
-            if [[ ! -s "tools/${helper}" ]]; then
-              echo "::error::Launcher-side helper is missing: tools/${helper}"
-              exit 1
-            fi
-            install -m 0755 "tools/${helper}" "runtime/${helper}"
-          done
 
       - name: "⚙️ Load central runtime"
         id: runtime
@@ -286,7 +260,7 @@ jobs:
           sudo apt-get clean
 
       - name: "📦 Checkout private Stable engine"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ steps.runtime.outputs.engine_repository }}
           ref: main
@@ -297,7 +271,7 @@ jobs:
           persist-credentials: false
 
       - name: "📦 Checkout Lite engine (fix_selinux.py source)"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: DeadZone-Offical/DeadZone-xiaomi_Lite
           ref: main
@@ -349,7 +323,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # `actions/checkout@v4` with `lfs: true` retries the LFS
+          # `actions/checkout@v5` with `lfs: true` retries the LFS
           # fetch three times (~35s) before failing with a stack of
           # identical 404 lines. With `lfs: false` the checkout above
           # leaves the LFS pointer files in place and we perform a
@@ -389,7 +363,7 @@ jobs:
           # Stable's vendor toolchain under bin/tools/linux_x86_64/
           # is committed to the Stable engine as plain blobs (git
           # index mode 100644) because git LFS does not preserve
-          # the executable bit. On a fresh `actions/checkout@v4`
+          # the executable bit. On a fresh `actions/checkout@v5`
           # the runner materialises those files with mode 0644,
           # so the very first EROFS partition the extract stage
           # tries to unpack dies with
@@ -559,7 +533,7 @@ jobs:
         run: sudo timedatectl set-timezone Africa/Cairo
 
       - name: "☕ Install OpenJDK"
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -936,7 +910,7 @@ jobs:
           # release) consume. Run 38063165985 exposed a
           # regression where the engine wrote a JSON that
           # the reload-validator rejected with "Persisted
-          # metadata failed reload validation — missing
+          # metadata failed reload validation -- missing
           # device.name"; the previous launcher just
           # forwarded the engine's generic "metadata
           # stage failed" line and asked the operator to
@@ -944,28 +918,93 @@ jobs:
           # the prior (now-fixed) toolchain-permission
           # bug, not this one.
           #
-          # This step inspects whatever the engine managed
-          # to persist and surfaces a precise ::error::
-          # annotation whenever the reload-validator would
-          # reject the JSON. We do NOT modify, fix-up, or
-          # backfill the JSON: silently substituting a
-          # device.name would let the build proceed against
-          # a wrong device profile and produce a
-          # brick-prone ROM, which is the exact failure
-          # mode the reload-validator exists to prevent.
-          # The launcher reports; the engine fixes.
+          # Run 38115295186 then exposed a second,
+          # independent bug: the failure-only
+          # tools/inspect_rom_metadata.py helper collapsed
+          # OSError (which includes PermissionError) and
+          # json.JSONDecodeError into a single except
+          # branch, so a runner that ran out of disk
+          # during the post-upload verify_zst_roundtrip
+          # surfaced a misleading "fix
+          # bin/metadata/detect_props.sh" annotation when
+          # the real cause was an engine-internal storage
+          # problem.
+          #
+          # This launcher-owned step inspects whatever
+          # the engine managed to persist and surfaces a
+          # precise ::error:: annotation whenever the
+          # reload-validator would reject the JSON, with
+          # five explicit branches:
+          #   1. FileNotFoundError: engine never reached
+          #      persistence (likely a much earlier
+          #      stage failure) -- point at
+          #      detect_props.sh + build_action.log.
+          #   2. JSONDecodeError: genuine malformed JSON
+          #      -- blame detect_props.sh (only here).
+          #   3. OSError errno 28 (ENOSPC): disk full,
+          #      almost always the
+          #      verify_zst_roundtrip on a multi-GB
+          #      super.img.zst filling the runner's
+          #      tmpfs -- do NOT blame detect_props.sh,
+          #      point at the engine.
+          #   4. OSError (any other errno, including
+          #      PermissionError errno 13): generic
+          #      read/write failure -- do NOT blame
+          #      detect_props.sh.
+          #   5. JSON parses but reload-validator will
+          #      reject: missing device.name,
+          #      device.codename, or rom.version.
+          #
+          # Implementation note: the Python source is
+          # emitted into a temp file via a
+          # single-quoted heredoc, then handed to
+          # `python3 "<temp.py>"`. The single-quoted
+          # heredoc keeps the YAML literal block scalar
+          # flat (no Python indentation-vs-YAML-indent
+          # conflict) and passes the source's own
+          # apostrophes ("engine's", "runner's")
+          # through verbatim -- a previous attempt that
+          # used a $'...' assignment choked on those
+          # apostrophes and broke the YAML/bash parse
+          # chain. The launcher never modifies, fixes
+          # up, or backfills the JSON: silently
+          # substituting a device.name would let the
+          # build proceed against a wrong device
+          # profile and produce a brick-prone ROM,
+          # which is the exact failure mode the
+          # reload-validator exists to prevent. The
+          # launcher reports; the engine fixes.
           rom_metadata_path="build/.deadzone/rom_metadata.json"
           if [[ ! -s "$rom_metadata_path" ]]; then
-            # The engine never even persisted a JSON —
+            # The engine never even persisted a JSON --
             # likely a much earlier failure (download,
             # classify, extract). The downstream
             # failure-notification step already names the
-            # failed stage via build/.deadzone/failed_stage.txt;
-            # we only add a diagnostic when there is
-            # something to inspect.
+            # failed stage via
+            # build/.deadzone/failed_stage.txt; we only
+            # add a diagnostic when there is something
+            # to inspect.
             exit 0
           fi
-          python3 "$GITHUB_WORKSPACE/runtime/inspect_rom_metadata.py" "$rom_metadata_path" || true
+          # The Python source is base64-encoded and decoded
+          # into a temp file at runtime. This keeps the
+          # YAML literal block scalar flat (no Python
+          # indentation-vs-YAML-indent conflict) and
+          # dodges the apostrophe problem entirely
+          # -- a previous $'...' assignment choked on
+          # the source's "engine's" / "runner's"
+          # apostrophes, and a `<<'PYEOF'` heredoc
+          # inside the YAML literal block ended the
+          # YAML block prematurely because the closer
+          # has to sit at column 0. base64 has no shell
+          # metacharacters, so the assignment is safe
+          # under any quoting context.
+          SCRIPT_B64="aW1wb3J0IGpzb24KaW1wb3J0IHN5cwppbXBvcnQgb3MKClJFUVVJUkVEX0RFVklDRV9GSUVMRFMgPSAoIm5hbWUiLCAiY29kZW5hbWUiKQpSRVFVSVJFRF9ST01fRklFTERTID0gKCJ2ZXJzaW9uIiwpCgoKZGVmIG1pc3NpbmdfZmllbGRzKGJsb2NrLCByZXF1aXJlZCk6CiAgICByZXR1cm4gWwogICAgICAgIGZpZWxkCiAgICAgICAgZm9yIGZpZWxkIGluIHJlcXVpcmVkCiAgICAgICAgaWYgbm90IChibG9jay5nZXQoZmllbGQpIG9yICIiKS5zdHJpcCgpCiAgICBdCgoKZGVmIG1haW4oYXJndik6CiAgICBpZiBsZW4oYXJndikgIT0gMjoKICAgICAgICBwcmludCgiOjplcnJvcjo6RGlhZ25vc2UgU3RhYmxlIGVuZ2luZSBtZXRhZGF0YSBwZXJzaXN0ZW5jZTogZXhwZWN0ZWQgZXhhY3RseSBvbmUgYXJndW1lbnQsIHRoZSBwYXRoIHRvIGJ1aWxkLy5kZWFkem9uZS9yb21fbWV0YWRhdGEuanNvbi4iLCBmaWxlPXN5cy5zdGRlcnIpCiAgICAgICAgcmV0dXJuIDAKICAgIHBhdGggPSBhcmd2WzFdCiAgICB0cnk6CiAgICAgICAgd2l0aCBvcGVuKHBhdGgsIGVuY29kaW5nPSJ1dGYtOCIpIGFzIGhhbmRsZToKICAgICAgICAgICAgZG9jdW1lbnQgPSBqc29uLmxvYWQoaGFuZGxlKQogICAgZXhjZXB0IEZpbGVOb3RGb3VuZEVycm9yIGFzIGV4YzoKICAgICAgICBwcmludCgiOjplcnJvcjo6U3RhYmxlIGVuZ2luZSBkaWQgbm90IHBlcnNpc3QgYnVpbGQvLmRlYWR6b25lL3JvbV9tZXRhZGF0YS5qc29uICh7MH0pLiBUaGUgbWV0YWRhdGEgc3RhZ2UgbmV2ZXIgcmVhY2hlZCB0aGUgcGVyc2lzdGVuY2Ugc3RlcDsgaW5zcGVjdCBiaW4vbWV0YWRhdGEvZGV0ZWN0X3Byb3BzLnNoIGFuZCB0aGUgZW5naW5lJ3MgYnVpbGRfYWN0aW9uLmxvZyB0byBzZWUgd2hpY2ggZWFybGllciBjaGVjayBmYWlsZWQgYmVmb3JlIHRoZSBKU09OIHdhcyB3cml0dGVuLiIuZm9ybWF0KGV4YykpCiAgICAgICAgcmV0dXJuIDAKICAgIGV4Y2VwdCBqc29uLkpTT05EZWNvZGVFcnJvciBhcyBleGM6CiAgICAgICAgcHJpbnQoIjo6ZXJyb3I6OlN0YWJsZSBlbmdpbmUgcGVyc2lzdGVkIGEgbWFsZm9ybWVkIGJ1aWxkLy5kZWFkem9uZS9yb21fbWV0YWRhdGEuanNvbjogezB9OiB7MX0uIFRoZSByZWxvYWQtdmFsaWRhdG9yIHdpbGwgcmVqZWN0IGFueSBKU09OIHRoYXQgZG9lcyBub3QgcGFyc2U7IGZpeCBiaW4vbWV0YWRhdGEvZGV0ZWN0X3Byb3BzLnNoIHNvIGl0IHdyaXRlcyB2YWxpZCBKU09OLiIuZm9ybWF0KHR5cGUoZXhjKS5fX25hbWVfXywgZXhjKSkKICAgICAgICByZXR1cm4gMAogICAgZXhjZXB0IE9TRXJyb3IgYXMgZXhjOgogICAgICAgIGVycm5vX2F0dHIgPSBnZXRhdHRyKGV4YywgImVycm5vIiwgTm9uZSkKICAgICAgICBpZiBlcnJub19hdHRyID09IDI4OgogICAgICAgICAgICBwcmludCgiOjplcnJvcjo6U3RhYmxlIGVuZ2luZSBjb3VsZCBub3QgcGVyc2lzdCBidWlsZC8uZGVhZHpvbmUvcm9tX21ldGFkYXRhLmpzb246IHswfTogezF9IChlcnJubyAyOCwgRU5PU1BDKS4gVGhlIHJ1bm5lciByYW4gb3V0IG9mIGRpc2sgc3BhY2Ugd2hpbGUgdGhlIGVuZ2luZSB3YXMgd3JpdGluZyBpdHMgbWV0YWRhdGE7IHRoaXMgaXMgYWxtb3N0IGFsd2F5cyBhIHN5bXB0b20gb2YgYW4gZWFybGllciBzdGFnZSAodHlwaWNhbGx5IHRoZSBwb3N0LXVwbG9hZCB2ZXJpZnlfenN0X3JvdW5kdHJpcCBvbiBhIG11bHRpLUdCIHN1cGVyLmltZy56c3QpIGZpbGxpbmcgdGhlIHJ1bm5lcidzIHRtcGZzLiBUaGUgZml4IGJlbG9uZ3MgaW4gdGhlIFN0YWJsZSBlbmdpbmUgKERlYWRab25lLVhpYW9taS1TdGFibGUpLCBOT1QgaW4gYmluL21ldGFkYXRhL2RldGVjdF9wcm9wcy5zaDogZGV0ZWN0X3Byb3BzLnNoIGlzIG5vdCBydW5uaW5nIG9uIGFuIGVtcHR5IGRpc2sgYW5kIHRoZSBKU09OIGl0IHdvdWxkIGhhdmUgd3JpdHRlbiBpcyBpcnJlbGV2YW50IHVudGlsIHRoZSByb3VuZC10cmlwIC8gZGlzayBpc3N1ZSBpcyByZXNvbHZlZC4gSW5zcGVjdCBidWlsZF9hY3Rpb24ubG9nIGZvciB0aGUgZmlyc3QgRU5PU1BDIGxpbmUgYW5kIHNob3J0ZW4gb3Igc2tpcCB0aGUgcm91bmQtdHJpcCB2ZXJpZmljYXRpb24gKG9yIHN0cmVhbSB0aGUgZGVjb21wcmVzc2lvbiB0byBhIHBhdGggdGhhdCBkb2VzIG5vdCBzaGFyZSB0aGUgcnVubmVyJ3MgdG1wZnMpLiIuZm9ybWF0KHR5cGUoZXhjKS5fX25hbWVfXywgZXhjKSkKICAgICAgICBlbHNlOgogICAgICAgICAgICBlcnJub19sYWJlbCA9ICgiZXJybm8gezB9Ii5mb3JtYXQoZXJybm9fYXR0cikgaWYgZXJybm9fYXR0ciBpcyBub3QgTm9uZSBlbHNlICJubyBlcnJubyIpCiAgICAgICAgICAgIHByaW50KCI6OmVycm9yOjpTdGFibGUgZW5naW5lIGNvdWxkIG5vdCBvcGVuIGJ1aWxkLy5kZWFkem9uZS9yb21fbWV0YWRhdGEuanNvbiBmb3IgaW5zcGVjdGlvbjogezB9OiB7MX0gKHsyfSkuIFRoaXMgaXMgYW4gb3BlcmF0aW5nLXN5c3RlbS1sZXZlbCBmYWlsdXJlIChyZWFkLCB3cml0ZSwgb3IgcGVybWlzc2lvbiBkZW5pZWQpLCBOT1QgYSBKU09OIHBhcnNlIGZhaWx1cmUgLS0gYmluL21ldGFkYXRhL2RldGVjdF9wcm9wcy5zaCBpcyBhbG1vc3QgY2VydGFpbmx5IG5vdCB0aGUgY2F1c2UuIEluc3BlY3QgYnVpbGRfYWN0aW9uLmxvZyBmb3IgdGhlIGNvcnJlc3BvbmRpbmcgUGVybWlzc2lvbkVycm9yIC8gT1NFcnJvciBsaW5lIHRvIGlkZW50aWZ5IHRoZSB1cHN0cmVhbSBlbmdpbmUgc3RlcCB0aGF0IHJhbiBvdXQgb2YgZGlzaywgbG9zdCBhIGZpbGUgaGFuZGxlLCBvciBoaXQgYSBwZXJtaXNzaW9ucyBib3VuZGFyeSwgYW5kIGZpeCB0aGF0IHN0ZXAgaW4gdGhlIFN0YWJsZSBlbmdpbmUuIi5mb3JtYXQodHlwZShleGMpLl9fbmFtZV9fLCBleGMsIGVycm5vX2xhYmVsKSkKICAgICAgICByZXR1cm4gMAoKICAgIGRldmljZV9ibG9jayA9IGRvY3VtZW50LmdldCgiZGV2aWNlIikgb3Ige30KICAgIHJvbV9ibG9jayA9IGRvY3VtZW50LmdldCgicm9tIikgb3Ige30KCiAgICBtaXNzaW5nX2RldmljZSA9IG1pc3NpbmdfZmllbGRzKGRldmljZV9ibG9jaywgUkVRVUlSRURfREVWSUNFX0ZJRUxEUykKICAgIG1pc3Npbmdfcm9tID0gbWlzc2luZ19maWVsZHMocm9tX2Jsb2NrLCBSRVFVSVJFRF9ST01fRklFTERTKQoKICAgIGlmIG5vdCBtaXNzaW5nX2RldmljZSBhbmQgbm90IG1pc3Npbmdfcm9tOgogICAgICAgIHJldHVybiAwCgogICAgcGFydHMgPSBbXQogICAgaWYgbWlzc2luZ19kZXZpY2U6CiAgICAgICAgcGFydHMuYXBwZW5kKCJkZXZpY2UuIiArICIsIGRldmljZS4iLmpvaW4obWlzc2luZ19kZXZpY2UpKQogICAgaWYgbWlzc2luZ19yb206CiAgICAgICAgcGFydHMuYXBwZW5kKCJyb20uIiArICIsIHJvbS4iLmpvaW4obWlzc2luZ19yb20pKQogICAgbWlzc2luZyA9ICIgYW5kICIuam9pbihwYXJ0cykKICAgIHByaW50KCI6OmVycm9yOjpTdGFibGUgZW5naW5lIHJlbG9hZC12YWxpZGF0b3Igd2lsbCByZWplY3QgYnVpbGQvLmRlYWR6b25lL3JvbV9tZXRhZGF0YS5qc29uOiBtaXNzaW5nIHswfS4gVGhlIGVuZ2luZSB3cm90ZSBhIHJvbV9tZXRhZGF0YS5qc29uIHRoYXQgZG9lcyBub3QgY2FycnkgdGhlIGZpZWxkcyB0aGUgcmVsb2FkLXZhbGlkYXRvciByZXF1aXJlcyAoZGV2aWNlLm5hbWUgYW5kIGRldmljZS5jb2RlbmFtZSBjb21lIGZyb20gdGhlIHBlci1jb2RlbmFtZSBEZXZpY2VDb25maWcsIHJvbS52ZXJzaW9uIGZyb20gYnVpbGQucHJvcCkuIFRoaXMgaXMgYSBidWcgaW4gYmluL21ldGFkYXRhL2RldGVjdF9wcm9wcy5zaCAtLSBkbyBOT1QgaW52ZW50IG9yIGJhY2tmaWxsIGEgZGV2aWNlIG5hbWUgZnJvbSB0aGUgbGF1bmNoZXI7IHRoZSBidWlsZCBtdXN0IGJlIHJlamVjdGVkIHNvIGEgd3JvbmcgZGV2aWNlIHByb2ZpbGUgY2Fubm90IGxlYWsgaW50byBhIFN0YWJsZSBST00uIEZpeCBkZXRlY3RfcHJvcHMuc2ggc28gdGhlIHBlcnNpc3RlZCBKU09OIHNhdGlzZmllcyB0aGUgcmVsb2FkLXZhbGlkYXRvci4iLmZvcm1hdChtaXNzaW5nKSkKICAgIHJldHVybiAwCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIHN5cy5leGl0KG1haW4oc3lzLmFyZ3YpKQo="
+          SCRIPT_PATH="$(mktemp -t deadzone-inspect-rom-metadata.XXXXXX.py)"
+          trap 'rm -f "$SCRIPT_PATH"' EXIT
+          printf '%s' "$SCRIPT_B64" | base64 -d > "$SCRIPT_PATH"
+          python3 "$SCRIPT_PATH" "$rom_metadata_path" || true
+
 
       - name: "❌ Send failure notification"
         if: failure()
@@ -1175,7 +1214,7 @@ jobs:
 
       - name: "📋 Upload debug logs"
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: build-logs-${{ github.run_number }}
           path: |
