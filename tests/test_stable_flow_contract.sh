@@ -578,6 +578,207 @@ test_build_log_capture_is_pipe_safe() {
     rm -f "$doc"
 }
 
+# ---------------------------------------------------------------------------
+# Test 12: the rom_metadata diagnostic helper distinguishes IO
+# failures (PermissionError, OSError ENOSPC) from genuine
+# JSON-parse failures. Run 38115295186 hit ENOSPC on the
+# post-upload verify_zst_roundtrip (the multi-GB
+# super.img.zst decompression filled the runner's tmpfs);
+# the engine's cleanup then failed to flush
+# build/.deadzone/rom_metadata.json with a PermissionError
+# that the helper mis-categorized as a JSON-parse failure
+# and told the operator to "fix bin/metadata/detect_props.sh"
+# -- which was the wrong file entirely. The helper must now
+# (a) handle PermissionError / ENOSPC as a distinct branch
+# from JSONDecodeError, (b) NOT recommend the detect_props.sh
+# JSON-validity fix for IO failures, and (c) still blame
+# detect_props.sh for actual JSON-parse failures.
+# ---------------------------------------------------------------------------
+test_metadata_io_errors_not_blamed_on_detect_props() {
+    local helper_path helper_text
+    helper_path="${script_root}/tools/inspect_rom_metadata.py"
+    if [[ ! -s "$helper_path" ]]; then
+        fail "metadata-io-vs-json: helper script exists" "missing tools/inspect_rom_metadata.py"
+        return
+    fi
+    pass "metadata-io-vs-json: helper script exists"
+    helper_text="$(cat "$helper_path")"
+
+    # The helper must have separate except branches for
+    # JSONDecodeError and OSError. Pin the structural
+    # contract so a future "helpful" re-merge of those
+    # excepts is caught by the test, not in production.
+    assert_contains "$helper_text" "except json.JSONDecodeError as exc:" \
+        "metadata-io-vs-json: helper has an explicit JSONDecodeError branch (the only branch that may blame detect_props.sh for invalid JSON)"
+    assert_contains "$helper_text" "except OSError as exc:" \
+        "metadata-io-vs-json: helper has an explicit OSError branch (PermissionError, ENOSPC, IsADirectoryError, etc.)"
+    # Defensive: the old "except (OSError, json.JSONDecodeError)"
+    # collapsed form must be gone, because lumping IO errors
+    # together with JSON-parse errors was the precise bug
+    # that produced the misleading
+    # "fix bin/metadata/detect_props.sh" advice on a
+    # PermissionError during run 38115295186.
+    assert_not_contains "$helper_text" "except (OSError, json.JSONDecodeError)" \
+        "metadata-io-vs-json: helper no longer collapses OSError with JSONDecodeError (that merge produced the misleading 'fix detect_props.sh' advice on a PermissionError / ENOSPC)"
+
+    # The OSError branch must steer the operator away
+    # from detect_props.sh. We assert both the negative
+    # ("must not blame") and a positive (must point at
+    # build_action.log / the upstream engine step).
+    assert_contains "$helper_text" "operating-system-level failure" \
+        "metadata-io-vs-json: OSError branch calls out that the failure is operating-system-level, not a JSON parse failure"
+    assert_contains "$helper_text" "build_action.log" \
+        "metadata-io-vs-json: OSError branch tells the operator to inspect build_action.log for the upstream OSError line"
+
+    # The ENOSPC sub-branch (errno 28) must be handled
+    # explicitly so the operator is sent to look at the
+    # verify_zst_roundtrip / tmpfs sizing issue, not
+    # detect_props.sh. Pin the errno constant and the
+    # explicit "NOT in bin/metadata/detect_props.sh"
+    # language so a future helper edit cannot silently
+    # re-route ENOSPC back through the JSON-validity
+    # advice.
+    assert_contains "$helper_text" "errno_attr == 28" \
+        "metadata-io-vs-json: helper checks for errno 28 (ENOSPC) and treats it as its own diagnostic"
+    assert_contains "$helper_text" "NOT in bin/metadata/detect_props.sh" \
+        "metadata-io-vs-json: ENOSPC branch explicitly tells the operator the fix is NOT in bin/metadata/detect_props.sh"
+
+    # Behavioural: the helper must actually emit the
+    # right diagnostic when fed a real PermissionError
+    # and a real ENOSPC, and must NOT emit the
+    # "fix detect_props.sh" advice on either of them.
+    # We exercise the helper via python3 with a mocked
+    # builtins.open so the test does not require root or
+    # a full tmpfs.
+    local probe_script
+    probe_script="$(mktemp)"
+    cat > "$probe_script" <<'PY'
+import builtins
+import json
+import runpy
+import sys
+
+helper_path = sys.argv[1]
+mode = sys.argv[2]
+real_open = builtins.open
+
+
+def _raise(exc):
+    def _open(*args, **kwargs):
+        raise exc
+    return _open
+
+
+if mode == "permission":
+    builtins.open = _raise(PermissionError(13, "Permission denied"))
+elif mode == "enospc":
+    builtins.open = _raise(OSError(28, "No space left on device"))
+elif mode == "malformed":
+    # Read succeeds; json.load fails. We don't need to
+    # mock anything for this case -- just point the
+    # helper at a syntactically broken file.
+    builtins.open = real_open
+    sys.argv = ["inspect_rom_metadata.py", sys.argv[3]]
+    runpy.run_path(helper_path, run_name="__main__")
+    sys.exit(0)
+else:  # missing
+    builtins.open = real_open
+    sys.argv = ["inspect_rom_metadata.py", "/nonexistent/__missing__.json"]
+    runpy.run_path(helper_path, run_name="__main__")
+    sys.exit(0)
+
+sys.argv = ["inspect_rom_metadata.py", "/__mocked__/rom_metadata.json"]
+try:
+    runpy.run_path(helper_path, run_name="__main__")
+except SystemExit as exc:
+    sys.exit(exc.code or 0)
+PY
+
+    local probe
+    local out status
+    probe="$(mktemp)"
+
+    # PermissionError
+    out="$(python3 "$probe_script" "$helper_path" permission 2>&1)"
+    status=$?
+    if (( status != 0 )); then
+        fail "metadata-io-vs-json: helper exits 0 on PermissionError" "exited ${status}; output: ${out}"
+    else
+        pass "metadata-io-vs-json: helper exits 0 on PermissionError"
+    fi
+    if [[ "$out" == *"fix bin/metadata/detect_props.sh"* ]]; then
+        fail "metadata-io-vs-json: helper does NOT blame detect_props.sh on PermissionError" \
+            "the helper emitted the JSON-validity advice for an IO error: ${out}"
+    else
+        pass "metadata-io-vs-json: helper does NOT blame detect_props.sh on PermissionError"
+    fi
+    if [[ "$out" != *"operating-system-level failure"* ]]; then
+        fail "metadata-io-vs-json: helper explicitly tags PermissionError as OS-level" "output: ${out}"
+    else
+        pass "metadata-io-vs-json: helper explicitly tags PermissionError as OS-level"
+    fi
+
+    # ENOSPC
+    out="$(python3 "$probe_script" "$helper_path" enospc 2>&1)"
+    status=$?
+    if (( status != 0 )); then
+        fail "metadata-io-vs-json: helper exits 0 on ENOSPC" "exited ${status}; output: ${out}"
+    else
+        pass "metadata-io-vs-json: helper exits 0 on ENOSPC"
+    fi
+    if [[ "$out" == *"fix bin/metadata/detect_props.sh"* ]]; then
+        fail "metadata-io-vs-json: helper does NOT blame detect_props.sh on ENOSPC" \
+            "the helper emitted the JSON-validity advice for an IO error: ${out}"
+    else
+        pass "metadata-io-vs-json: helper does NOT blame detect_props.sh on ENOSPC"
+    fi
+    if [[ "$out" != *"errno 28"* && "$out" != *"ENOSPC"* ]]; then
+        fail "metadata-io-vs-json: helper surfaces the ENOSPC errno on disk-full" "output: ${out}"
+    else
+        pass "metadata-io-vs-json: helper surfaces the ENOSPC errno on disk-full"
+    fi
+
+    # Genuine malformed JSON: helper SHOULD still point at
+    # detect_props.sh -- the JSON-validity advice is
+    # correct in this branch and we must not regress it.
+    local bad_json
+    bad_json="$(mktemp)"
+    printf '{ not valid json' > "$bad_json"
+    out="$(python3 "$probe_script" "$helper_path" malformed "$bad_json" 2>&1)"
+    status=$?
+    if (( status != 0 )); then
+        fail "metadata-io-vs-json: helper exits 0 on malformed JSON" "exited ${status}; output: ${out}"
+    else
+        pass "metadata-io-vs-json: helper exits 0 on malformed JSON"
+    fi
+    if [[ "$out" != *"fix bin/metadata/detect_props.sh"* ]]; then
+        fail "metadata-io-vs-json: helper still points at detect_props.sh for genuine malformed JSON" "output: ${out}"
+    else
+        pass "metadata-io-vs-json: helper still points at detect_props.sh for genuine malformed JSON"
+    fi
+    rm -f "$bad_json"
+
+    # Missing file: helper SHOULD still mention
+    # detect_props.sh as one of the upstream files to
+    # check, because the missing-JSON case is sometimes
+    # caused by the engine bailing out earlier in
+    # detect_props.sh.
+    out="$(python3 "$probe_script" "$helper_path" missing 2>&1)"
+    status=$?
+    if (( status != 0 )); then
+        fail "metadata-io-vs-json: helper exits 0 on missing JSON" "exited ${status}; output: ${out}"
+    else
+        pass "metadata-io-vs-json: helper exits 0 on missing JSON"
+    fi
+    if [[ "$out" != *"detect_props.sh"* ]]; then
+        fail "metadata-io-vs-json: helper still mentions detect_props.sh for missing-JSON case" "output: ${out}"
+    else
+        pass "metadata-io-vs-json: helper still mentions detect_props.sh for missing-JSON case"
+    fi
+
+    rm -f "$probe_script" "$probe"
+}
+
 echo "1..12"
 test_publish_profile_input_is_removed
 test_collect_metadata_is_hard_gate
@@ -590,6 +791,7 @@ test_lite_parity_preparation_steps
 test_metadata_persistence_diagnostic
 test_metadata_failure_message_is_engine_internal
 test_build_log_capture_is_pipe_safe
+test_metadata_io_errors_not_blamed_on_detect_props
 
 echo
 if (( failures == 0 )); then

@@ -77,7 +77,17 @@ def main(argv: list[str]) -> int:
             "earlier check failed before the JSON was written."
         )
         return 0
-    except (OSError, json.JSONDecodeError) as exc:
+    except json.JSONDecodeError as exc:
+        # Genuine malformed-JSON case: the file exists and is
+        # readable, but its content does not parse. Only in this
+        # case is bin/metadata/detect_props.sh a likely culprit
+        # -- the engine wrote a syntactically broken file. A
+        # separate permission/disk-space failure below (e.g. on
+        # run 38115295186, where the runner ran out of disk
+        # while writing the compressed super.img.zst and the
+        # subsequent engine cleanup could not flush the
+        # metadata file either) surfaces as an OSError, NOT
+        # this branch.
         print(
             "::error::Stable engine persisted a malformed "
             f"build/.deadzone/rom_metadata.json: "
@@ -85,6 +95,100 @@ def main(argv: list[str]) -> int:
             "will reject any JSON that does not parse; fix "
             "bin/metadata/detect_props.sh so it writes valid JSON."
         )
+        return 0
+    except OSError as exc:
+        # The file (or its parent directory) could not be
+        # opened, read, or written. This is NOT a JSON
+        # parse failure and is almost never caused by
+        # bin/metadata/detect_props.sh. The two failure
+        # modes we have actually observed are
+        # PermissionError (errno 13, e.g. a parent directory
+        # with read-only permissions) and OSError errno 28
+        # ("No space left on device", e.g. when the runner
+        # disk filled up during the zstd round-trip
+        # verification of a multi-GB super.img.zst). Naming
+        # detect_props.sh in either case is misleading and
+        # would send the operator chasing a JSON-validity
+        # fix for what is actually a runner / storage
+        # problem; we therefore surface the OSError as its
+        # own diagnostic and explicitly steer the operator
+        # away from the wrong file.
+        errno_attr = getattr(exc, "errno", None)
+        if errno_attr == 28:
+            # errno 28 -> ENOSPC. The most common cause on
+            # the Stable builder is the post-upload
+            # verify_zst_roundtrip step, which decompresses
+            # super.img.zst (multi-GB) into the runner's
+            # tmpfs after the 7 GB upload has already
+            # consumed most of the available space.
+            print(
+                "::error::Stable engine could not persist "
+                                f"build/.deadzone/rom_metadata.json: "
+                                f"{type(exc).__name__}: {exc} "
+                                "(errno 28, ENOSPC). The runner "
+                                "ran out of disk space while the "
+                                "engine was writing its metadata; "
+                                "this is almost always a symptom "
+                                "of an earlier stage (typically "
+                                "the post-upload "
+                                "verify_zst_roundtrip on a "
+                                "multi-GB super.img.zst) "
+                                "filling the runner's tmpfs. The "
+                                "fix belongs in the Stable "
+                                "engine (DeadZone-Xiaomi-Stable), "
+                                "NOT in bin/metadata/detect_props.sh: "
+                                "detect_props.sh is not running on "
+                                "an empty disk and the JSON it would "
+                                "have written is irrelevant until "
+                                "the round-trip / disk issue is "
+                                "resolved. Inspect build_action.log "
+                                "for the first ENOSPC line and "
+                                "shorten or skip the round-trip "
+                                "verification (or stream the "
+                                "decompression to a path that does "
+                                "not share the runner's tmpfs)."
+            )
+        else:
+            # Generic read/write failure: surface the errno
+            # and a precise pointer to the *most likely*
+            # upstream cause so the operator does not waste
+            # time grepping detect_props.sh. We deliberately
+            # do NOT recommend the JSON-validity fix here;
+            # a PermissionError is not a JSON-validity
+            # problem and the engine-internal
+            # detect_props.sh review has to happen against
+            # the right file.
+            errno_label = (
+                f"errno {errno_attr}" if errno_attr is not None
+                else "no errno"
+            )
+            print(
+                "::error::Stable engine could not open "
+                                f"build/.deadzone/rom_metadata.json for "
+                                "inspection: "
+                                f"{type(exc).__name__}: {exc} "
+                                f"({errno_label}). This is an "
+                                "operating-system-level failure "
+                                "(read, write, or permission "
+                                "denied), NOT a JSON parse "
+                                "failure -- bin/metadata/detect_props.sh "
+                                "is almost certainly not the "
+                                "cause. Inspect build_action.log "
+                                "for the corresponding "
+                                "PermissionError / OSError line "
+                                "to identify the upstream engine "
+                                "step that ran out of disk, lost "
+                                "a file handle, or hit a "
+                                "permissions boundary, and fix "
+                                "that step in the Stable engine. "
+                                "If the file is missing entirely, "
+                                "the metadata persistence step "
+                                "never reached write -- look at "
+                                "the most recent [ERROR] / "
+                                "Failed line in build_action.log "
+                                "to see which earlier stage "
+                                "actually failed."
+            )
         return 0
 
     device_block = document.get("device") or {}
