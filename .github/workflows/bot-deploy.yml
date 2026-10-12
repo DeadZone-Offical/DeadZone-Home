@@ -641,6 +641,68 @@ jobs:
           fi
           rm -f "${response_body}"
 
+      - name: 🔬 Inspect Worker bindings via /admin/env-check
+        if: steps.deploy.outcome == 'success' && env.DEPLOY_MODE == 'deploy'
+        id: env-check
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          RESOLVED_WORKER_URL: ${{ steps.resolve.outputs.worker_url }}
+          WORKER_NAME: ${{ env.WORKER_NAME }}
+        run: |
+          set -Eeuo pipefail
+          # Prefer the resolved Worker URL from the Cloudflare API
+          # step, but fall back to the canonical
+          # `<worker>.<subdomain>.workers.dev` form so the
+          # diagnostic still runs when the resolve step failed
+          # (e.g. the Cloudflare API token used by the deploy
+          # workflow no longer has Account Settings:Read scope).
+          worker_host="${RESOLVED_WORKER_URL}"
+          if [[ -z "${worker_host:-}" ]]; then
+            echo "Resolve step did not publish worker_url; falling back to canonical <worker>.mezom8446.workers.dev for /admin/env-check." >&2
+            worker_host="https://${WORKER_NAME}.mezom8446.workers.dev"
+          fi
+          echo "Probing ${worker_host%/}/admin/env-check …"
+          response_body="${RUNNER_TEMP}/env-check.json"
+          http_code="$(
+            curl --silent --show-error --output "${response_body}" \
+              --write-out '%{http_code}' \
+              --max-time 30 \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              "${worker_host%/}/admin/env-check"
+          )"
+          echo "  worker responded HTTP ${http_code}"
+          if [[ "${http_code}" != "200" ]]; then
+            echo "::warning::Worker /admin/env-check returned HTTP ${http_code}; cannot surface Worker bindings." >&2
+            sed -E 's/^/  | /' "${response_body}" >&2 || true
+            exit 0
+          fi
+          if ! jq -e '.ok == true' "${response_body}" >/dev/null; then
+            echo "::warning::Worker /admin/env-check did not return ok=true." >&2
+            sed -E 's/^/  | /' "${response_body}" >&2 || true
+            exit 0
+          fi
+          # Surface only the per-binding length (the route never
+          # echoes the value itself, by construction). A length
+          # of 0 means the binding is unset; > 0 means it is
+          # configured but does not leak the value.
+          echo "Worker bindings (length only):"
+          jq -r '.bindings | to_entries[] | "  \(.key): \(.value)"' "${response_body}"
+          # Surface a dedicated warning for the three bindings
+          # that, when unset, would change user-visible behavior
+          # (specifically: 'Something went wrong' for the
+          # membership-gate default branch in user-flow.ts).
+          discussion_len="$(jq -r '.bindings.DEADZONE_DISCUSSION_ID // 0' "${response_body}")"
+          channel_len="$(jq -r '.bindings.DEADZONE_CHANNEL_ID // 0' "${response_body}")"
+          owner_len="$(jq -r '.bindings.OWNER_TELEGRAM_IDS // 0' "${response_body}")"
+          if [[ "${discussion_len}" == "0" || "${channel_len}" == "0" ]]; then
+            echo "::warning::DEADZONE_DISCUSSION_ID (length=${discussion_len}) or DEADZONE_CHANNEL_ID (length=${channel_len}) is unset. The access control gate falls through to errors.generic for non-owners in that state." >&2
+          fi
+          if [[ "${owner_len}" == "0" ]]; then
+            echo "::warning::OWNER_TELEGRAM_IDS is unset. The owner bypass in dispatchImmediately is disabled, so the access control gate runs for every user." >&2
+          fi
+          rm -f "${response_body}"
+
       - name: 📣 Deployment summary
         if: always()
         shell: bash
