@@ -6,6 +6,30 @@
 # creates its own GitHub Actions run; Stable is NOT routed through any
 # generic dispatcher.
 #
+# Engine it drives
+# ----------------
+# This launcher drives the engine in
+# `DeadZone-Offical/DeadZone-Xiaomi-Stable@main`. As of the bootstrap
+# commit, that engine ships in the pre-refactor Lite-style layout:
+#   * `build.sh`, `packROM.sh`, `uploadROM.sh` at the repo root
+#   * the vendor toolchain at `bin/Linux/x86_64/`
+#   * `bin/fix_selinux.py` and `bin/getSuperSize.sh` (no Lite
+#     sparse-checkout needed — the engine already vendors them)
+#   * `bin/ddevice/*.txt` as the per-build state directory; the
+#     final ZIP name is recorded in `bin/ddevice/output_zip.txt`
+#     before uploadROM.sh cleans `out/` and `build/`
+#   * `notify.py` for the full Telegram lifecycle (start, download,
+#     unpack, build, pack, upload, success, fail)
+# The pipeline is the Lite sequence: `build.sh` -> `packROM.sh` ->
+# `uploadROM.sh`. There is no `--with-upload` flag on the Stable
+# engine, and the refactored engine layout (a single `build.sh`
+# with internal Stage 1..Stage 11, `bin/upload/run_upload.sh`,
+# `bin/tools/linux_x86_64/`, `bin/DeviceConfig/`) is not yet
+# present in `DeadZone-Xiaomi-Stable`. When that refactor lands,
+# this workflow will need to be re-adapted to the new engine
+# contract; the Lite-style flow here is the only one that runs
+# against the engine as it actually exists today.
+#
 # Architecture / ownership boundary
 # ---------------------------------
 # Device configuration is owned by DeadZone-SuperInspector, NOT by
@@ -17,6 +41,10 @@
 # DeviceConfig is the operator's signal to run SuperInspector first —
 # the workflow fails fast with a clear, actionable error rather than
 # inventing flash destinations or duplicating SuperInspector's work.
+# The current pre-refactor engine does NOT yet consume
+# `bin/DeviceConfig/`, so the verifier tolerates a missing
+# `bin/DeviceConfig/` directory (logs a warning) and only fails
+# the build when the directory exists but is empty.
 #
 # Post-prompt-removal contract
 # ---------------------------
@@ -28,7 +56,7 @@
 # SuperInspector, not by the launcher or the bot.
 #
 # Concurrency model
-# ----------------
+# -----------------
 # Each `workflow_dispatch` invocation creates a fresh GitHub Actions
 # run with its own runner, its own workspace, its own `toolbuild/`
 # checkout, and its own log/artifact uploads. GitHub Actions is
@@ -40,24 +68,44 @@
 #
 # Why a separate workflow (not a shared dispatcher)?
 # --------------------------------------------------
-# Stable's engine is a thin shell-script pipeline under `bin/`, not the
-# monolithic `uploadROM.sh`/`packROM.sh` pair that Lite uses. The
-# pipeline is invoked as `bash build.sh ... --with-upload`; upload is
-# Stage 11/11 inside that same script. Lite, by contrast, splits the
-# pipeline across two scripts. Wiring a shared dispatcher would force
-# both projects into a single rigid shape and break Stable's
-# recoverable Stage-1..Stage-11 layout.
+# The Stable engine's pipeline is split across three top-level
+# scripts (`build.sh`, `packROM.sh`, `uploadROM.sh`), the same
+# way the Lite engine is. Unlike Lite, the Stable engine's
+# `uploadROM.sh` cleans `out/` and `build/` after a successful
+# upload, so the launcher has to copy the final ZIP out of the
+# engine's working directory into a stable artifact location
+# BEFORE invoking `uploadROM.sh`. The Lite-style split is
+# preserved here rather than collapsing the three scripts into
+# one wrapper, because the engine is the source of truth for
+# the pipeline contract and changing the launcher to invoke a
+# different script would diverge from what the engine ships.
 #
 # Stage integration
 # ----------------
-# The Stable engine's `bin/upload/run_upload.sh` is invoked by
-# build.sh when --with-upload is set. The upload stage uses the same
-# rclone semantics as DeadZone-xiaomi_Lite's uploadROM.sh:
-#   * rclone copyto with --checksum
-#   * `lsjson` probe to skip identical existing files
-#   * lock-dir to refuse concurrent uploads of the same artifact
-#   * retries via --retries / --low-level-retries
-# The Drive path is `${RCLONE_UPLOAD_DIR%/}/Stable/${CODENAME}/${OS_FOLDER}/<zip>`.
+# The Stable engine's `uploadROM.sh` uses the same rclone
+# semantics as DeadZone-xiaomi_Lite's uploadROM.sh, with a
+# hard-coded OneDrive remote `starxONEDRIVE:NTBuild/<os>/<poly>/<device>/`:
+#   * rclone copy (one-shot, no checksum)
+#   * hard-coded remote / path layout
+#   * cleans `out/` and `build/` on success
+# The Drive path is `starxONEDRIVE:NTBuild/${OS}/${polyxver}/${device_code}/<zip>`.
+# The launcher also seeds the engine with a centralized
+# `rclone.conf` from `DeadZone-File` so the engine's rclone call
+# has a valid OAuth token; the seed is installed BEFORE
+# `uploadROM.sh setup` would run so the actual `uploadROM.sh`
+# upload uses the same token.
+#
+# Why we copy the final ZIP to a stable artifact location
+# -------------------------------------------------------
+# `uploadROM.sh` deletes `$work_dir/out` after a successful
+# upload (so the engine's repo stays small between dispatches).
+# That means by the time the workflow's "collect artifact
+# metadata" step runs, the ZIP is gone from `out/`. We
+# therefore copy `out/<final>.zip` to `$GITHUB_WORKSPACE/out/`
+# immediately after `packROM.sh` and before `uploadROM.sh`. The
+# launcher's actions/upload-artifact step can then upload from
+# the stable path regardless of whether the upload step
+# succeeded, failed, or skipped cleanup.
 
 name: Deadzone-Stable
 
@@ -270,7 +318,42 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: "📦 Checkout Lite engine (fix_selinux.py source)"
+      - name: "🧭 Detect Stable engine layout"
+        working-directory: toolbuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Decide which engine layout the launcher should drive.
+          # The Stable engine ships in one of two layouts:
+          #   * refactored: thin shell pipeline under `bin/`
+          #     with `bin/upload/run_upload.sh`,
+          #     `bin/release/run_release.sh`, `bin/flash/`,
+          #     `bin/DeviceConfig/`, `bin/tools/linux_x86_64/`,
+          #     and `bin/release/naming.py`. The launcher
+          #     invokes `build.sh --with-upload` and the engine
+          #     handles pack/release/upload internally.
+          #   * pre-refactor: Lite-style split where the pipeline
+          #     is three top-level scripts (`build.sh`,
+          #     `packROM.sh`, `uploadROM.sh`), the toolchain is
+          #     at `bin/Linux/x86_64/`, and the launcher runs
+          #     the three scripts as separate steps.
+          # This detection has to run BEFORE the Lite
+          # sparse-checkout and the toolchain chmod so the
+          # downstream steps can branch on the layout.
+          if [[ -f bin/upload/run_upload.sh && -f bin/release/run_release.sh && -f bin/flash/run_flash.sh && -f bin/release/naming.py ]]; then
+            layout="refactored"
+          elif [[ -f build.sh && -f packROM.sh && -f uploadROM.sh && -f notify.py ]]; then
+            layout="pre_refactor"
+          else
+            echo "::error::Could not determine the Stable engine layout. Neither the refactored files (bin/upload/run_upload.sh, bin/release/run_release.sh, bin/flash/run_flash.sh, bin/release/naming.py) nor the pre-refactor files (build.sh, packROM.sh, uploadROM.sh, notify.py) are all present." >&2
+            echo "::error::Inspect the DeadZone-Xiaomi-Stable checkout and either complete one of the two layouts or update this launcher to match." >&2
+            exit 1
+          fi
+          echo "Stable engine layout: ${layout}"
+          printf 'DEADZONE_ENGINE_LAYOUT=%s\n' "$layout" >> "$GITHUB_ENV"
+
+      - name: "📦 Checkout Lite engine (fix_selinux.py source, refactored only)"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'refactored'
         uses: actions/checkout@v5
         with:
           repository: DeadZone-Offical/DeadZone-xiaomi_Lite
@@ -283,22 +366,46 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: "🛡️ Verify Lite fix_selinux.py is present"
+      - name: "🛡️ Verify Lite fix_selinux.py is present (refactored only)"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'refactored'
         working-directory: toolbuild
         shell: bash
         run: |
           set -euo pipefail
-          # The Stable engine's bin/repack/selinux.sh resolves
-          # fix_selinux.py from $LITE_ENGINE_ROOT/bin/imaging/.
+          # The refactored Stable engine's bin/repack/selinux.sh
+          # resolves fix_selinux.py from $LITE_ENGINE_ROOT/bin/imaging/.
           # We fail fast here (BEFORE the build starts) so a
           # missing Lite script is reported as a launch-time
           # diagnostic, not as a confusing repack-stage
           # "fix_selinux.py not found" error 30 minutes later.
           if [[ ! -s "$GITHUB_WORKSPACE/liteengine/bin/imaging/fix_selinux.py" ]]; then
             echo "::error::Lite engine checkout is missing bin/imaging/fix_selinux.py."
-            echo "::error::The Stable engine's repack stage consumes the canonical Lite fix_selinux.py verbatim. The LITE_ENGINE_ROOT variable points at $GITHUB_WORKSPACE/liteengine; verify the Lite checkout above." >&2
+            echo "::error::The refactored Stable engine's repack stage consumes the canonical Lite fix_selinux.py verbatim. The LITE_ENGINE_ROOT variable points at $GITHUB_WORKSPACE/liteengine; verify the Lite checkout above." >&2
             exit 1
           fi
+
+      - name: "🛡️ Verify pre-refactor engine fix_selinux.py is present (pre-refactor only)"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor'
+        working-directory: toolbuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The pre-refactor engine's `packROM.sh` calls
+          # `python3 $work_dir/bin/fix_selinux.py` directly. The
+          # bootstrap commit already vendors that file in the
+          # engine's `bin/` directory, so we just need to assert
+          # it is present and py_compile-clean. If it ever goes
+          # missing (a future refactor that moves the script to
+          # `bin/imaging/`), this step fails fast with a
+          # launch-time diagnostic instead of letting packROM.sh
+          # blow up with a confusing `No such file or directory`
+          # 30 minutes into the build.
+          if [[ ! -s bin/fix_selinux.py ]]; then
+            echo "::error::Pre-refactor Stable engine is missing bin/fix_selinux.py." >&2
+            echo "::error::packROM.sh invokes 'python3 \$work_dir/bin/fix_selinux.py' to apply selinux labels during partition repack. Re-push the engine with the script restored under bin/fix_selinux.py, or update the engine to source it from a different location." >&2
+            exit 1
+          fi
+          python3 -m py_compile bin/fix_selinux.py
 
       - name: "🛡️ Verify private Stable engine checkout"
         if: always() && failure()
@@ -360,28 +467,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Stable's vendor toolchain under bin/tools/linux_x86_64/
-          # is committed to the Stable engine as plain blobs (git
-          # index mode 100644) because git LFS does not preserve
-          # the executable bit. On a fresh `actions/checkout@v5`
-          # the runner materialises those files with mode 0644,
-          # so the very first EROFS partition the extract stage
-          # tries to unpack dies with
-          #   "bin/tools/linux_x86_64/extract.erofs: Permission denied"
+          # The Stable engine vendors its ELF helpers under one of
+          # two possible toolchain directories, depending on the
+          # engine's layout:
+          #   * pre-refactor engine (the engine as it ships in
+          #     the bootstrap commit): `bin/Linux/x86_64/`
+          #   * refactored engine: `bin/tools/linux_x86_64/`
+          # We accept either path and require at least one to be
+          # present, so the launcher works against both layouts.
+          # `actions/checkout@v5` materialises these blobs with
+          # mode 0644 because git LFS does not preserve the
+          # executable bit, so the very first EROFS partition the
+          # extract stage tries to unpack would die with
+          #   `<toolchain>/extract.erofs: Permission denied`
           # (the exact symptom of run 38060885738). `chmod -R u+rwX`
           # in the next step only adds +x to directories and to
           # files that ALREADY have it for some user, so it cannot
           # repair 0644 toolchain blobs on its own. We therefore
-          # force +x on the canonical toolchain directory here,
+          # force +x on the detected toolchain directory here,
           # BEFORE the engine layout validator runs, and assert
           # the canonical EROFS binary is now executable so a
           # missing or renamed toolchain surfaces immediately
           # instead of as a confusing mid-extract EROFS failure
           # ten minutes into the build.
-          toolchain_dir="bin/tools/linux_x86_64"
-          if [[ ! -d "$toolchain_dir" ]]; then
-            echo "::error::Stable engine toolchain directory is missing: ${toolchain_dir}"
-            echo "::error::The DeadZone-Xiaomi-Stable engine is expected to vendor its ELF helpers (extract.erofs, lpunpack, lpmake, mkfs.erofs, ...) under ${toolchain_dir}. Re-push the engine with the bundled toolchain or update the engine source." >&2
+          toolchain_dir=""
+          if [[ -d bin/tools/linux_x86_64 ]]; then
+            toolchain_dir="bin/tools/linux_x86_64"
+          elif [[ -d bin/Linux/x86_64 ]]; then
+            toolchain_dir="bin/Linux/x86_64"
+          fi
+          if [[ -z "$toolchain_dir" ]]; then
+            echo "::error::Stable engine toolchain directory is missing: tried bin/tools/linux_x86_64/ and bin/Linux/x86_64/" >&2
+            echo "::error::The DeadZone-Xiaomi-Stable engine is expected to vendor its ELF helpers (extract.erofs, lpunpack, lpmake, mkfs.erofs, ...) under one of these toolchain directories. Re-push the engine with the bundled toolchain or update the engine source." >&2
             exit 1
           fi
           # Mark every file in the toolchain executable. The vendor
@@ -414,7 +531,7 @@ jobs:
             exit 1
           fi
           printf '::group::Stable toolchain permissions\n'
-          ls -l "$canonical_bin" "$toolchain_dir/lpunpack" "bin/upload/run_upload.sh" 2>/dev/null || true
+          ls -l "$canonical_bin" "$toolchain_dir/lpunpack" 2>/dev/null || true
           printf '::endgroup::\n'
 
       - name: "🧭 Validate Stable engine layout"
@@ -422,30 +539,62 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Stable's canonical layout is a thin shell pipeline under
-          # bin/, not Lite's flat root. The required files pin the
-          # build entrypoint, the release + upload stages, and the
-          # Lite-compatibility notify.py shim the launcher uses for
-          # start/pack/upload callbacks. Each missing file is a clear
-          # diagnostic with a path the operator can act on.
-          required_engine_files=(
-            build.sh
-            Version
-            bin/upload/run_upload.sh
-            bin/release/run_release.sh
-            bin/flash/run_flash.sh
-            bin/release/naming.py
-          )
-          for engine_file in "${required_engine_files[@]}"; do
-            if [[ ! -s "$engine_file" ]]; then
-              echo "::error::Stable engine file is missing or empty: ${engine_file}"
-              exit 1
-            fi
-          done
-          bash -n build.sh
-          bash -n bin/upload/run_upload.sh
-          bash -n bin/release/run_release.sh
-          python3 -m py_compile bin/release/naming.py
+          # The engine layout was detected in the earlier
+          # "🧭 Detect Stable engine layout" step. Here we
+          # verify that the detected layout's required files
+          # are actually present, executable, and shell-valid.
+          # Each missing file is a clear diagnostic with a
+          # path the operator can act on.
+          layout="${DEADZONE_ENGINE_LAYOUT:-}"
+          if [[ -z "$layout" ]]; then
+            echo "::error::DEADZONE_ENGINE_LAYOUT is not set; the engine layout detection step did not run or failed silently." >&2
+            exit 1
+          fi
+          if [[ "$layout" == "refactored" ]]; then
+            required_engine_files=(
+              build.sh
+              Version
+              bin/upload/run_upload.sh
+              bin/release/run_release.sh
+              bin/flash/run_flash.sh
+              bin/release/naming.py
+            )
+            for engine_file in "${required_engine_files[@]}"; do
+              if [[ ! -s "$engine_file" ]]; then
+                echo "::error::Stable engine file is missing or empty: ${engine_file}"
+                exit 1
+              fi
+            done
+            bash -n build.sh
+            bash -n bin/upload/run_upload.sh
+            bash -n bin/release/run_release.sh
+            python3 -m py_compile bin/release/naming.py
+          else
+            # pre_refactor — the Lite-style split. The launcher
+            # runs `build.sh`, then `packROM.sh`, then
+            # `uploadROM.sh` as three separate steps, so each
+            # of those scripts must be present, executable, and
+            # shell-valid. `notify.py` is invoked by the engine
+            # itself (inside `build.sh`) so it must also be
+            # present and py_compile-clean.
+            required_engine_files=(
+              build.sh
+              Version
+              packROM.sh
+              uploadROM.sh
+              notify.py
+            )
+            for engine_file in "${required_engine_files[@]}"; do
+              if [[ ! -s "$engine_file" ]]; then
+                echo "::error::Stable engine file is missing or empty: ${engine_file}"
+                exit 1
+              fi
+            done
+            bash -n build.sh
+            bash -n packROM.sh
+            bash -n uploadROM.sh
+            python3 -m py_compile notify.py
+          fi
 
       - name: "🛡️ Verify SuperInspector device config presence"
         working-directory: toolbuild
@@ -453,11 +602,13 @@ jobs:
         run: |
           set -euo pipefail
           # Device configuration is owned by DeadZone-SuperInspector.
-          # The Stable build engine reads per-codename profiles from
-          # ``bin/DeviceConfig/<codename>/<codename>.json`` at Stage 9
-          # (flash) and Stage 10 (release). SuperInspector generates
-          # and publishes that file via its own writer. This workflow
-          # MUST NOT regenerate, backfill, or duplicate that work.
+          # The refactored Stable build engine reads per-codename
+          # profiles from
+          # ``bin/DeviceConfig/<codename>/<codename>.json`` at
+          # Stage 9 (flash) and Stage 10 (release). SuperInspector
+          # generates and publishes that file via its own writer.
+          # This workflow MUST NOT regenerate, backfill, or
+          # duplicate that work.
           #
           # The codename is unknown until Stage 4 (metadata) of
           # build.sh runs, so we cannot pre-validate a specific
@@ -468,13 +619,24 @@ jobs:
           # inside Stage 9 with the engine's own
           # ``dz_flash_load_config`` error.
           #
-          # We fail fast with a clear, actionable error pointing the
-          # operator at SuperInspector instead of letting the build
-          # progress 11 stages only to die in Stage 9.
+          # The pre-refactor engine (the layout the engine ships
+          # in at the bootstrap commit) does NOT yet consume
+          # ``bin/DeviceConfig/``; it derives its per-build
+          # configuration from `bin/ddevice/*.txt` written by
+          # `build.sh` itself. We therefore tolerate a missing
+          # ``bin/DeviceConfig/`` directory under the pre-refactor
+          # layout (a soft warning) and only fail the build when
+          # the directory exists but is empty (a true
+          # configuration regression that would break Stage 9
+          # under the refactored engine).
           if [[ ! -d bin/DeviceConfig ]]; then
-            echo "::error::bin/DeviceConfig/ is missing from the Stable engine checkout." >&2
-            echo "::error::DeadZone-SuperInspector is the owner of bin/DeviceConfig/<codename>/<codename>.json. Run SuperInspector against the device's stock ROM first so it can publish the per-codename device configuration into DeadZone-Offical/DeadZone-Xiaomi-Stable, then re-dispatch this Stable build." >&2
-            exit 1
+            if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" ]]; then
+              echo "::error::bin/DeviceConfig/ is missing from the Stable engine checkout." >&2
+              echo "::error::DeadZone-SuperInspector is the owner of bin/DeviceConfig/<codename>/<codename>.json. Run SuperInspector against the device's stock ROM first so it can publish the per-codename device configuration into DeadZone-Offical/DeadZone-Xiaomi-Stable, then re-dispatch this Stable build." >&2
+              exit 1
+            fi
+            echo "::notice::bin/DeviceConfig/ is not present in the pre-refactor engine checkout; the pre-refactor engine derives its configuration from bin/ddevice/*.txt and does not consume SuperInspector's per-codename profiles. This step is informational and will start failing once the engine lands its refactored layout."
+            exit 0
           fi
           shopt -s nullglob
           device_config_files=(bin/DeviceConfig/*/*.json)
@@ -618,7 +780,8 @@ jobs:
           fi
           rclone version
 
-      - name: "🚀 Build, release, and upload Stable ROM"
+      - name: "🚀 Build, release, and upload Stable ROM (refactored layout)"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'refactored'
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -628,7 +791,7 @@ jobs:
           DEADZONE_GITHUB_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           DEADZONE_RCLONE_CONFIG_REPO: DeadZone-Offical/DeadZone-File
           DEADZONE_RCLONE_CONFIG_PATH: rclone.conf
-          # The Stable engine consumes the canonical Lite
+          # The refactored Stable engine consumes the canonical Lite
           # bin/imaging/fix_selinux.py at repack time. The launcher
           # checked out the Lite engine sparsely to $GITHUB_WORKSPACE/liteengine
           # above; expose its path so the engine's selinux.sh can
@@ -650,16 +813,18 @@ jobs:
           DZ_HEARTBEAT_INTERVAL: "30"
         run: |
           set -Eeuo pipefail
-          # Stable's pipeline is one script (build.sh) with 11 stages.
-          # `--with-upload` enables Stage 11 (Google Drive upload) so
-          # build.sh invokes bin/upload/run_upload.sh after the release
-          # stage has produced the final ZIP. We do NOT split the
-          # pipeline into separate pack / upload scripts the way Lite
-          # does — Stable's bin/ layout is canonical and replacing it
-          # with Lite's packROM.sh / uploadROM.sh would change build
-          # behavior. The upload stage uses the pre-seeded
-          # $WORK_DIR/rclone.conf (mode 600) and reuses the same
-          # RCLONE_REMOTE_NAME / RCLONE_UPLOAD_DIR runtime values.
+          # The refactored Stable engine's pipeline is one script
+          # (build.sh) with 11 stages. `--with-upload` enables
+          # Stage 11 (Google Drive upload) so build.sh invokes
+          # bin/upload/run_upload.sh after the release stage has
+          # produced the final ZIP. We do NOT split the pipeline
+          # into separate pack / upload scripts the way Lite does
+          # — the refactored Stable engine's bin/ layout is
+          # canonical and replacing it with Lite's packROM.sh /
+          # uploadROM.sh would change build behavior. The upload
+          # stage uses the pre-seeded $WORK_DIR/rclone.conf
+          # (mode 600) and reuses the same RCLONE_REMOTE_NAME /
+          # RCLONE_UPLOAD_DIR runtime values.
           #
           # `stdbuf -oL -eL` forces line-buffered stdout + stderr
           # for build.sh, bin/*, and the brand `dz_stage_*` heartbeat
@@ -674,27 +839,14 @@ jobs:
           # not in the apt cache; `stdbuf` ships with coreutils
           # which is already on the runner image.
           #
-          # The previous pipeline used `… 2>&1 | tee build_action.log`
-          # to mirror stdout to both the Actions log AND an on-disk
-          # log file. That had a subtle bug: when `bash build.sh`
-          # exited 1, the wrapper's `set -Eeuo pipefail` propagated
-          # the failure and `tee` was killed by SIGPIPE before it
-          # could flush the in-memory buffer to disk. The on-disk
-          # file was therefore either missing or empty, and the
-          # `📋 Upload debug logs` step below reported
-          # "No files were found with the provided path:
-          # toolbuild/build_action.log" (the canonical symptom of
-          # run 38063165985, which exited at the engine's metadata
-          # stage with a "Persisted metadata failed reload
-          # validation — missing device.name" error that we never
-          # got to read). We now route the engine's full output to
-          # `build_action.log` first (so the file is durable and
-          # SIGPIPE-safe — a `>` redirect is owned by the shell and
-          # not killed when its parent exits), and then mirror that
-          # file to stdout so the Actions live log still streams
-          # line-by-line. The exit status of the engine is captured
-          # from the backgrounded subshell and re-raised so the step
-          # still fails the workflow when `build.sh` fails.
+          # We route the engine's full output to `build_action.log`
+          # first (so the file is durable and SIGPIPE-safe — a `>`
+          # redirect is owned by the shell and not killed when its
+          # parent exits), and then mirror that file to stdout so
+          # the Actions live log still streams line-by-line. The
+          # exit status of the engine is captured from the
+          # backgrounded subshell and re-raised so the step still
+          # fails the workflow when `build.sh` fails.
           log_path="$PWD/build_action.log"
           : > "$log_path"
           sudo -E stdbuf -oL -eL bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "stable" \
@@ -717,6 +869,166 @@ jobs:
           # 0 and the workflow would mark the step as success.
           exit "$google_status"
 
+      - name: "🚀 Build Stable ROM (pre-refactor layout)"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor'
+        working-directory: toolbuild
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_INPUT_URL: ${{ inputs.input_url }}
+          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+          DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+        run: |
+          set -Eeuo pipefail
+          # The pre-refactor Stable engine's pipeline is three
+          # top-level scripts (`build.sh`, `packROM.sh`,
+          # `uploadROM.sh`) — exactly the Lite split. The
+          # launcher invokes `build.sh` here as a single
+          # backgrounded shell with the engine's full output
+          # routed to `build_action.log` (a durable,
+          # SIGPIPE-safe `>` redirect that the shell owns, not
+          # a `tee` that dies on SIGPIPE when `build.sh`
+          # exits 1). `tail -F --pid=$build_pid` mirrors the
+          # log file to stdout so the Actions live log keeps
+          # streaming line-by-line. The exit code of `build.sh`
+          # is re-raised so a failure still propagates.
+          #
+          # `notify.py` is invoked by `build.sh` itself for the
+          # Telegram lifecycle (download, unpack, build), so we
+          # do NOT call notify.py here — the engine already
+          # does. `packROM.sh` and `uploadROM.sh` are run in
+          # separate steps below so the launcher can copy the
+          # final ZIP to a stable artifact location BEFORE
+          # `uploadROM.sh` cleans up the engine's working
+          # directory.
+          log_path="$PWD/build_action.log"
+          : > "$log_path"
+          sudo -E stdbuf -oL -eL bash build.sh \
+            "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "stable" \
+            "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" \
+            > "$log_path" 2>&1 &
+          build_pid=$!
+          tail -n +1 -F --pid="$build_pid" "$log_path" || true
+          wait "$build_pid"
+          build_status=$?
+          printf 'DEADZONE_BUILD_STATUS=%s\n' "$build_status" >> "$GITHUB_ENV"
+          exit "$build_status"
+
+      - name: "📦 Pack Stable ROM (pre-refactor layout)"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
+        working-directory: toolbuild
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_INPUT_URL: ${{ inputs.input_url }}
+          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+          DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+        run: |
+          set -Eeuo pipefail
+          # `packROM.sh` rebuilds the super.img from the
+          # unpacked partitions in `build/baserom/images/` and
+          # produces the final ZIP in `out/`. The pack notify
+          # call mirrors the verified Lite pack step and is
+          # best-effort: a Telegram failure must not fail a
+          # build that has already produced a usable artifact.
+          #
+          # The launcher captures the final ZIP by globbing
+          # `out/` IMMEDIATELY after `packROM.sh` completes,
+          # because the next step (`uploadROM.sh`) deletes
+          # both `out/` and `build/` on success. The captured
+          # ZIP is copied to a stable artifact location
+          # (`$GITHUB_WORKSPACE/out/`) so the workflow's
+          # downstream artifact-metadata and upload steps can
+          # find the file regardless of what `uploadROM.sh`
+          # does.
+          python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "stable" \
+            "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
+          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
+          if [[ ! -s bin/ddevice/output_zip.txt ]]; then
+            echo "::error::packROM.sh did not record the final ZIP path in bin/ddevice/output_zip.txt" >&2
+            exit 1
+          fi
+          final_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
+          final_zip="$PWD/out/${final_name}"
+          if [[ ! -f "$final_zip" ]]; then
+            echo "::error::packROM.sh recorded '$final_name' in output_zip.txt but the file does not exist at $final_zip" >&2
+            exit 1
+          fi
+          stable_out="$GITHUB_WORKSPACE/out"
+          mkdir -p "$stable_out"
+          cp -f "$final_zip" "$stable_out/${final_name}"
+          echo "Captured pre-upload Stable ZIP: ${final_name}"
+          printf 'DEADZONE_RESULT_NAME=%s\n' "$final_name" >> "$GITHUB_ENV"
+
+      - name: "☁️ Setup rclone for Stable upload (pre-refactor layout)"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
+        working-directory: toolbuild
+        run: |
+          set -euo pipefail
+          # The pre-refactor Stable engine's `uploadROM.sh setup`
+          # subcommand accepts 3 positional args: <token> <repo>
+          # <path>. It fetches the rclone.conf via the GitHub
+          # Contents API and writes it to $work_dir/rclone.conf.
+          # We pre-seed the same token + repo + path values from
+          # the central runtime's `upload.env` (the same values
+          # the central-runtime load-build.sh loads) so the
+          # engine's rclone call has a valid OAuth token even if
+          # the in-engine fetch fails.
+          if [[ -z "${RCLONE_REMOTE_NAME:-}" || -z "${RCLONE_UPLOAD_DIR:-}" ]]; then
+            echo "::error::RCLONE_REMOTE_NAME or RCLONE_UPLOAD_DIR is missing from the central runtime; cannot configure rclone for the Stable upload." >&2
+            exit 1
+          fi
+          : "${GH_TOKEN_FOR_RCLONE:=${DEADZONE_PRIVATE_READ_TOKEN:-}}"
+          : "${RCLONE_CONFIG_REPO_OWNER:=DeadZone-Offical}"
+          : "${RCLONE_CONFIG_REPO_NAME:=DeadZone-File}"
+          : "${RCLONE_CONFIG_PATH:=rclone.conf}"
+          if [[ -z "$GH_TOKEN_FOR_RCLONE" ]]; then
+            echo "::error::No GitHub token available for the rclone.conf fetch; the DEADZONE_PRIVATE_READ_TOKEN secret must be provisioned on DeadZone-Offical/DeadZone-Home." >&2
+            exit 1
+          fi
+          sudo -E bash uploadROM.sh setup \
+            "$GH_TOKEN_FOR_RCLONE" \
+            "${RCLONE_CONFIG_REPO_OWNER}/${RCLONE_CONFIG_REPO_NAME}" \
+            "$RCLONE_CONFIG_PATH"
+          if [[ ! -s rclone.conf ]]; then
+            echo "::error::uploadROM.sh setup did not write rclone.conf to $PWD/rclone.conf" >&2
+            exit 1
+          fi
+          chmod 600 rclone.conf
+
+      - name: "☁️ Upload Stable ROM (pre-refactor layout)"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
+        working-directory: toolbuild
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_INPUT_URL: ${{ inputs.input_url }}
+          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
+          DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+        run: |
+          set -Eeuo pipefail
+          # The pre-refactor Stable engine's `uploadROM.sh`
+          # uploads the final ZIP to the canonical Drive path
+          # `starxONEDRIVE:NTBuild/<os>/<poly>/<device>/<zip>`
+          # and then cleans `$work_dir/out` and `$work_dir/build`.
+          # We pre-copied the final ZIP to
+          # `$GITHUB_WORKSPACE/out/<name>` in the Pack step
+          # above so the artifact survives the cleanup and the
+          # downstream artifact-metadata step can still find it.
+          #
+          # We do NOT fail the workflow on a non-zero upload
+          # exit: a build that produced a usable artifact but
+          # failed to upload is a "build succeeded, upload
+          # failed" outcome, not a build failure. The
+          # "❌ Send failure notification" step is gated on
+          # `failure()` and would not fire for this case; the
+          # failure is surfaced via the build summary's
+          # DEADZONE_GOOGLE_UPLOAD_STATUS=0 vs !=0 rendering.
+          python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "stable" \
+            "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
+          set +e
+          sudo -E bash uploadROM.sh 2>&1 | tee -a build_action.log
+          google_status=${PIPESTATUS[0]}
+          set -e
+          printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
+
       - name: "📡 Report progress to bot (Lite parity)"
         if: success()
         working-directory: toolbuild
@@ -726,14 +1038,21 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
-          # Lite's launcher emits `downloading`, `reading_rom`,
-          # `building`, `packaging`, and `uploading` stage events
-          # so the live panel can show granular progress while
-          # `build.sh` runs the same Stable 11-stage pipeline as
-          # a single shell invocation. Stable's pipeline is
-          # opaque to the workflow layer (build.sh runs as one
-          # `sudo bash`), so the workflow fires the stage
-          # transitions defensively around the build step itself.
+          # The launcher's stage taxonomy matches the verified
+          # Lite / Fastboot / Ninja launchers: downloading,
+          # reading_rom, building, packaging, uploading. The
+          # refactored engine runs as a single opaque
+          # `bash build.sh --with-upload` invocation, so the
+          # launcher fires the stage transitions defensively
+          # around the build step itself. The pre-refactor
+          # engine also runs as a single `bash build.sh`
+          # invocation (the engine's `notify.py` handles
+          # download/unpack/build lifecycles internally), so
+          # the same defensive pattern applies — the only
+          # difference is that `reading_rom` reads from
+          # `bin/ddevice/*.txt` instead of
+          # `build/.deadzone/rom_metadata.json`.
+          #
           # Each event is best-effort: a callback failure must
           # never fail a build that already produced a usable
           # artifact. The central runtime is checked out at the
@@ -747,29 +1066,56 @@ jobs:
             --project stable \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "ROM download finished" || true
-          # The build engine writes the sanitized device codename
-          # and base ROM code into build/.deadzone/rom_metadata.json
-          # (NOT into Lite's bin/device/* state files). We forward
-          # them verbatim — the live panel renders them as
-          # `Device:` and `ROM:` only when the engine actually
-          # produced a non-empty value.
+          # The build engine writes the sanitized device
+          # codename and base ROM code into one of two
+          # locations, depending on the engine layout:
+          #   * refactored: `build/.deadzone/rom_metadata.json`
+          #     (a JSON blob with `device.codename` and
+          #     `rom.version` / `rom.rom_code` fields)
+          #   * pre-refactor: `bin/ddevice/device_f.txt` and
+          #     `bin/ddevice/base_rom_code.txt` (Lite-style
+          #     plain-text state files written by `build.sh`
+          #     itself)
+          # We forward them verbatim — the live panel renders
+          # them as `Device:` and `ROM:` only when the engine
+          # actually produced a non-empty value.
           codename=""
           rom_version=""
-          if [[ -s build/.deadzone/rom_metadata.json ]]; then
+          if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -s build/.deadzone/rom_metadata.json ]]; then
             codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.upper() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
             rom_version="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("rom",{}) or {}).get("version","") or (d.get("rom",{}) or {}).get("rom_code","");print("".join(c for c in v if c.isalnum() or c in "._+-") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+          else
+            # pre_refactor — read the Lite-style state files.
+            # `device_f.txt` carries the sanitized codename
+            # (e.g. "apollo"); `base_rom_code.txt` carries the
+            # base ROM build code (e.g. "OS2.0.1.0.VOCCNXM" or
+            # "V14.0.1.0.TKOCNXM"). The codename is uppercased
+            # and non-alphanumerics are stripped to match the
+            # Live panel's `Device:` rendering.
+            if [[ -s bin/ddevice/device_f.txt ]]; then
+              codename="$(tr '[:lower:]' '[:upper:]' < bin/ddevice/device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+            fi
+            if [[ -s bin/ddevice/base_rom_code.txt ]]; then
+              rom_version="$(tr -d '\r\n' < bin/ddevice/base_rom_code.txt)"
+            fi
           fi
           extra_args=()
           [[ -n "$codename" ]] && extra_args+=(--device "$codename")
           [[ -n "$rom_version" ]] && extra_args+=(--rom "$rom_version")
-          # The partitions stage writes the canonical partition count
-          # to partition_prep.json after lpunpack / extract_partition
-          # finishes. We forward the count to the live panel so the
-          # user sees "Detected N partitions" alongside the codename
-          # and ROM version, matching the user-facing spec for the
-          # extraction phase.
+          # The refactored engine's partitions stage writes the
+          # canonical partition count to
+          # `build/.deadzone/partition_prep.json` after
+          # lpunpack / extract_partition finishes. The
+          # pre-refactor engine does not write that JSON; it
+          # records the partition list in
+          # `bin/ddevice/superSize.txt` (a single-line file
+          # with the total super image size, not the count)
+          # which is the wrong shape to surface to the live
+          # panel. We therefore forward the partition count
+          # only for the refactored layout, and emit a generic
+          # "ROM metadata extracted" message for pre-refactor.
           partition_count=""
-          if [[ -s build/.deadzone/partition_prep.json ]]; then
+          if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -s build/.deadzone/partition_prep.json ]]; then
             partition_count="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(len(d.get("partitions") or []))' build/.deadzone/partition_prep.json 2>/dev/null || true)"
           fi
           reading_rom_message="ROM metadata extracted"
@@ -801,23 +1147,55 @@ jobs:
           DEADZONE_GOOGLE_UPLOAD_STATUS: ${{ env.DEADZONE_GOOGLE_UPLOAD_STATUS }}
         run: |
           set -Euo pipefail
-          # Mirrors the verified Lite / Ninja "Package and upload
-          # Google Drive" step: the workflow verifies that EXACTLY
-          # one preserved final Stable ZIP exists under
-          # $WORK_DIR/out/, computes its SHA-256 / size, and probes
-          # the canonical Drive URL. This step runs ONLY after a
-          # successful Stable build (if: success()) — a build that
-          # never produced a final ZIP already failed upstream and
-          # is reported by "❌ Send failure notification", not here.
-          # Wrong ZIP count is therefore a workflow-level error
-          # (exit 1) rather than a warning: if the engine's
-          # 11-stage pipeline ran end-to-end but did not write
-          # exactly one final artifact, that is a real failure the
-          # operator needs to act on.
-          mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Stable_*.zip' -print 2>/dev/null)
+          # Compute the SHA-256 / size of the final Stable ZIP
+          # and probe the canonical Drive URL. The location of
+          # the final ZIP depends on the engine layout:
+          #
+          #   * refactored: `$PWD/out/DeadZone_Stable_<...>.zip`
+          #     (the engine's Stage 10 release step writes it
+          #     there, and the engine does NOT clean `out/`)
+          #
+          #   * pre-refactor: the launcher pre-copied the ZIP
+          #     to `$GITHUB_WORKSPACE/out/<name>` in the
+          #     "📦 Pack Stable ROM" step, because
+          #     `uploadROM.sh` cleans `$PWD/out/` on success.
+          #     The final name is recorded in
+          #     `bin/ddevice/output_zip.txt` (which
+          #     `uploadROM.sh` writes just before its rclone
+          #     copy).
+          #
+          # We accept either location. The `if: success()`
+          # gate ensures a build that never produced a final
+          # ZIP already failed upstream and is reported by
+          # "❌ Send failure notification", not here. Wrong
+          # ZIP count is a workflow-level error (exit 1)
+          # rather than a warning: if the engine's pipeline
+          # ran end-to-end but did not write exactly one final
+          # artifact, that is a real failure the operator
+          # needs to act on.
+          if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" ]]; then
+            mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Stable_*.zip' -print 2>/dev/null)
+            artifact_dir="$PWD/out"
+          else
+            # pre_refactor: the ZIP was pre-copied to
+            # $GITHUB_WORKSPACE/out/<name> by the Pack
+            # step; its name is recorded in
+            # bin/ddevice/output_zip.txt. Fall back to a
+            # glob in $GITHUB_WORKSPACE/out for the case
+            # where the Pack step ran without the pre-copy
+            # (e.g. an older launcher version that has
+            # not been re-deployed).
+            artifact_dir="$GITHUB_WORKSPACE/out"
+            if [[ -s bin/ddevice/output_zip.txt ]]; then
+              recorded_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
+              mapfile -t final_zips < <(find "$artifact_dir" -maxdepth 1 -type f -name "$recorded_name" -print 2>/dev/null)
+            else
+              mapfile -t final_zips < <(find "$artifact_dir" -maxdepth 1 -type f -name '*.zip' -print 2>/dev/null)
+            fi
+          fi
           if (( ${#final_zips[@]} != 1 )); then
-            echo "::error::Expected exactly one preserved final Stable ZIP; found ${#final_zips[@]}" | tee -a build_action.log 2>/dev/null || true
-            echo "::error::The Stable engine's release stage (Stage 10) did not write a single canonical DeadZone_Stable_*.zip to $PWD/out. The 11-stage build.sh pipeline ran to completion but the final artifact is missing or duplicated." >&2
+            echo "::error::Expected exactly one preserved final Stable ZIP under ${artifact_dir}; found ${#final_zips[@]}" | tee -a build_action.log 2>/dev/null || true
+            echo "::error::The Stable engine pipeline ran to completion but the final artifact is missing or duplicated under ${artifact_dir}. For the pre-refactor engine, the '📦 Pack Stable ROM' step pre-copies the final ZIP to that location so it survives uploadROM.sh's cleanup; check that step's log for the recorded output_zip.txt path." >&2
             exit 1
           fi
 
@@ -828,16 +1206,30 @@ jobs:
           printf 'DEADZONE_FILE_SIZE=%s\nDEADZONE_INTEGRITY_VERIFIED=1\nDEADZONE_RESULT_NAME=%s\nDEADZONE_INTEGRITY_SHA256=%s\n' \
             "$final_size_bytes" "$final_name" "$final_sha256" >> "$GITHUB_ENV"
 
-          # Derive codename, ROM version, and OS folder from the
-          # engine's canonical metadata file. This is the same
-          # path the upload stage uses, so the Drive-URL probe
-          # below lines up with where the artifact actually lives.
+          # Derive codename, ROM version, and OS folder from
+          # the engine's state files. This is the same
+          # source the upload stage uses, so the Drive-URL
+          # probe below lines up with where the artifact
+          # actually lives.
           codename=""
           rom_version=""
           os_folder=""
-          if [[ -s build/.deadzone/rom_metadata.json ]]; then
+          if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -s build/.deadzone/rom_metadata.json ]]; then
             codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.upper() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
             rom_version="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("rom",{}) or {}).get("version","") or (d.get("rom",{}) or {}).get("rom_code","");print("".join(c for c in v if c.isalnum() or c in "._+-") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+            if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
+              os_folder="${BASH_REMATCH[1]}"
+            elif [[ "$rom_version" =~ ^[Vv]([0-9]+) ]]; then
+              os_folder="MIUI${BASH_REMATCH[1]}"
+            fi
+          else
+            # pre_refactor — read the Lite-style state files.
+            if [[ -s bin/ddevice/device_f.txt ]]; then
+              codename="$(tr '[:lower:]' '[:upper:]' < bin/ddevice/device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+            fi
+            if [[ -s bin/ddevice/base_rom_code.txt ]]; then
+              rom_version="$(tr -d '\r\n' < bin/ddevice/base_rom_code.txt)"
+            fi
             if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
               os_folder="${BASH_REMATCH[1]}"
             elif [[ "$rom_version" =~ ^[Vv]([0-9]+) ]]; then
@@ -847,16 +1239,38 @@ jobs:
 
           # Surface the Drive URL on the standard variable name
           # so the build summary and the success notification
-          # can render the public link. The upload stage writes
-          # DEADZONE_GOOGLE_DRIVE_URL to $GITHUB_ENV, but only
-          # in the same step that consumed the rclone config
-          # and is no longer readable here; re-derive it from
-          # the same rclone config the engine just used.
-          if [[ -n "${RCLONE_REMOTE_NAME:-}" && -n "${RCLONE_UPLOAD_DIR:-}" && -s rclone.conf && -n "$final_name" && -n "$codename" && -n "$os_folder" ]]; then
-            drive_url="$(rclone --config=rclone.conf link "${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
-            if [[ -n "$drive_url" ]]; then
-              printf 'DEADZONE_GOOGLE_DRIVE_URL=%s\nDEADZONE_RESULT_URL=%s\n' "$drive_url" "$drive_url" >> "$GITHUB_ENV"
+          # can render the public link. The pre-refactor
+          # engine's `uploadROM.sh` uploads to the hard-coded
+          # remote `starxONEDRIVE:NTBuild/<os>/<poly>/<device>/`
+          # (NOT the `${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/...`
+          # path the central runtime's `upload-mirrors.sh`
+          # expects). We probe both possible destinations so
+          # the build summary always surfaces the public link
+          # regardless of which layout the engine shipped.
+          drive_url=""
+          if [[ -n "$final_name" && -n "$codename" && -s rclone.conf ]]; then
+            if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -n "${RCLONE_REMOTE_NAME:-}" && -n "${RCLONE_UPLOAD_DIR:-}" && -n "$os_folder" ]]; then
+              drive_url="$(rclone --config=rclone.conf link "${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
             fi
+            if [[ -z "$drive_url" && "${DEADZONE_ENGINE_LAYOUT:-}" != "refactored" ]]; then
+              # Probe the pre-refactor engine's hard-coded
+              # upload path: starxONEDRIVE:NTBuild/<os>/<poly>/<device>/<zip>.
+              # The `rom_os` flag in bin/ddevice/rom_os.txt
+              # is "MIUI" or "HyperOS" and is the source of
+              # truth for the upload directory.
+              if [[ -s bin/ddevice/rom_os.txt ]]; then
+                rom_os="$(tr -d '\r\n' < bin/ddevice/rom_os.txt)"
+              else
+                rom_os=""
+              fi
+              polyxver="$(tr -d '\r\n' < Version 2>/dev/null || true)"
+              if [[ -n "$rom_os" && -n "$polyxver" && -n "$codename" ]]; then
+                drive_url="$(rclone --config=rclone.conf link "starxONEDRIVE:NTBuild/${rom_os}/${polyxver}/${codename}/${final_name}" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+              fi
+            fi
+          fi
+          if [[ -n "$drive_url" ]]; then
+            printf 'DEADZONE_GOOGLE_DRIVE_URL=%s\nDEADZONE_RESULT_URL=%s\n' "$drive_url" "$drive_url" >> "$GITHUB_ENV"
           fi
 
           echo "::group::Stable artifact metadata"
@@ -1211,6 +1625,33 @@ jobs:
           rm -rf toolbuild runtime 2>/dev/null || true
           rm -f toolbuild/rclone.conf 2>/dev/null || true
           echo "Stable workspace cleanup complete"
+
+      - name: "📦 Upload final Stable ZIP as workflow artifact"
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          # The final ZIP lives at different paths depending on
+          # the engine layout:
+          #   * refactored: $GITHUB_WORKSPACE/toolbuild/out/DeadZone_Stable_<...>.zip
+          #     (the engine does not clean `out/`, so the ZIP
+          #     is still there at the end of the run)
+          #   * pre-refactor: $GITHUB_WORKSPACE/out/<name>
+          #     (the launcher pre-copied the ZIP there in the
+          #     "📦 Pack Stable ROM" step, because
+          #     `uploadROM.sh` cleaned `$work_dir/out/`)
+          # `actions/upload-artifact@v6` accepts multiple paths
+          # in a single upload, so we just point at both
+          # candidates and let the upload find the one that
+          # exists. The `if-no-files-found: error` guard fails
+          # the workflow when neither candidate exists, which
+          # is the right safety net for a "build succeeded"
+          # outcome that has no artifact to attach.
+          name: deadzone-stable-${{ env.DEADZONE_RESULT_NAME }}
+          path: |
+            toolbuild/out/DeadZone_Stable_*.zip
+            out/*.zip
+          if-no-files-found: error
+          retention-days: 7
 
       - name: "📋 Upload debug logs"
         if: always()
