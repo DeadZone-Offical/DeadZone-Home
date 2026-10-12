@@ -960,18 +960,28 @@ jobs:
 
       - name: "☁️ Setup rclone for Stable upload (pre-refactor layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
+        env:
+          RCLONE_CONFIG_BUILD_ENV_PATH: ${{ vars.RCLONE_CONFIG_BUILD_ENV_PATH || 'build.env' }}
         working-directory: toolbuild
         run: |
           set -euo pipefail
           # The pre-refactor Stable engine's `uploadROM.sh setup`
-          # subcommand accepts 3 positional args: <token> <repo>
-          # <path>. It fetches the rclone.conf via the GitHub
-          # Contents API and writes it to $work_dir/rclone.conf.
-          # We pre-seed the same token + repo + path values from
-          # the central runtime's `upload.env` (the same values
-          # the central-runtime load-build.sh loads) so the
-          # engine's rclone call has a valid OAuth token even if
-          # the in-engine fetch fails.
+          # subcommand now accepts an optional 4th positional arg
+          # `<build_env_path>` (in addition to the existing
+          # `<token> <repo> <rclone_path>`). When the 4th arg is
+          # provided, the engine fetches the build.env file from
+          # the central runtime repo via the GitHub Contents API
+          # and forwards its three non-secret routing values
+          # (`RCLONE_REMOTE_NAME`, `RCLONE_UPLOAD_DIR`,
+          # `RCLONE_PUBLIC_LINK_BASE`) to `GITHUB_ENV`. We already
+          # load those values from the central runtime in the
+          # `⚙️ Load central runtime` step above, so the engine
+          # forwarding is redundant for THIS launcher; the
+          # forwarding is still useful for the standalone
+          # `DeadZone-Xiaomi-Stable` workflow and for any future
+          # caller that does not have the central runtime.
+          # The 3-arg form (no build.env) is still supported for
+          # older engines.
           if [[ -z "${RCLONE_REMOTE_NAME:-}" || -z "${RCLONE_UPLOAD_DIR:-}" ]]; then
             echo "::error::RCLONE_REMOTE_NAME or RCLONE_UPLOAD_DIR is missing from the central runtime; cannot configure rclone for the Stable upload." >&2
             exit 1
@@ -987,7 +997,8 @@ jobs:
           sudo -E bash uploadROM.sh setup \
             "$GH_TOKEN_FOR_RCLONE" \
             "${RCLONE_CONFIG_REPO_OWNER}/${RCLONE_CONFIG_REPO_NAME}" \
-            "$RCLONE_CONFIG_PATH"
+            "$RCLONE_CONFIG_PATH" \
+            "${RCLONE_CONFIG_BUILD_ENV_PATH:-}"
           if [[ ! -s rclone.conf ]]; then
             echo "::error::uploadROM.sh setup did not write rclone.conf to $PWD/rclone.conf" >&2
             exit 1
@@ -1290,6 +1301,8 @@ jobs:
           DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
           DEADZONE_FILE_SIZE: ${{ env.DEADZONE_FILE_SIZE }}
           DEADZONE_INTEGRITY_SHA256: ${{ env.DEADZONE_INTEGRITY_SHA256 }}
+          DEADZONE_GOOGLE_DRIVE_URL: ${{ env.DEADZONE_GOOGLE_DRIVE_URL }}
+          DEADZONE_UPLOAD_VERIFIED: ${{ env.DEADZONE_UPLOAD_VERIFIED }}
         run: |
           set -euo pipefail
           # Terminal succeeded event. This is the source of
@@ -1304,10 +1317,26 @@ jobs:
           # path rather than the relative `runtime/...` that
           # would otherwise be resolved against toolbuild.
           runtime_dir="$GITHUB_WORKSPACE/runtime"
+          # Build the success message. Include the verified
+          # Google Drive link in the bot message ONLY when the
+          # upload step verified the file on Drive. Never
+          # include a stale or unverified link: the message
+          # would otherwise claim an upload that did not
+          # actually land. `--message` is bounded to 500 chars
+          # by report_build_event.py, so we truncate the URL
+          # line conservatively.
+          success_message="DeadZone Stable build complete."
+          if [[ "${DEADZONE_UPLOAD_VERIFIED:-}" == "1" && -n "${DEADZONE_GOOGLE_DRIVE_URL:-}" ]]; then
+            success_message="${success_message} Drive: ${DEADZONE_GOOGLE_DRIVE_URL}"
+          elif [[ "${DEADZONE_UPLOAD_VERIFIED:-}" == "1" ]]; then
+            success_message="${success_message} (Drive upload verified, no public link available)"
+          fi
+          # Truncate to leave headroom for any future fields.
+          success_message="${success_message:0:480}"
           if [[ -s "$runtime_dir/report_build_event.py" ]]; then
             python3 "$runtime_dir/report_build_event.py" succeeded \
               --project stable \
-              --message "DeadZone Stable build complete." || true
+              --message "$success_message" || true
           fi
 
       - name: "🛡️ Diagnose Stable engine metadata persistence (failure-only)"
