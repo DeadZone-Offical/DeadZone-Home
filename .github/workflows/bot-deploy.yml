@@ -531,6 +531,58 @@ jobs:
           echo "  url:    ${webhook_url}"
           rm -f "${response_body}"
 
+      - name: 🔁 Force-refresh Telegram webhook registration
+        if: steps.deploy.outcome == 'success' && steps.resolve.outcome == 'success' && env.DEPLOY_MODE == 'deploy'
+        id: refresh
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          WORKER_URL: ${{ steps.resolve.outputs.worker_url }}
+        run: |
+          set -Eeuo pipefail
+          # Telegram's setWebhook is documented as idempotent for
+          # the URL but the `secret_token` update propagation has
+          # been observed to lag indefinitely in some cases: a
+          # successful setWebhook with a different `secret_token`
+          # from the previously registered one returns `ok:true`
+          # but the new secret_token is not used for incoming
+          # updates until the registration is force-refreshed. The
+          # recovery path is `deleteWebhook` (which holds pending
+          # updates) followed by `setWebhook`. This step is
+          # non-fatal because the self-heal handler on the Worker
+          # will retry every hour regardless, and a transient
+          # rate-limit will be picked up on the next deploy.
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${WORKER_URL:-}" ]]; then
+            echo "Skipping webhook refresh (missing CLOUDFLARE_API_TOKEN or WORKER_URL)."
+            exit 0
+          fi
+          echo "Force-refreshing Telegram webhook via ${WORKER_URL%/}/admin/refresh-webhook …"
+          response_body="${RUNNER_TEMP}/refresh.json"
+          http_code="$(
+            curl --silent --show-error --output "${response_body}" \
+              --write-out '%{http_code}' \
+              --max-time 30 \
+              -X POST \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              "${WORKER_URL%/}/admin/refresh-webhook"
+          )"
+          echo "  worker responded HTTP ${http_code}"
+          if [[ "${http_code}" != "200" ]]; then
+            echo "::warning::Worker /admin/refresh-webhook returned HTTP ${http_code}; webhook is registered via the admin route, but the force-refresh did not confirm a clean state. The next self-heal or deploy will retry." >&2
+            sed -E 's/^/  | /' "${response_body}" >&2 || true
+            exit 0
+          fi
+          if ! jq -e '.ok == true' "${response_body}" >/dev/null; then
+            echo "::warning::Worker /admin/refresh-webhook did not return ok=true." >&2
+            sed -E 's/^/  | /' "${response_body}" >&2 || true
+            exit 0
+          fi
+          bot_username="$(jq -r '.bot.username // "unknown"' "${response_body}")"
+          bot_id="$(jq -r '.bot.id // 0' "${response_body}")"
+          echo "Telegram webhook force-refreshed via Worker admin route."
+          echo "  bot:    @${bot_username} (id=${bot_id})"
+          rm -f "${response_body}"
+
       - name: 📣 Deployment summary
         if: always()
         shell: bash
