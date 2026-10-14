@@ -222,12 +222,93 @@ jobs:
           # listed in `projects.env` plus `DeadZone-Offical/DeadZone-File`.
           # It MUST NOT be the bot dispatch token (`GITHUB_BUILD_TOKEN`)
           # or any other write-capable credential. The workflow fails
-          # fast if the secret is missing so a misconfigured secret
-          # surfaces immediately instead of producing a 403 later.
+          # fast if the secret is missing OR has been revoked / lost
+          # access to a required private repository, so a misconfigured
+          # secret surfaces immediately instead of producing a 403
+          # several minutes into a 90-minute Stable build.
+          #
+          # Two-stage validation:
+          #   1. Existence check: token is non-empty (handled below).
+          #   2. Reachability check: the token can read at least the
+          #      central runtime repo (`DeadZone-Offical/DeadZone-File`)
+          #      and the Stable engine repo
+          #      (`DeadZone-Offical/DeadZone-Xiaomi-Stable`). The Stable
+          #      engine repo name is treated as a constant here because
+          #      it is hard-coded in `DEADZONE_ENGINE_REPOSITORY` above;
+          #      cross-checking against `steps.runtime.outputs.
+          #      engine_repository` in the `✅ Validate loaded runtime`
+          #      step catches drift between this hard-coded constant and
+          #      the value the central runtime exports.
+          #
+          # The GitHub REST endpoint we probe is `GET /repos/{owner}/{repo}`
+          # (anonymous call permitted; an authenticated call must return
+          # 200 with a non-zero subscriber_count for a private repo the
+          # token can read, and 404 for a private repo it cannot). A 401
+          # indicates the token is rejected outright (revoked, expired,
+          # or wrong account); a 403 with `repo` scope missing indicates
+          # a write-capable fallback was misconfigured. We treat every
+          # non-2xx response as a hard failure with a precise diagnostic
+          # so the operator can fix the secret instead of waiting for
+          # the engine checkout to 403 several steps later.
+          #
+          # Token handling rules:
+          #   * The token is read from `${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}`
+          #     ONLY. No fallback to `${{ github.token }}`, GITHUB_TOKEN,
+          #     or any other credential.
+          #   * The token is NEVER echoed in command output. We pipe the
+          #     curl invocation through `printf` to an environment
+          #     variable, then into `curl -H "Authorization: ..."` via
+          #     an inline `$VAR` whose value happens to be the masked
+          #     secret itself. GitHub Actions auto-masks any environment
+            #     variable whose name matches a registered secret name,
+            #     so the curl `-H` line is redacted even though the
+            #     token is technically present in the rendered command.
+          #   * The token is NEVER echoed via `set -x`. The wrapper uses
+          #     `set +x` around the probe so the shell trace is not
+          #     produced for that command.
           if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
             echo "::error::Missing required launcher secret: DEADZONE_PRIVATE_READ_TOKEN. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
             exit 1
           fi
+          # Targets the launcher must read before any private checkout
+          # can succeed. Update this list when a new private engine is
+          # added to `runtime/projects.env`; the canonical sources are
+          # the `DEADZONE_ENGINE_REPOSITORY` env block at the top of
+          # this workflow and `steps.runtime.outputs.engine_repository`.
+          required_repos=(
+            "DeadZone-Offical/DeadZone-File"
+            "DeadZone-Offical/DeadZone-Xiaomi-Stable"
+          )
+          for required_repo in "${required_repos[@]}"; do
+            http_code=$(set +x; curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${DEADZONE_PRIVATE_READ_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: deadzone-stable-launcher" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${required_repo}")
+            case "$http_code" in
+              200)
+                echo "  - ${required_repo}: reachable (HTTP 200)"
+                ;;
+              401)
+                echo "::error::DEADZONE_PRIVATE_READ_TOKEN was rejected by the GitHub API (HTTP 401) when probing ${required_repo}. The fine-grained PAT is missing, expired, revoked, or issued by a different GitHub account. Update the DEADZONE_PRIVATE_READ_TOKEN secret on DeadZone-Offical/DeadZone-Home." >&2
+                exit 1
+                ;;
+              403)
+                echo "::error::DEADZONE_PRIVATE_READ_TOKEN returned HTTP 403 (forbidden) when probing ${required_repo}. The fine-grained PAT is alive but does NOT grant Contents: Read-only on ${required_repo}. Either add ${required_repo} to the PAT's repository access list, or replace the PAT with one that already includes it. Update the DEADZONE_PRIVATE_READ_TOKEN secret on DeadZone-Offical/DeadZone-Home." >&2
+                exit 1
+                ;;
+              404)
+                echo "::error::DEADZONE_PRIVATE_READ_TOKEN returned HTTP 404 (not found) when probing ${required_repo}. Either the repository name is wrong, or the fine-grained PAT was scoped to the WRONG GitHub account. Verify the repository exists at https://github.com/${required_repo} and that the PAT was issued by an account or organization with read access to it. Update the DEADZONE_PRIVATE_READ_TOKEN secret on DeadZone-Offical/DeadZone-Home." >&2
+                exit 1
+                ;;
+              *)
+                echo "::error::DEADZONE_PRIVATE_READ_TOKEN returned unexpected HTTP ${http_code} when probing ${required_repo}. Inspect the GitHub Actions network connectivity and the token's rate-limit status; the probe is the only validation check the launcher runs before private checkouts begin." >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "Launcher credentials OK: ${#required_repos[@]} private repositories reachable."
 
       - name: "📥 Checkout DeadZone launcher"
         uses: actions/checkout@v5
@@ -318,6 +399,7 @@ jobs:
           remove-haskell: "true"
 
       - name: "🧹 Clean unused runner packages"
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           docker image prune --all --force || true
@@ -326,7 +408,59 @@ jobs:
           sudo apt-get autoremove --purge -y || true
           sudo apt-get clean
 
+      - name: "🛡️ Storage, RAM, and mount diagnostics"
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          # Print an explicit snapshot of every filesystem the build
+          # might touch, plus RAM/swap state and the active mount
+          # table. This step is informational: it never fails the
+          # build on its own. The companion preflight step below is
+          # what enforces the 25 GB / 3 GB thresholds.
+          #
+          # After `easimon/maximize-build-space` ran above, the root
+          # filesystem has been intentionally filled almost to 100%
+          # by a /pv.img loopfile that backs an LVM volume mounted
+          # on `toolbuild/`. Reading `df` on `${{ github.workspace }}`
+          # at this point therefore returns the *root* filesystem,
+          # NOT the LVM volume the build will actually write to. The
+          # launcher has to look at the mounted LVM volume directly
+          # for build-storage accounting; this diagnostic prints
+          # BOTH numbers (root + LVM) so the operator can see the
+          # divergence at a glance.
+          echo "::group::Storage, RAM, and mount diagnostics"
+          echo "--- df -h ---"
+          df -h
+          echo
+          echo "--- df -h \$(findmnt buildvg-buildlv -n -o TARGET 2>/dev/null || true) ---"
+          lvm_target="$(findmnt buildvg-buildlv -n -o TARGET 2>/dev/null || true)"
+          if [[ -n "$lvm_target" ]]; then
+            df -h "$lvm_target"
+          else
+            echo "(buildvg-buildlv is not mounted; the launcher will fall back to the workspace root in the preflight step.)"
+          fi
+          echo
+          echo "--- /proc/meminfo / free ---"
+          free
+          echo
+          echo "--- swapon ---"
+          swapon --show || true
+          echo
+          echo "--- lsblk (top-level) ---"
+          lsblk -o NAME,SIZE,TYPE,MOUNTPOINT || true
+          echo
+          echo "--- mount points containing 'toolbuild' ---"
+          mount | grep -i toolbuild || echo "(no mount point containing toolbuild)"
+          echo
+          echo "--- largest top-level directories on the workspace ---"
+          du -h -d 1 -x /home/runner/work 2>/dev/null | sort -hr | head -n 8 || true
+          echo
+          echo "--- large dirs under /tmp, /mnt, /var/tmp (>=512 MiB) ---"
+          find /tmp /mnt /var/tmp -xdev -type d -size +512M 2>/dev/null | head -n 10 || true
+          echo "::endgroup::"
+
       - name: "🛡️ Preflight: disk, RAM, and toolchain"
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           # Run 38444352495 ended in a runner "lost communication" error
@@ -340,13 +474,7 @@ jobs:
           # *upstream* class of failures the same kind of build
           # could trip: a runner that started the Pack step with
           # insufficient free disk, low free RAM, or a missing
-          # core tool. The build space was enlarged by
-          # `easimon/maximize-build-space@…` above, but a
-          # regression there (or a future runner image that ships
-          # without the toolchain) would otherwise surface as a
-          # confusing mid-Extract `Permission denied` or a
-          # mid-Pack ENOSPC. We fail fast here, with a precise
-          # diagnostic, instead.
+          # core tool.
           #
           # Thresholds are conservative: a typical Stable build
           # needs ~25 GB free in toolbuild at peak (a 6 GB
@@ -355,26 +483,61 @@ jobs:
           # subprocess holds a few hundred MB while the engine
           # runs aapt2 / mkfs.erofs concurrently).
           #
-          # Note: `toolbuild` is created by the
-          # `📦 Checkout private Stable engine` step that runs
-          # AFTER this preflight, so we measure free space on
-          # the workspace root (which is the same volume) and
-          # fall back to `${{ github.workspace }}/..` if the
-          # workspace itself is not yet present. The free
-          # space is identical either way: the workspace and
-          # `toolbuild` share a single root filesystem on
-          # the GitHub-hosted runner.
-          check_path="${{ github.workspace }}"
-          if [[ ! -d "$check_path" ]]; then
-            check_path="${{ github.workspace }}/.."
+          # Critical: when `easimon/maximize-build-space` ran above,
+          # it created an LVM volume at /dev/mapper/buildvg-buildlv
+          # and mounted it on `${BUILD_MOUNT_PATH}` (= ${{ github.workspace }}/toolbuild).
+          # That mount is what the build actually writes into —
+          # NOT the root filesystem, which has been intentionally
+          # filled almost to 100% by the /pv.img loopfile. The
+          # previous version of this step measured `df` on
+          # `${{ github.workspace }}`, which is a parent of the
+          # mount, and saw the *root* filesystem's available space
+          # (often under 200 MiB after Maximize). The preflight
+          # would then exit 1 with `Preflight failed: toolbuild has
+          # only 0 GB free…`, even though `toolbuild/` itself was
+          # mounted on a 100 GiB ext4 volume that had 99.9 GiB free.
+          # This version explicitly resolves the build filesystem
+          # (via /proc/mounts -> findmnt) and measures THAT.
+          #
+          # Build filesystem resolution order:
+          #   1. /dev/mapper/buildvg-buildlv mounted at the
+          #      `${BUILD_MOUNT_PATH}` (the Maximize output). When
+          #      this is found, the preflight measures free space
+          #      on the mount target — the filesystem the build
+          #      actually writes into.
+          #   2. As a defensive fallback (e.g. a future runner image
+          #      where Maximize-build-space fails), ${{ github.workspace }}'s
+          #      own filesystem, with a warning that future builds
+          #      may ENOSPC if Maximize regressed. The 25 GB
+          #      threshold stays enforced either way.
+          build_mount_path="${{ github.workspace }}/toolbuild"
+          lvm_target="$(findmnt buildvg-buildlv -n -o TARGET 2>/dev/null || true)"
+          lvm_avail_gb=""
+          if [[ -n "$lvm_target" ]]; then
+            build_check_path="$lvm_target"
+            lvm_avail_gb="$(df -Pk "$build_check_path" | awk 'NR==2 {printf "%d\n", $4 / 1024 / 1024}')"
+            echo "LVM build volume buildvg-buildlv mounted at ${lvm_target}; available ${lvm_avail_gb} GB."
+          elif [[ -d "$build_mount_path" ]]; then
+            build_check_path="$build_mount_path"
+            lvm_avail_gb="$(df -Pk "$build_check_path" | awk 'NR==2 {printf "%d\n", $4 / 1024 / 1024}')"
+            echo "toolbuild directory exists but is not on the LVM volume; using $build_check_path with ${lvm_avail_gb} GB available. The maximize-build-space step did not produce a separate mount, so the workspace root will be the build filesystem."
+          else
+            build_check_path="${{ github.workspace }}"
+            if [[ ! -d "$build_check_path" ]]; then
+              build_check_path="${{ github.workspace }}/.."
+            fi
+            lvm_avail_gb="$(df -Pk "$build_check_path" | awk 'NR==2 {printf "%d\n", $4 / 1024 / 1024}')"
+            echo "::warning::Neither /dev/mapper/buildvg-buildlv nor ${build_mount_path} exists; preflight is checking the workspace root filesystem at $build_check_path (${lvm_avail_gb} GB available). The maximize-build-space step did not enlarge the volume as expected — re-run the dispatch; if the failure reproduces, file a runner-image ticket." >&2
           fi
-          free_disk_kb=$(df -Pk "$check_path" 2>/dev/null | awk 'NR==2 {print $4}')
-          free_ram_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-          free_disk_gb=$(( free_disk_kb / 1024 / 1024 ))
-          free_ram_gb=$(( free_ram_kb / 1024 / 1024 ))
-          echo "Preflight: free disk=${free_disk_gb} GB, free RAM=${free_ram_gb} GB (checked ${check_path})"
-          if (( free_disk_gb < 25 )); then
-            echo "::error::Preflight failed: toolbuild has only ${free_disk_gb} GB free; Stable builds need at least 25 GB. The maximize-build-space step did not enlarge the volume as expected, or a previous step consumed the free space. Re-run the dispatch; if the failure reproduces, file a runner-image ticket." >&2
+          # RAM is independent of the storage layout. MemAvailable is
+          # the kernel's report of memory that can be allocated to
+          # new processes without swapping, and is the right figure
+          # to compare against the 3 GB build-residency threshold.
+          free_ram_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+          free_ram_gb="$(( free_ram_kb / 1024 / 1024 ))"
+          echo "Preflight: free disk=${lvm_avail_gb} GB (checked ${build_check_path}), free RAM=${free_ram_gb} GB."
+          if (( lvm_avail_gb < 25 )); then
+            echo "::error::Preflight failed: build filesystem (${build_check_path}) has only ${lvm_avail_gb} GB free; Stable builds need at least 25 GB. The maximize-build-space step did not enlarge the volume as expected, or a previous step consumed the free space. Re-run the dispatch; if the failure reproduces, file a runner-image ticket and link this run's diagnostics." >&2
             exit 1
           fi
           if (( free_ram_gb < 3 )); then
@@ -385,8 +548,9 @@ jobs:
           # `Install Stable dependencies` step below installs the
           # rest (lz4, zstd, erofs-utils, aapt, ...); we only
           # check the tools that MUST be on the runner image
-          # itself (bash, sudo, git, tee, tail, findmnt).
-          for tool in bash sudo git tee tail findmnt xz; do
+          # itself (bash, sudo, git, tee, tail, findmnt,
+          # stdbuf, curl, xz).
+          for tool in bash sudo git tee tail findmnt xz stdbuf curl; do
             if ! command -v "$tool" >/dev/null 2>&1; then
               echo "::error::Preflight failed: required tool '$tool' is missing from the runner image." >&2
               exit 1
@@ -780,6 +944,7 @@ jobs:
             --message "Runner allocated, fetching engine sources" || true
 
       - name: "🕒 Set Cairo timezone"
+        timeout-minutes: 2
         run: sudo timedatectl set-timezone Africa/Cairo
 
       - name: "☕ Install OpenJDK"
