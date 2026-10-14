@@ -1285,6 +1285,21 @@ jobs:
           DEADZONE_INPUT_URL: ${{ inputs.input_url }}
           DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
           DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+          # Pin zipalign and apksigner to the runner's Android
+          # SDK build-tools that the previous step installed.
+          # The engine's mod scripts (FrameworkServices,
+          # ExternalStorageProvider, Provision, etc.) honour
+          # $ZIPALIGN and $APKSIGNER when set, but fall back
+          # to /home/mohammed/... when the env is empty -- a
+          # hardcoded path that does not exist on a hosted
+          # runner. We override the env here so every mod
+          # script sees the same path the SDK install step
+          # validated.
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_BUILD_TOOLS: ${{ env.ANDROID_BUILD_TOOLS }}
+          ZIPALIGN: ${{ env.ANDROID_BUILD_TOOLS }}/zipalign
+          APKSIGNER: ${{ env.ANDROID_BUILD_TOOLS }}/apksigner
+          AAPT2: ${{ env.ANDROID_BUILD_TOOLS }}/aapt2
         run: |
           set -Eeuo pipefail
           # The pre-refactor Stable engine's pipeline is three
@@ -1330,6 +1345,11 @@ jobs:
           DEADZONE_INPUT_URL: ${{ inputs.input_url }}
           DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
           DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_BUILD_TOOLS: ${{ env.ANDROID_BUILD_TOOLS }}
+          ZIPALIGN: ${{ env.ANDROID_BUILD_TOOLS }}/zipalign
+          APKSIGNER: ${{ env.ANDROID_BUILD_TOOLS }}/apksigner
+          AAPT2: ${{ env.ANDROID_BUILD_TOOLS }}/aapt2
         run: |
           set -Eeuo pipefail
           # `packROM.sh` rebuilds the super.img from the
