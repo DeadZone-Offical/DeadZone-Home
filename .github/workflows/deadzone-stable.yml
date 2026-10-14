@@ -112,12 +112,27 @@ name: Deadzone-Stable
 run-name: "🚀 Deadzone-Stable · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}"
 
 concurrency:
-  # Per-request concurrency key: two different users can dispatch
-  # Stable at the same time and they run in parallel. The same user
-  # re-pressing Build for the same request_id cancels their previous
-  # run, which is the only safe semantic.
-  group: deadzone-home-stable-${{ inputs.request_id }}
-  cancel-in-progress: false
+  # Per-branch/ref concurrency key: only one Stable build for the
+  # same `github.ref` is ever active. A newer manual dispatch on
+  # the same ref cancels the older queued or running build before
+  # it can reserve a runner, which is the only safe semantic for
+  # a "Stable pipeline that consumes the entire 100 GB LVM volume
+  # and ~3 GB RAM per run" workload. Without this, a fast
+  # double-tap on the bot would queue two parallel runs that
+  # each try to `easimon/maximize-build-space` the same root
+  # filesystem and race each other into a `pv.img` collision.
+  #
+  # We deliberately key on `github.ref` (not `inputs.request_id`)
+  # because the request_id is a per-build identity, not a
+  # run-level lock. Two distinct Telegram dispatches on the same
+  # ref would otherwise still be allowed to run in parallel under
+  # the request_id key, which is what the duplicate-download
+  # / duplicate-pack failures of runs 38604517142 and 38610249902
+  # were: separate dispatches on the same `main` ref, each
+  # grabbing its own runner, each burning 50+ minutes, and each
+  # hitting the runner's host-IO ENOSPC at the post-pack cp.
+  group: deadzone-home-stable-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 on:
   workflow_dispatch:
@@ -463,6 +478,32 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
+          # ----- Run identity -----
+          # Surface the (workflow, ref, run_id, run_attempt, sha,
+          # request_id) tuple at the very top of the preflight so
+          # any operator reading the live log can immediately tell
+          # which Stable run produced the output. This is also the
+          # place we record whether the run is a retry of a
+          # previous attempt (github.run_attempt > 1): the
+          # concurrency block above cancels older runs on a
+          # newer dispatch, so a second attempt in this same
+          # `run_id` is a true retry, not a duplicate.
+          # The same identity is echoed by every other major
+          # stage (Build, Pack, Upload) below so the log lines
+          # can be cross-referenced if the same `run_id` ever
+          # interleaves with another dispatch.
+          echo "::group::Stable run identity"
+          echo "  workflow    : ${{ github.workflow }}"
+          echo "  ref         : ${{ github.ref }}"
+          echo "  ref_name    : ${{ github.ref_name }}"
+          echo "  sha         : ${{ github.sha }}"
+          echo "  run_id      : ${{ github.run_id }}"
+          echo "  run_attempt : ${{ github.run_attempt }}"
+          echo "  run_number  : ${{ github.run_number }}"
+          echo "  actor       : ${{ github.actor }}"
+          echo "  request_id  : ${{ inputs.request_id }}"
+          echo "  input_url   : ${{ inputs.input_url }}"
+          echo "::endgroup::"
           # Run 38444352495 ended in a runner "lost communication" error
           # that the launcher surfaced as a generic annotation. The real
           # root cause was a single 50-minute foregrounded Pack step
@@ -1257,11 +1298,69 @@ jobs:
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
           log_path="$PWD/build_action.log"
           : >> "$log_path"
+          # ----- Periodic progress + disk checkpoints -----
+          # `packROM.sh` itself emits one [REPACK] line per
+          # partition (one every 5–30 s on a real build), but
+          # the lpmake phase that re-assembles super.img can
+          # run for 60+ s without a single line of new
+          # output. That long silence is what historically
+          # tripped the Actions control plane into a "lost
+          # communication" disambiguation. We launch a
+          # backgrounded heartbeat that prints disk and
+          # memory checkpoints every 30 s so the live log
+          # always has *something* flowing while
+          # `packROM.sh` is computing.
+          _pack_heartbeat_log="$PWD/.pack_heartbeat.log"
+          : > "$_pack_heartbeat_log"
           sudo -E stdbuf -oL -eL bash packROM.sh >> "$log_path" 2>&1 &
           pack_pid=$!
-          tail -n +1 -F --pid="$pack_pid" "$log_path" || true
+          (
+              while :; do
+                  sleep 30 || break
+                  if ! kill -0 "$pack_pid" 2>/dev/null; then
+                      break
+                  fi
+                  {
+                      echo "::group::Pack heartbeat $(date -u +%H:%M:%S)"
+                      echo "  - toolbuild free (bytes): $(df -Pk "$PWD" | awk 'NR==2 {print $4 * 1024}')"
+                      echo "  - toolbuild free (GiB): $(df -Pk "$PWD" | awk 'NR==2 {printf "%.2f\n", $4 / 1024 / 1024}')"
+                      echo "  - root FS free (bytes): $(df -Pk / 2>/dev/null | awk 'NR==2 {print $4 * 1024}')"
+                      echo "  - free RAM (MiB): $(awk '/MemAvailable/ {printf "%d\n", $2 / 1024}' /proc/meminfo 2>/dev/null || echo 0)"
+                      echo "  - load average: $(cat /proc/loadavg 2>/dev/null || echo unknown)"
+                      echo "  - process count: $(pgrep -c -P "$pack_pid" 2>/dev/null || echo unknown) child of packROM.sh"
+                      echo "::endgroup::"
+                  } >> "$_pack_heartbeat_log"
+              done
+          ) &
+          _heartbeat_pid=$!
+          # Mirror both the engine log and the heartbeat
+          # log so the live UI sees periodic checkpoints
+          # even during the silent lpmake phase.
+          tail -n +1 -F --pid="$pack_pid" "$log_path" 2>/dev/null &
+          _mirror_pid=$!
+          tail -n +1 -F --pid="$pack_pid" "$_pack_heartbeat_log" 2>/dev/null &
+          _hb_mirror_pid=$!
           wait "$pack_pid"
           pack_status=$?
+          # Stop the heartbeat and its mirror now that
+          # packROM.sh has exited. We `kill` rather than
+          # `wait` so a stuck `tail -F` cannot block the
+          # step on a slow log rotation; the `|| true`
+          # tolerates a race where the heartbeat exited
+          # on its own (when it noticed packROM.sh had
+          # already gone away).
+          kill "$_hb_mirror_pid" 2>/dev/null || true
+          kill "$_heartbeat_pid" 2>/dev/null || true
+          wait "$_hb_mirror_pid" 2>/dev/null || true
+          wait "$_heartbeat_pid" 2>/dev/null || true
+          # Surface the final heartbeat in the live log
+          # so a post-mortem reader can see the
+          # last-known free space and load.
+          if [[ -s "$_pack_heartbeat_log" ]]; then
+              echo "::group::Final Pack heartbeat"
+              tail -n 30 "$_pack_heartbeat_log" || true
+              echo "::endgroup::"
+          fi
           if [[ $pack_status -ne 0 ]]; then
             echo "::error::packROM.sh exited ${pack_status}; see build_action.log for the engine's diagnostic." >&2
             exit "$pack_status"
@@ -1276,10 +1375,75 @@ jobs:
             echo "::error::packROM.sh recorded '$final_name' in output_zip.txt but the file does not exist at $final_zip" >&2
             exit 1
           fi
-          stable_out="$GITHUB_WORKSPACE/out"
+          # ----- Capture the final ZIP on the LVM build volume -----
+          # The previous version of this step wrote the captured
+          # ZIP to `$GITHUB_WORKSPACE/out/`, which is on the
+          # ROOT filesystem of the runner. After
+          # `easimon/maximize-build-space` ran, the root
+          # filesystem has been intentionally filled almost to
+          # 100% by a /pv.img loopfile that backs an LVM volume
+          # mounted on `${GITHUB_WORKSPACE}/toolbuild/`. The
+          # root FS therefore has only ~100 MiB free — far less
+          # than a 6 GB Stable ZIP. Run 38604517142 hit ENOSPC
+          # on this exact `cp` (`cp: error writing '...zip':
+          # No space left on device`) even though the LVM
+          # build volume was at 99 GiB free; the Pack step
+          # itself had already finished and the ZIP existed at
+          # `toolbuild/out/<name>.zip`.
+          #
+          # The fix is to point the artifact capture at the
+          # LVM-backed build directory. We use a dedicated
+          # `toolbuild/artifact/` subdirectory (not `toolbuild/out/`
+          # which the engine owns and which `uploadROM.sh`
+          # cleans at the end of the upload step) so the
+          # artifact survives the upload step's cleanup while
+          # the rest of the workflow can still read it via the
+          # well-known path. The actions/upload-artifact step
+          # below uploads from this same `toolbuild/artifact/`
+          # path, and the `🗂️ Collect Stable artifact metadata`
+          # step also reads from it. The 25 GB preflight
+          # threshold above guarantees we have at least 25 GB
+          # of headroom on the LVM volume for the source ROM,
+          # the extracted partitions, the build output, the
+          # final ZIP, AND a safety margin for runner control
+          # plane IO — 6 GB ZIPs fit comfortably in 25 GB.
+          stable_out="$GITHUB_WORKSPACE/toolbuild/artifact"
           mkdir -p "$stable_out"
-          cp -f "$final_zip" "$stable_out/${final_name}"
-          echo "Captured pre-upload Stable ZIP: ${final_name}"
+          # Sanity-check the available headroom before we
+          # commit to the cp. We deliberately do not lower the
+          # 25 GB threshold for the preflight, but we do add a
+          # tight, artifact-scoped check at this exact copy
+          # so a future regression that fills toolbuild/ during
+          # the Pack step (e.g. a runaway extractor) surfaces
+          # here with a precise diagnostic instead of a generic
+          # `cp` ENOSPC. We require at least 2x the ZIP size
+          # of free space: the ZIP itself plus a 1x reserve
+          # so the actions/upload-artifact step that follows
+          # can re-read + hash the file without competing for
+          # the same blocks.
+          _zip_bytes="$(stat -c '%s' "$final_zip" 2>/dev/null || stat -f '%z' "$final_zip" 2>/dev/null || echo 0)"
+          _avail_bytes="$(df -Pk "$stable_out" | awk 'NR==2 {print $4 * 1024}')"
+          if [[ "${_zip_bytes:-0}" -gt 0 && "${_avail_bytes:-0}" -lt $(( _zip_bytes * 2 )) ]]; then
+            echo "::error::Captured Stable artifact target $stable_out has only $(( _avail_bytes / 1024 / 1024 )) MiB free; the final ZIP is $(( _zip_bytes / 1024 / 1024 )) MiB and we need 2x headroom. The LVM build volume is too full — investigate toolbuild/ before re-dispatching." >&2
+            exit 1
+          fi
+          if ! cp -f "$final_zip" "$stable_out/${final_name}"; then
+            echo "::error::Failed to capture final Stable ZIP at $stable_out/${final_name}; check toolbuild/ free space and the previous step's log." >&2
+            exit 1
+          fi
+          # Verify the captured copy is byte-identical to the
+          # engine-produced ZIP. A mismatch is a hard failure:
+          # if the source and the copy differ, the artifact
+          # the workflow will publish is not the artifact the
+          # engine produced, and that is a correctness bug,
+          # not a transient IO problem.
+          _src_sha="$(sha256sum "$final_zip" 2>/dev/null | awk '{print $1}')"
+          _dst_sha="$(sha256sum "$stable_out/${final_name}" 2>/dev/null | awk '{print $1}')"
+          if [[ "$_src_sha" != "$_dst_sha" || -z "$_src_sha" ]]; then
+            echo "::error::Captured Stable artifact SHA-256 mismatch: source=$_src_sha captured=$_dst_sha" >&2
+            exit 1
+          fi
+          echo "Captured pre-upload Stable ZIP: ${final_name} (${_zip_bytes} bytes, SHA-256=${_src_sha})"
           printf 'DEADZONE_RESULT_NAME=%s\n' "$final_name" >> "$GITHUB_ENV"
 
       - name: "☁️ Setup rclone for Stable upload (pre-refactor layout)"
@@ -1375,6 +1539,25 @@ jobs:
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
           log_path="$PWD/build_action.log"
+          # Cap the Build+Pack log at 5 MiB before the Upload
+          # step appends more. The Pack step already rotates
+          # at its boundary, but a 5 MiB log plus a 6 GB
+          # ZIP-build log (one line per partition) plus a
+          # 30-minute rclone round-trip can still push the
+          # file past 10 MiB and trip the runner's IO
+          # buffer. We use `tail -c` (NOT `>`) so the
+          # truncated file is still a valid stream of
+          # lines; a hard truncate could leave a half-line
+          # at the top and break log-parsing tools the bot
+          # panel uses downstream.
+          if [[ -s "$log_path" ]]; then
+            if [[ $(stat -c '%s' "$log_path" 2>/dev/null || echo 0) -gt 5242880 ]]; then
+              tail -c 5242880 "$log_path" > "$log_path.tmp"
+              mv -f "$log_path.tmp" "$log_path"
+              echo "[launcher] build_action.log truncated to last 5 MiB at the Upload boundary" \
+                >> "$log_path"
+            fi
+          fi
           : >> "$log_path"
           sudo -E stdbuf -oL -eL bash uploadROM.sh >> "$log_path" 2>&1 &
           upload_pid=$!
@@ -1548,18 +1731,25 @@ jobs:
           # artifact, that is a real failure the operator
           # needs to act on.
           if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" ]]; then
+            # The refactored engine owns `toolbuild/out/`
+            # itself and does not clean it on success, so the
+            # ZIP is still there at this point.
             mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Stable_*.zip' -print 2>/dev/null)
             artifact_dir="$PWD/out"
           else
-            # pre_refactor: the ZIP was pre-copied to
-            # $GITHUB_WORKSPACE/out/<name> by the Pack
-            # step; its name is recorded in
-            # bin/ddevice/output_zip.txt. Fall back to a
-            # glob in $GITHUB_WORKSPACE/out for the case
-            # where the Pack step ran without the pre-copy
-            # (e.g. an older launcher version that has
-            # not been re-deployed).
-            artifact_dir="$GITHUB_WORKSPACE/out"
+            # pre_refactor: the launcher pre-copies the ZIP
+            # to `$GITHUB_WORKSPACE/toolbuild/artifact/<name>`
+            # in the Pack step. We deliberately point at
+            # the LVM-backed `toolbuild/artifact/` (NOT
+            # `$GITHUB_WORKSPACE/out/`) so the metadata
+            # read does not race the post-pack `cp -f`
+            # ENOSPC that 38604517142 hit on the root FS.
+            # The `toolbuild/artifact/` directory is on the
+            # LVM volume and has at least 25 GB free
+            # (enforced by the preflight step above), so a
+            # 6 GB Stable ZIP fits with a comfortable
+            # headroom.
+            artifact_dir="$GITHUB_WORKSPACE/toolbuild/artifact"
             if [[ -s bin/ddevice/output_zip.txt ]]; then
               recorded_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
               mapfile -t final_zips < <(find "$artifact_dir" -maxdepth 1 -type f -name "$recorded_name" -print 2>/dev/null)
@@ -2003,17 +2193,75 @@ jobs:
             --project stable \
             --message "DeadZone Stable ROM build cancelled." || true
 
+      - name: "📦 Upload final Stable ZIP as workflow artifact"
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          # The final ZIP lives at different paths depending on
+          # the engine layout:
+          #   * refactored: $GITHUB_WORKSPACE/toolbuild/out/DeadZone_Stable_<...>.zip
+          #     (the engine does not clean `out/`, so the ZIP
+          #     is still there at the end of the run)
+          #   * pre-refactor: $GITHUB_WORKSPACE/toolbuild/artifact/<name>
+          #     (the launcher pre-copied the ZIP there in the
+          #     "📦 Pack Stable ROM" step on the LVM-backed
+          #     build volume; `uploadROM.sh` cleaned
+          #     `$work_dir/out/`).
+          # We do NOT point at `$GITHUB_WORKSPACE/out/*.zip`
+          # any more: that path is on the ROOT filesystem,
+          # which has only ~100 MiB free after
+          # `easimon/maximize-build-space` carved /pv.img
+          # out of it. Run 38604517142 hit ENOSPC on the
+          # post-pack `cp` to that path even though the
+          # LVM build volume was at 99 GiB free; the ZIP
+          # is too large to ever live on the root FS.
+          # `actions/upload-artifact@v6` accepts multiple
+          # paths in a single upload, so we list the
+          # pre-refactor and refactored candidates and let
+          # the upload find the one that exists. The
+          # `if-no-files-found: error` guard fails the
+          # workflow when neither candidate exists, which
+          # is the right safety net for a "build succeeded"
+          # outcome that has no artifact to attach.
+          name: deadzone-stable-${{ env.DEADZONE_RESULT_NAME }}
+          path: |
+            toolbuild/out/DeadZone_Stable_*.zip
+            toolbuild/artifact/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: "📋 Upload debug logs"
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            toolbuild/build_action.log
+          retention-days: 1
+          if-no-files-found: ignore
+
       - name: "🧽 Cleanup Stable workspace"
         if: always()
         timeout-minutes: 5
         shell: bash
         run: |
           set -uo pipefail
-          # `toolbuild` may be busy if Maximize-build-space mounted an
-          # LVM volume on it, and `runtime` may not exist if the
-          # private-runtime checkout failed before completing. Both
-          # conditions are expected after a failed Stable build, so the
-          # cleanup is best-effort and never fails the job.
+          # `toolbuild` may be busy if Maximize-build-space
+          # mounted an LVM volume on it, and `runtime` may not
+          # exist if the private-runtime checkout failed before
+          # completing. Both conditions are expected after a
+          # failed Stable build, so the cleanup is best-effort
+          # and never fails the job.
+          #
+          # This step runs AFTER `📦 Upload final Stable ZIP`
+          # and `📋 Upload debug logs` so the uploaders can
+          # still find the final ZIP and the build log on
+          # the workspace. The original ordering had this
+          # cleanup BEFORE the uploaders, which made the
+          # upload steps fail with `if-no-files-found: error`
+          # on every successful build. (Precedents: 38604517142
+          # and 38610249902.) The order in YAML is the order
+          # in which the steps run.
           #
           # Build-reliability note (run 38444352495): a runner
           # that lost communication with the control plane in
@@ -2021,23 +2269,33 @@ jobs:
           # mounted and `build_action.log` truncated mid-line.
           # The cleanup therefore:
           #   1. unmounts `toolbuild` BEFORE removing it
-          #      (a leftover mount would surface as a confusing
-          #      `device or resource busy` in a later step or
-          #      in the next dispatch),
+          #      (a leftover mount would surface as a
+          #      confusing `device or resource busy` in a
+          #      later step or in the next dispatch),
           #   2. removes `runtime` so the next dispatch's
-          #      `actions/checkout@v5` for the private runtime
-          #      can re-create it from scratch (a stale
-          #      `runtime/build_stage.py` from a previous run
-          #      would otherwise leak state),
-          #   3. truncates `build_action.log` to zero (a stale
-          #      log from a prior failed run is uploaded by
-          #      the `📋 Upload debug logs` step on the next
-          #      dispatch if the file is large enough; a clean
-          #      truncation keeps the upload bounded),
+          #      `actions/checkout@v5` for the private
+          #      runtime can re-create it from scratch (a
+          #      stale `runtime/build_stage.py` from a
+          #      previous run would otherwise leak state),
+          #   3. truncates `build_action.log` to zero (a
+          #      stale log from a prior failed run is
+          #      uploaded by the `📋 Upload debug logs`
+          #      step on the next dispatch if the file is
+          #      large enough; a clean truncation keeps the
+          #      upload bounded),
           #   4. removes any leftover `liteengine` and
-          #      `out/` directories (the refactored layout's
-          #      sparse-checkout would otherwise re-checkout
-          #      the same files on the next dispatch).
+          #      `out/` directories (the refactored
+          #      layout's sparse-checkout would otherwise
+          #      re-checkout the same files on the next
+          #      dispatch),
+          #   5. removes the captured
+          #      `toolbuild/artifact/` directory that the
+          #      Pack step writes the final Stable ZIP to.
+          #      The capture directory lives on the LVM
+          #      build volume and is NOT cleaned by
+          #      `uploadROM.sh`; we drop it here so a
+          #      future dispatch does not see a stale ZIP
+          #      from a previous run.
           # The whole step is wrapped in `|| true` and a
           # 5-minute timeout so a stuck cleanup never blocks
           # the runner teardown.
@@ -2052,46 +2310,10 @@ jobs:
           fi
           rm -rf toolbuild runtime liteengine 2>/dev/null || true
           rm -rf out 2>/dev/null || true
+          rm -rf toolbuild/artifact 2>/dev/null || true
           rm -f toolbuild/rclone.conf 2>/dev/null || true
           : > build_action.log 2>/dev/null || true
           echo "Stable workspace cleanup complete"
-
-      - name: "📦 Upload final Stable ZIP as workflow artifact"
-        if: success()
-        uses: actions/upload-artifact@v6
-        with:
-          # The final ZIP lives at different paths depending on
-          # the engine layout:
-          #   * refactored: $GITHUB_WORKSPACE/toolbuild/out/DeadZone_Stable_<...>.zip
-          #     (the engine does not clean `out/`, so the ZIP
-          #     is still there at the end of the run)
-          #   * pre-refactor: $GITHUB_WORKSPACE/out/<name>
-          #     (the launcher pre-copied the ZIP there in the
-          #     "📦 Pack Stable ROM" step, because
-          #     `uploadROM.sh` cleaned `$work_dir/out/`)
-          # `actions/upload-artifact@v6` accepts multiple paths
-          # in a single upload, so we just point at both
-          # candidates and let the upload find the one that
-          # exists. The `if-no-files-found: error` guard fails
-          # the workflow when neither candidate exists, which
-          # is the right safety net for a "build succeeded"
-          # outcome that has no artifact to attach.
-          name: deadzone-stable-${{ env.DEADZONE_RESULT_NAME }}
-          path: |
-            toolbuild/out/DeadZone_Stable_*.zip
-            out/*.zip
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: "📋 Upload debug logs"
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: build-logs-${{ github.run_number }}
-          path: |
-            toolbuild/build_action.log
-          retention-days: 1
-          if-no-files-found: ignore
 
       - name: "📣 Build summary"
         if: always()
