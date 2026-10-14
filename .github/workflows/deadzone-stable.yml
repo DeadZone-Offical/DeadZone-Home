@@ -511,7 +511,28 @@ jobs:
           #      may ENOSPC if Maximize regressed. The 25 GB
           #      threshold stays enforced either way.
           build_mount_path="${{ github.workspace }}/toolbuild"
-          lvm_target="$(findmnt buildvg-buildlv -n -o TARGET 2>/dev/null || true)"
+          # Resolve the build filesystem via /proc/mounts (which is
+          # what `findmnt` and `mount` both read) so a misnamed or
+          # relabelled device node can still be located. The lookup
+          # tries, in order:
+          #   1. `findmnt -n -o TARGET buildvg-buildlv` (the canonical
+          #      Maximize-build-space device name)
+          #   2. `findmnt -n -o TARGET /dev/mapper/buildvg-buildlv`
+          #      (the absolute device path; some `findmnt` versions
+          #      resolve the symlink differently)
+          #   3. `mount | awk` against the device name and against
+          #      `/dev/mapper/buildvg-buildlv` (a defensive fallback
+          #      that does not depend on findmnt's device name
+          #      parsing at all).
+          # The first non-empty result wins.
+          lvm_target="$(
+            {
+              findmnt -n -o TARGET buildvg-buildlv 2>/dev/null
+              findmnt -n -o TARGET /dev/mapper/buildvg-buildlv 2>/dev/null
+              mount 2>/dev/null | awk '/(^|[ \t])(\/dev\/mapper\/)?buildvg-buildlv[ \t]/ {print $3}'
+            } | grep -v '^$' | head -n 1
+          )"
+          lvm_target="${lvm_target:-}"
           lvm_avail_gb=""
           if [[ -n "$lvm_target" ]]; then
             build_check_path="$lvm_target"
@@ -520,7 +541,8 @@ jobs:
           elif [[ -d "$build_mount_path" ]]; then
             build_check_path="$build_mount_path"
             lvm_avail_gb="$(df -Pk "$build_check_path" | awk 'NR==2 {printf "%d\n", $4 / 1024 / 1024}')"
-            echo "toolbuild directory exists but is not on the LVM volume; using $build_check_path with ${lvm_avail_gb} GB available. The maximize-build-space step did not produce a separate mount, so the workspace root will be the build filesystem."
+            mount_source="$(df -Pk "$build_check_path" | awk 'NR==2 {print $1}')"
+            echo "toolbuild directory exists with ${lvm_avail_gb} GB available (df source: ${mount_source}). The launcher could not resolve buildvg-buildlv via findmnt / mount, so it falls back to df on the toolbuild path. If the source contains 'mapper/buildvg' then the maximize-build-space step successfully mounted the LVM volume and the 25 GB threshold is being enforced against THAT volume; if not, the workspace root is the build filesystem."
           else
             build_check_path="${{ github.workspace }}"
             if [[ ! -d "$build_check_path" ]]; then
