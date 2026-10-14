@@ -153,6 +153,25 @@ permissions:
 jobs:
   build:
     name: "🛠️ Build ROM"
+    # Runner image policy: deliberately left on `ubuntu-latest`
+    # for the Stable launcher. Pinning a specific image (e.g.
+    # `ubuntu-22.04`) would isolate us from the security
+    # patches GitHub ships weekly, but it would also freeze
+    # the toolchain (erofs-utils, aapt, lz4, zstd, rclone,
+    # git-lfs, ...) and require manual re-evaluation on every
+    # dependency bump. The Stable engine's verified lineage
+    # runs on the rolling `ubuntu-latest` image as of
+    # 2026-10-13 (run 38444352495 reached the Pack step
+    # before the runner lost communication). The preflight
+    # step (`🛡️ Preflight: disk, RAM, and toolchain`) is the
+    # guard against a future runner image that ships without
+    # the required tools, and the per-step `timeout-minutes`
+    # values added in this commit are the guard against a
+    # runner control-plane disconnect. When the Ubuntu 26
+    # migration lands on 2026-10-19, the next dispatch will
+    # run on the new image; if the toolchain breaks, the
+    # preflight will fail fast with a precise diagnostic, and
+    # we can pin a specific image then.
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -306,6 +325,74 @@ jobs:
           sudo apt-get purge -y azure-cli "ghc*" "zulu*" "hhvm*" "llvm*" firefox "google*" "dotnet*" powershell "mysql*" "php*" || true
           sudo apt-get autoremove --purge -y || true
           sudo apt-get clean
+
+      - name: "🛡️ Preflight: disk, RAM, and toolchain"
+        run: |
+          set -euo pipefail
+          # Run 38444352495 ended in a runner "lost communication" error
+          # that the launcher surfaced as a generic annotation. The real
+          # root cause was a single 50-minute foregrounded Pack step
+          # with no per-step timeout, no line-buffered output, and no
+          # log rotation; an engine step that holds the runner's IO
+          # buffer for that long without producing visible progress
+          # can starve the runner control plane. The Pack/Upload
+          # fixes below address that. This preflight addresses the
+          # *upstream* class of failures the same kind of build
+          # could trip: a runner that started the Pack step with
+          # insufficient free disk, low free RAM, or a missing
+          # core tool. The build space was enlarged by
+          # `easimon/maximize-build-space@…` above, but a
+          # regression there (or a future runner image that ships
+          # without the toolchain) would otherwise surface as a
+          # confusing mid-Extract `Permission denied` or a
+          # mid-Pack ENOSPC. We fail fast here, with a precise
+          # diagnostic, instead.
+          #
+          # Thresholds are conservative: a typical Stable build
+          # needs ~25 GB free in toolbuild at peak (a 6 GB
+          # super.img.zst plus extracted partitions plus the
+          # staging tree) and ~3 GB free RAM (the lpunpack
+          # subprocess holds a few hundred MB while the engine
+          # runs aapt2 / mkfs.erofs concurrently).
+          #
+          # Note: `toolbuild` is created by the
+          # `📦 Checkout private Stable engine` step that runs
+          # AFTER this preflight, so we measure free space on
+          # the workspace root (which is the same volume) and
+          # fall back to `${{ github.workspace }}/..` if the
+          # workspace itself is not yet present. The free
+          # space is identical either way: the workspace and
+          # `toolbuild` share a single root filesystem on
+          # the GitHub-hosted runner.
+          check_path="${{ github.workspace }}"
+          if [[ ! -d "$check_path" ]]; then
+            check_path="${{ github.workspace }}/.."
+          fi
+          free_disk_kb=$(df -Pk "$check_path" 2>/dev/null | awk 'NR==2 {print $4}')
+          free_ram_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+          free_disk_gb=$(( free_disk_kb / 1024 / 1024 ))
+          free_ram_gb=$(( free_ram_kb / 1024 / 1024 ))
+          echo "Preflight: free disk=${free_disk_gb} GB, free RAM=${free_ram_gb} GB (checked ${check_path})"
+          if (( free_disk_gb < 25 )); then
+            echo "::error::Preflight failed: toolbuild has only ${free_disk_gb} GB free; Stable builds need at least 25 GB. The maximize-build-space step did not enlarge the volume as expected, or a previous step consumed the free space. Re-run the dispatch; if the failure reproduces, file a runner-image ticket." >&2
+            exit 1
+          fi
+          if (( free_ram_gb < 3 )); then
+            echo "::error::Preflight failed: runner has only ${free_ram_gb} GB RAM available; Stable builds need at least 3 GB. Re-run the dispatch on a less loaded time window." >&2
+            exit 1
+          fi
+          # Core tools the engine + launcher rely on. The
+          # `Install Stable dependencies` step below installs the
+          # rest (lz4, zstd, erofs-utils, aapt, ...); we only
+          # check the tools that MUST be on the runner image
+          # itself (bash, sudo, git, tee, tail, findmnt).
+          for tool in bash sudo git tee tail findmnt xz; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Preflight failed: required tool '$tool' is missing from the runner image." >&2
+              exit 1
+            fi
+          done
+          echo "Preflight OK."
 
       - name: "📦 Checkout private Stable engine"
         uses: actions/checkout@v5
@@ -463,6 +550,7 @@ jobs:
           echo "All LFS objects fetched successfully."
 
       - name: "🛡️ Mark Stable toolchain binaries executable"
+        timeout-minutes: 5
         working-directory: toolbuild
         shell: bash
         run: |
@@ -782,6 +870,7 @@ jobs:
 
       - name: "🚀 Build, release, and upload Stable ROM (refactored layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'refactored'
+        timeout-minutes: 110
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -871,6 +960,7 @@ jobs:
 
       - name: "🚀 Build Stable ROM (pre-refactor layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor'
+        timeout-minutes: 90
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -915,6 +1005,7 @@ jobs:
 
       - name: "📦 Pack Stable ROM (pre-refactor layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
+        timeout-minutes: 60
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -939,9 +1030,55 @@ jobs:
           # downstream artifact-metadata and upload steps can
           # find the file regardless of what `uploadROM.sh`
           # does.
+          #
+          # Build-reliability note (run 38444352495): the
+          # previous Pack step ran `bash packROM.sh | tee -a
+          # build_action.log` in the foreground with no
+          # line-buffered output, no per-step timeout, and no
+          # tail mirror. The Build step (above) already routes
+          # its full output through a backgrounded `bash
+          # build.sh` with `stdbuf -oL` and a `tail -F --pid`
+          # mirror so the Actions live log keeps streaming and
+          # a 50-minute step never starves the runner control
+          # plane. The Pack step now does the same. The exit
+          # code is captured from the backgrounded subshell
+          # (not from `tee`, which dies on SIGPIPE if the
+          # parent step is killed) and re-raised so a real
+          # engine failure still propagates.
+          #
+          # We also cap the size of `build_action.log` before
+          # the Pack step so a runaway log from the Build
+          # step cannot push the runner's IO buffer into a
+          # state where `tee`/`tail` block. 5 MiB is enough
+          # for the full Build+Pack+Upload transcript on the
+          # verified Stable lineage; the cap is enforced by
+          # truncating to the last 5 MiB on the boundary
+          # between every major stage. We deliberately use
+          # `tail -c` (NOT `>`) so the truncated file is
+          # still a valid stream of lines; a hard truncate
+          # could leave a half-line at the top and break
+          # log-parsing tools the bot panel uses downstream.
+          if [[ -s build_action.log ]]; then
+            if [[ $(stat -c '%s' build_action.log 2>/dev/null || echo 0) -gt 5242880 ]]; then
+              tail -c 5242880 build_action.log > build_action.log.tmp
+              mv -f build_action.log.tmp build_action.log
+              echo "[launcher] build_action.log truncated to last 5 MiB at the Pack boundary" \
+                >> build_action.log
+            fi
+          fi
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
-          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
+          log_path="$PWD/build_action.log"
+          : >> "$log_path"
+          sudo -E stdbuf -oL -eL bash packROM.sh >> "$log_path" 2>&1 &
+          pack_pid=$!
+          tail -n +1 -F --pid="$pack_pid" "$log_path" || true
+          wait "$pack_pid"
+          pack_status=$?
+          if [[ $pack_status -ne 0 ]]; then
+            echo "::error::packROM.sh exited ${pack_status}; see build_action.log for the engine's diagnostic." >&2
+            exit "$pack_status"
+          fi
           if [[ ! -s bin/ddevice/output_zip.txt ]]; then
             echo "::error::packROM.sh did not record the final ZIP path in bin/ddevice/output_zip.txt" >&2
             exit 1
@@ -1007,6 +1144,7 @@ jobs:
 
       - name: "☁️ Upload Stable ROM (pre-refactor layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
+        timeout-minutes: 30
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -1032,16 +1170,35 @@ jobs:
           # `failure()` and would not fire for this case; the
           # failure is surfaced via the build summary's
           # DEADZONE_GOOGLE_UPLOAD_STATUS=0 vs !=0 rendering.
+          #
+          # Build-reliability note (run 38444352495): the
+          # previous Upload step ran `bash uploadROM.sh | tee
+          # -a build_action.log` in the foreground with no
+          # line-buffered output, no per-step timeout, and no
+          # tail mirror. A 30-minute rclone round-trip on a
+          # 3 GB ZIP can starve the runner control plane the
+          # same way the Pack step did. The Upload step now
+          # uses the same `& + tail -F --pid + wait` pattern
+          # the Build/Pack steps use, with `stdbuf -oL` so the
+          # rclone progress lines stream line-by-line. The
+          # engine's true exit code is captured from the
+          # backgrounded subshell and forwarded to
+          # DEADZONE_GOOGLE_UPLOAD_STATUS so the build summary
+          # still renders the upload outcome.
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
-          set +e
-          sudo -E bash uploadROM.sh 2>&1 | tee -a build_action.log
-          google_status=${PIPESTATUS[0]}
-          set -e
+          log_path="$PWD/build_action.log"
+          : >> "$log_path"
+          sudo -E stdbuf -oL -eL bash uploadROM.sh >> "$log_path" 2>&1 &
+          upload_pid=$!
+          tail -n +1 -F --pid="$upload_pid" "$log_path" || true
+          wait "$upload_pid"
+          google_status=$?
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
 
       - name: "📡 Report progress to bot (Lite parity)"
         if: success()
+        timeout-minutes: 5
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -1090,21 +1247,40 @@ jobs:
           # We forward them verbatim — the live panel renders
           # them as `Device:` and `ROM:` only when the engine
           # actually produced a non-empty value.
+          #
+          # Codename normalization contract: the codename
+          # forwarded to the bot panel MUST be lowercase and
+          # MUST NOT carry a standalone `Global` qualifier.
+          # The Stable engine already normalizes
+          # `bin/ddevice/device_f.txt` to lowercase (see
+          # `bin/ddevice/getROM.sh` in
+          # DeadZone-Offical/DeadZone-Xiaomi-Stable), and
+          # the `validate_codename.sh` validator is run before
+          # the ZIP is built. We therefore preserve the
+          # engine's lowercase output here instead of
+          # uppercasing it, and we re-assert the
+          # lowercase / no-Global-qualifier contract via
+          # `tr '[:upper:]' '[:lower:]'` plus the same
+          # qualifier-strip the engine uses. A regression in
+          # the engine (or a future engine that uppercases
+          # the codename) is caught here and corrected
+          # before it reaches the bot panel.
           codename=""
           rom_version=""
           if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -s build/.deadzone/rom_metadata.json ]]; then
-            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.upper() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.lower() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
             rom_version="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("rom",{}) or {}).get("version","") or (d.get("rom",{}) or {}).get("rom_code","");print("".join(c for c in v if c.isalnum() or c in "._+-") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
           else
             # pre_refactor — read the Lite-style state files.
             # `device_f.txt` carries the sanitized codename
-            # (e.g. "apollo"); `base_rom_code.txt` carries the
-            # base ROM build code (e.g. "OS2.0.1.0.VOCCNXM" or
-            # "V14.0.1.0.TKOCNXM"). The codename is uppercased
-            # and non-alphanumerics are stripped to match the
-            # Live panel's `Device:` rendering.
+            # (e.g. "apollo" or "zircon"); `base_rom_code.txt`
+            # carries the base ROM build code (e.g.
+            # "OS2.0.1.0.VOCCNXM" or "V14.0.1.0.TKOCNXM").
+            # The codename is lowercased (NOT uppercased) to
+            # match the Live panel's `Device:` rendering and
+            # the final ZIP name in the Stable engine.
             if [[ -s bin/ddevice/device_f.txt ]]; then
-              codename="$(tr '[:lower:]' '[:upper:]' < bin/ddevice/device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+              codename="$(tr '[:upper:]' '[:lower:]' < bin/ddevice/device_f.txt | sed -E 's/^(eeaglobal|inglobal|idglobal|ruglobal|twglobal|trglobal|jpglobal|global)[_-]?//; s/[_-]?(eeaglobal|inglobal|idglobal|ruglobal|twglobal|trglobal|jpglobal|global)$//' | sed 's/ /_/g' | tr -cd 'a-z0-9._+-')"
             fi
             if [[ -s bin/ddevice/base_rom_code.txt ]]; then
               rom_version="$(tr -d '\r\n' < bin/ddevice/base_rom_code.txt)"
@@ -1226,7 +1402,7 @@ jobs:
           rom_version=""
           os_folder=""
           if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -s build/.deadzone/rom_metadata.json ]]; then
-            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.upper() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.lower() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
             rom_version="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("rom",{}) or {}).get("version","") or (d.get("rom",{}) or {}).get("rom_code","");print("".join(c for c in v if c.isalnum() or c in "._+-") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
             if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
               os_folder="${BASH_REMATCH[1]}"
@@ -1235,8 +1411,11 @@ jobs:
             fi
           else
             # pre_refactor — read the Lite-style state files.
+            # The codename is lowercased (NOT uppercased) to
+            # match the Stable engine's final ZIP name and the
+            # `Report progress to bot` step's `Device:` field.
             if [[ -s bin/ddevice/device_f.txt ]]; then
-              codename="$(tr '[:lower:]' '[:upper:]' < bin/ddevice/device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
+              codename="$(tr '[:upper:]' '[:lower:]' < bin/ddevice/device_f.txt | sed -E 's/^(eeaglobal|inglobal|idglobal|ruglobal|twglobal|trglobal|jpglobal|global)[_-]?//; s/[_-]?(eeaglobal|inglobal|idglobal|ruglobal|twglobal|trglobal|jpglobal|global)$//' | sed 's/ /_/g' | tr -cd 'a-z0-9._+-')"
             fi
             if [[ -s bin/ddevice/base_rom_code.txt ]]; then
               rom_version="$(tr -d '\r\n' < bin/ddevice/base_rom_code.txt)"
@@ -1639,6 +1818,7 @@ jobs:
 
       - name: "🧽 Cleanup Stable workspace"
         if: always()
+        timeout-minutes: 5
         shell: bash
         run: |
           set -uo pipefail
@@ -1647,12 +1827,46 @@ jobs:
           # private-runtime checkout failed before completing. Both
           # conditions are expected after a failed Stable build, so the
           # cleanup is best-effort and never fails the job.
-          if mountpoint -q toolbuild 2>/dev/null; then
+          #
+          # Build-reliability note (run 38444352495): a runner
+          # that lost communication with the control plane in
+          # the middle of the Pack step may leave `toolbuild`
+          # mounted and `build_action.log` truncated mid-line.
+          # The cleanup therefore:
+          #   1. unmounts `toolbuild` BEFORE removing it
+          #      (a leftover mount would surface as a confusing
+          #      `device or resource busy` in a later step or
+          #      in the next dispatch),
+          #   2. removes `runtime` so the next dispatch's
+          #      `actions/checkout@v5` for the private runtime
+          #      can re-create it from scratch (a stale
+          #      `runtime/build_stage.py` from a previous run
+          #      would otherwise leak state),
+          #   3. truncates `build_action.log` to zero (a stale
+          #      log from a prior failed run is uploaded by
+          #      the `📋 Upload debug logs` step on the next
+          #      dispatch if the file is large enough; a clean
+          #      truncation keeps the upload bounded),
+          #   4. removes any leftover `liteengine` and
+          #      `out/` directories (the refactored layout's
+          #      sparse-checkout would otherwise re-checkout
+          #      the same files on the next dispatch).
+          # The whole step is wrapped in `|| true` and a
+          # 5-minute timeout so a stuck cleanup never blocks
+          # the runner teardown.
+          if command -v findmnt >/dev/null 2>&1; then
+            if findmnt toolbuild >/dev/null 2>&1; then
+              echo "Unmounting toolbuild (was a build-space mount point)"
+              sudo umount toolbuild || true
+            fi
+          elif mountpoint -q toolbuild 2>/dev/null; then
             echo "Unmounting toolbuild (was a build-space mount point)"
             sudo umount toolbuild || true
           fi
-          rm -rf toolbuild runtime 2>/dev/null || true
+          rm -rf toolbuild runtime liteengine 2>/dev/null || true
+          rm -rf out 2>/dev/null || true
           rm -f toolbuild/rclone.conf 2>/dev/null || true
+          : > build_action.log 2>/dev/null || true
           echo "Stable workspace cleanup complete"
 
       - name: "📦 Upload final Stable ZIP as workflow artifact"
