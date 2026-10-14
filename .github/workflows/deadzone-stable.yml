@@ -1096,6 +1096,71 @@ jobs:
           fi
           rclone version
 
+      - name: "🛠️ Install Android SDK build-tools 34.0.0 (apksigner, zipalign, aapt2)"
+        working-directory: toolbuild
+        run: |
+          set -euo pipefail
+          # The Stable engine's bin/modfile/UpdateFile/system/
+          # DeadZone_ExternalStorageProvider/update.sh and
+          # bin/modfile/UpdateFile/system_ext/DeadZone_Provision/
+          # A16/provision_patch.py hardcode
+          #   $ANDROID_BUILD_TOOLS:/$HOME/android-sdk/build-tools/34.0.0
+          # for `zipalign`, `apksigner`, and `aapt2`. Without this
+          # step, the build aborts with
+          # `error: missing required tool: .../build-tools/34.0.0/zipalign`
+          # the first time a mod that needs to rebuild an APK runs.
+          # We install only the build-tools 34.0.0 subpackage
+          # (smallest possible payload) and a platform-tools jar
+          # mirror is not required: every mod uses cmdline-tools'
+          # sdkmanager to install build-tools into a per-runner
+          # $HOME/android-sdk, which is exactly what the scripts
+          # expect.
+          ANDROID_SDK_ROOT="$HOME/android-sdk"
+          BUILD_TOOLS_VERSION="34.0.0"
+          export ANDROID_SDK_ROOT
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          # Stable `HOME` on a hosted runner is /home/runner. The
+          # cmdline-tools tarball is small (~150 MB) and the
+          # install is idempotent: sdkmanager skips any package
+          # already at the expected version.
+          CMDLINE_TOOLS_VERSION="11076708"
+          CMDLINE_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_TOOLS_VERSION}_latest.zip"
+          CMDLINE_TOOLS_DIR="$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          if [[ ! -x "$CMDLINE_TOOLS_DIR/bin/sdkmanager" ]]; then
+            tmp_zip="$(mktemp -t cmdline-tools-XXXXXX.zip)"
+            echo "Fetching Android cmdline-tools ${CMDLINE_TOOLS_VERSION}..."
+            curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+              --connect-timeout 30 --max-time 600 \
+              -o "$tmp_zip" "$CMDLINE_TOOLS_URL"
+            unzip -q "$tmp_zip" -d "$ANDROID_SDK_ROOT/cmdline-tools/"
+            # The zip extracts to cmdline-tools/cmdline-tools/;
+            # sdkmanager expects cmdline-tools/latest/.
+            rm -rf "$CMDLINE_TOOLS_DIR"
+            mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$CMDLINE_TOOLS_DIR"
+            rm -f "$tmp_zip"
+          fi
+          export PATH="$CMDLINE_TOOLS_DIR/bin:$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}:$PATH"
+          if [[ ! -x "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/zipalign" ]]; then
+            echo "Installing Android build-tools ${BUILD_TOOLS_VERSION}..."
+            yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+              --install "build-tools;${BUILD_TOOLS_VERSION}" >/dev/null
+          fi
+          for tool in zipalign apksigner aapt2; do
+            tool_path="$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/${tool}"
+            if [[ ! -x "$tool_path" ]]; then
+              echo "::error::Android build-tools ${BUILD_TOOLS_VERSION} is missing ${tool} at ${tool_path}"
+              exit 1
+            fi
+            "$tool_path" version >/dev/null 2>&1 \
+              || echo "::notice::${tool} did not respond to 'version' subcommand (often a warning, not a failure)"
+          done
+          # Persist for the subsequent Build / Pack / Upload steps.
+          {
+            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+            echo "ANDROID_BUILD_TOOLS=${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS_VERSION}"
+          } >> "$GITHUB_ENV"
+          echo "Android build-tools ${BUILD_TOOLS_VERSION} ready at ${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS_VERSION}"
+
       - name: "🚀 Build, release, and upload Stable ROM (refactored layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'refactored'
         timeout-minutes: 110
