@@ -35,12 +35,22 @@ jobs:
           set -euo pipefail
           # The launcher must use per-ref concurrency with cancel-in-progress: true
           # to prevent parallel runs on the same ref from racing on the LVM volume.
-          if ! grep -q "^  group: deadzone-home-stable-\${{ github.workflow }}-\${{ github.ref }}" \
+          # GitHub substitutes '${{ ... }}' inside the run block BEFORE bash sees
+          # the command, so a literal '${{ ... }}' in a grep -E pattern would
+          # never reach grep. Use grep -F (fixed string) with the same
+          # '${{ ... }}' markup the launcher workflow uses (which is what
+          # survives substitution in the deadzone-stable.yml file on disk).
+          if ! grep -Fq '${{ github.workflow }}-${{ github.ref }}' \
               .github/workflows/deadzone-stable.yml; then
               echo "::error::deadzone-stable.yml: concurrency group key is not per-ref" >&2
               exit 1
           fi
-          if ! grep -q "^  cancel-in-progress: true" \
+          if ! grep -q '^  group: deadzone-home-stable-' \
+              .github/workflows/deadzone-stable.yml; then
+              echo "::error::deadzone-stable.yml: concurrency group key is not under the deadzone-home-stable- namespace" >&2
+              exit 1
+          fi
+          if ! grep -q '^  cancel-in-progress: true' \
               .github/workflows/deadzone-stable.yml; then
               echo "::error::deadzone-stable.yml: concurrency does not have cancel-in-progress: true" >&2
               exit 1
