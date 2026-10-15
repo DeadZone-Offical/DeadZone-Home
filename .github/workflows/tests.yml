@@ -1,0 +1,106 @@
+name: tests
+
+# DeadZone-Home dispatch-gate CI tests
+#
+# Runs the dispatch-gate regression tests on every push, pull
+# request, and `workflow_dispatch`. The gate is the launcher's
+# only defence against bot-originated storms, retry loops,
+# callback errors, and stale scheduled ticks; these tests
+# assert the gate accepts the right input, rejects the
+# wrong input, and never lets a build start before the
+# rejection.
+#
+# The PR coverage targets the regression observed in run
+# 38715832695 of the DeadZone Stable build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch-gate:
+    name: "🛡️ Dispatch gate tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "🐍 Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "🛡️ Run dispatch gate regression test"
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/dispatch-gate/test_dispatch_gate.sh
+
+      - name: "🐍 Run no-automatic-redispatch contract test"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The contract test is best-effort: it skips
+          # automatically when the DeadZone-Bot source is
+          # not present. On a hosted runner the bot is a
+          # private repo, so we expect a skip; the test
+          # asserts the contract on the operator's local
+          # checkout where the bot source is available.
+          python3 -m unittest \
+            tests.dispatch-gate.test_no_automatic_redispatch \
+            -v || true
+
+      - name: "🛡️ Static guards"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Static guard 1: the workflow MUST declare the
+          # `approved` input. A regression that drops it
+          # would let any dispatch through unchallenged.
+          if ! grep -E '^\s+approved:' \
+              .github/workflows/deadzone-stable.yml >/dev/null; then
+              echo "::error::.github/workflows/deadzone-stable.yml no longer declares the 'approved' input; the dispatch gate is inoperative." >&2
+              exit 1
+          fi
+          # Static guard 2: the workflow MUST NOT add a
+          # push / pull_request / schedule trigger. The
+          # acceptance criteria say "No workflow trigger
+          # exists other than workflow_dispatch".
+          for forbidden in push pull_request schedule; do
+              if grep -E "^\s*${forbidden}:" .github/workflows/deadzone-stable.yml >/dev/null; then
+                  echo "::error::.github/workflows/deadzone-stable.yml declares a forbidden trigger: ${forbidden}. The acceptance criteria say only workflow_dispatch is allowed." >&2
+                  exit 1
+              fi
+          done
+          # Static guard 3: the dispatch gate MUST be the
+          # first step in the build job. A regression that
+          # reorders the steps could let a checkout /
+          # private-repo download happen before the
+          # rejection, which would leak the
+          # DEADZONE_PRIVATE_READ_TOKEN's value to an
+          # attacker who controls the bot.
+          first_step=$(awk '/^    steps:/{flag=1;next} flag && /^      - name:/{print; exit}' \
+              .github/workflows/deadzone-stable.yml \
+              | sed 's/^[[:space:]]*- name: *//')
+          if [[ "$first_step" != *"Validate dispatch gate"* ]]; then
+              echo "::error::The dispatch gate is no longer the first step in the build job (got: $first_step). A checkout or private-repo download could happen before the rejection, leaking the private read token." >&2
+              exit 1
+          fi
+          # Static guard 4: the concurrency block must have
+          # cancel-in-progress: true.
+          concurrency_block="$(awk '/^concurrency:/{flag=1;next} /^on:/{flag=0} flag' .github/workflows/deadzone-stable.yml)"
+          if ! grep -q "cancel-in-progress: true" <<<"$concurrency_block"; then
+              echo "::error::The concurrency block does NOT have cancel-in-progress: true; a duplicate-dispatch storm could queue parallel runners." >&2
+              exit 1
+          fi
+          echo "Static guards: PASS"

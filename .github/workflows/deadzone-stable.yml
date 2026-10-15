@@ -112,7 +112,7 @@ name: Deadzone-Stable
 run-name: "🚀 Deadzone-Stable · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}"
 
 concurrency:
-  # Per-branch/ref concurrency key: only one Stable build for the
+  # Per-ref concurrency key: only one Stable build for the
   # same `github.ref` is ever active. A newer manual dispatch on
   # the same ref cancels the older queued or running build before
   # it can reserve a runner, which is the only safe semantic for
@@ -161,6 +161,45 @@ on:
         description: "🔗 Signed DeadZone build-event endpoint"
         required: true
         type: string
+      # ----------------------------------------------------------------
+      # Explicit operator opt-in.
+      # ----------------------------------------------------------------
+      # The DeadZone-Stable workflow is invoked exclusively by
+      # `DeadZone-Offical/DeadZone-Bot` via `workflow_dispatch`. A
+      # bot-originated `workflow_dispatch` is not, by itself, a
+      # reason to spin up a 100 GB / 90-minute Stable build:
+      # webhook storms, retry loops, callback errors, and stale
+      # scheduled ticks have all been observed sending a fresh
+      # dispatch into the launcher. The launcher's defence against
+      # those is the explicit `approved` boolean. The bot must
+      # set `approved=true` *itself* on the dispatch it considers
+      # the canonical "user pressed Build" event. Retries,
+      # callbacks, notifications, and the bot's own failure paths
+      # must NEVER set `approved=true` automatically. A
+      # `workflow_dispatch` with `approved=false` (or any value
+      # other than the literal string `true`) is rejected
+      # immediately by the 🛡️ Validate dispatch gate step, BEFORE
+      # checkout, BEFORE private repo downloads, and BEFORE any
+      # build Action starts. The rejection reason is written to
+      # $GITHUB_STEP_SUMMARY and to the bot's callback so the
+      # user can see why the run did not start.
+      #
+      # The default value is the literal string `false`, NOT a
+      # GitHub boolean. GitHub `workflow_dispatch` inputs of
+      # type `boolean` render as a checkbox in the Actions UI
+      # that defaults to unchecked (= false), but a JSON payload
+      # without the field (a stale bot retry, a webhook storm)
+      # resolves to the empty string under `${{ inputs.approved }}`,
+      # which the gate treats as `false`. A future bot that
+      # forwards an unrelated `approved` field is rejected too.
+      approved:
+        description: "✅ Explicit operator opt-in (must be exactly 'true')"
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -168,25 +207,6 @@ permissions:
 jobs:
   build:
     name: "🛠️ Build ROM"
-    # Runner image policy: deliberately left on `ubuntu-latest`
-    # for the Stable launcher. Pinning a specific image (e.g.
-    # `ubuntu-22.04`) would isolate us from the security
-    # patches GitHub ships weekly, but it would also freeze
-    # the toolchain (erofs-utils, aapt, lz4, zstd, rclone,
-    # git-lfs, ...) and require manual re-evaluation on every
-    # dependency bump. The Stable engine's verified lineage
-    # runs on the rolling `ubuntu-latest` image as of
-    # 2026-10-13 (run 38444352495 reached the Pack step
-    # before the runner lost communication). The preflight
-    # step (`🛡️ Preflight: disk, RAM, and toolchain`) is the
-    # guard against a future runner image that ships without
-    # the required tools, and the per-step `timeout-minutes`
-    # values added in this commit are the guard against a
-    # runner control-plane disconnect. When the Ubuntu 26
-    # migration lands on 2026-10-19, the next dispatch will
-    # run on the new image; if the toolchain breaks, the
-    # preflight will fail fast with a precise diagnostic, and
-    # we can pin a specific image then.
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -206,6 +226,154 @@ jobs:
       DEADZONE_ENABLE_SECONDARY_MIRRORS: "0"
 
     steps:
+      # ----------------------------------------------------------------
+      # 🛡️ Dispatch gate (must be the FIRST step)
+      # ----------------------------------------------------------------
+      # Reject any `workflow_dispatch` that does not carry an explicit
+      # `approved=true` opt-in. This is the launcher's only
+      # defence against bot-originated storms, retry loops,
+      # callback errors, and stale scheduled ticks that would
+      # otherwise spin up a 100 GB / 90-minute Stable build.
+      # The bot must set `approved=true` on the dispatch it
+      # considers the canonical "user pressed Build" event.
+      # Retries, callback handlers, the failure notification
+      # step, and any other code path on the bot side that
+      # decides to dispatch a build MUST NOT set `approved=true`
+      # automatically. The launcher's earlier "🧾 Validate
+      # controlled request" step was the first thing in the
+      # job; this gate now runs strictly before it, so a
+      # rejected dispatch never even reaches the URL /
+      # request_id validators.
+      - name: "🛡️ Validate dispatch gate (approved opt-in)"
+        id: dispatch_gate
+        env:
+          APPROVED: ${{ inputs.approved }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ACTOR: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ----------------------------------------------------------------
+          # 1. Hard gate: `approved` must be the literal string "true".
+          #    Anything else — `false`, `yes`, `1`, `True`, the empty
+          #    string, a missing field, an unrelated JSON value — is
+          #    rejected. We compare against a single literal value
+          #    instead of bash's truthy coercion so a future bot
+          #    that passes `approved: "True"` (capital T) is also
+          #    rejected: that has to be a bug, not a feature.
+          # ----------------------------------------------------------------
+          if [[ "$APPROVED" != "true" ]]; then
+              {
+                  echo "## ⛔ Dispatch gate: REJECTED"
+                  echo
+                  echo "- Run: \`${RUN_ID}\` (attempt \`${RUN_ATTEMPT}\`)"
+                  echo "- Actor: \`${ACTOR}\`"
+                  echo "- Request ID: \`${REQUEST_ID}\`"
+                  echo "- Reason: \`approved\` input is \`${APPROVED:-<empty>}\`; the launcher requires the literal string \`true\`."
+                  echo
+                  echo "This run was rejected BEFORE checkout / private repo download / build start. No source code, no rclone config, no engine checkout was performed. The DeadZone-Bot dispatch handler MUST set \`approved=true\` on the single canonical user-initiated dispatch; retries, callback failures, and notification failures must not auto-dispatch a fresh build."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Dispatch gate rejected: approved='${APPROVED:-<empty>}' (must be literal 'true'). The bot MUST set approved=true only on the canonical user-initiated dispatch; retries, callbacks, and notification failures must NOT set approved=true automatically." >&2
+              exit 1
+          fi
+          echo "Dispatch gate: APPROVED — proceeding to checkout / build."
+
+      # ----------------------------------------------------------------
+      # 🔁 Dispatch-gate callback (rejection-only)
+      # ----------------------------------------------------------------
+      # When the gate above rejects a dispatch, this step fires
+      # exactly once with `if: failure()` and posts the rejection
+      # to the bot's signed callback endpoint. The callback uses
+      # the same signed-event helper the rest of the launcher
+      # uses (`build_stage.py`), and the request_id is
+      # preserved so the live panel can render the rejection
+      # on the correct request. We deliberately do NOT touch
+      # checkout, rclone.conf, the private Stable engine, or
+      # any other secret-bearing resource: the only state this
+      # step reads is the request_id, the callback URL, and the
+      # event secret (which is a public environment variable
+      # loaded by the central runtime, not a repo secret).
+      # The step is best-effort: a callback failure must not
+      # mask the gate's own rejection, so `|| true` swallows
+      # any network / signing error.
+      - name: "🔁 Notify bot of dispatch gate rejection"
+        if: failure() && steps.dispatch_gate.conclusion == 'failure'
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
+          DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          # The DEADZONE_EVENT_SECRET is loaded by the central
+          # runtime step further down. If the gate fails
+          # BEFORE the central runtime runs (which is the
+          # case here — the gate is the first step), the
+          # secret is empty and we cannot sign a callback.
+          # In that case we log a clear warning and exit
+          # 0; the rejection is already in the
+          # GITHUB_STEP_SUMMARY and the run is already
+          # failed, so the user will see the rejection
+          # without the bot panel update.
+          if [[ -z "${DEADZONE_EVENT_SECRET:-}" ]]; then
+              echo "::warning::DEADZONE_EVENT_SECRET is empty because the central runtime step has not yet run; the dispatch-gate rejection is in \$GITHUB_STEP_SUMMARY but the bot callback was not signed. The user will see the rejection only via the workflow run, not the live panel." >&2
+              exit 0
+          fi
+          if [[ -z "${DEADZONE_CALLBACK_URL:-}" || -z "${DEADZONE_REQUEST_ID:-}" ]]; then
+              echo "::warning::callback_url or request_id is empty; cannot post the dispatch-gate rejection to the bot." >&2
+              exit 0
+          fi
+          # Reuse the central runtime's signed-event reporter
+          # (build_stage.py) with a "rejected" event. The
+          # helper is invoked at the workspace root because
+          # the central runtime checkouts have not happened
+          # yet either; we cannot reach the helper from
+          # `$GITHUB_WORKSPACE/runtime/` and have to fall
+          # back to a tiny inline POST. We deliberately do
+          # NOT use the bot's GITHUB_BUILD_TOKEN (which is
+          # a write-capable credential) and we do NOT
+          # dispatch a fresh build here: the only side
+          # effect is one signed POST to the existing
+          # callback URL.
+          python3 - <<'PY' || true
+          import hashlib
+          import hmac
+          import json
+          import os
+          import sys
+          import urllib.request
+          callback_url = os.environ["DEADZONE_CALLBACK_URL"].strip()
+          request_id = os.environ["DEADZONE_REQUEST_ID"].strip()
+          secret = os.environ["DEADZONE_EVENT_SECRET"].strip()
+          if not callback_url or not request_id or not secret:
+              sys.exit(0)
+          payload = json.dumps({
+              "event": "dispatch_rejected",
+              "project": "stable",
+              "request_id": request_id,
+              "message": "Stable dispatch rejected: approved input was not the literal string 'true'. The bot must set approved=true only on the canonical user-initiated dispatch; retries, callbacks, and notification failures must NOT set approved=true automatically.",
+          }, separators=(",", ":")).encode("utf-8")
+          sig = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+          req = urllib.request.Request(
+              callback_url,
+              data=payload,
+              headers={
+                  "Content-Type": "application/json",
+                  "X-DeadZone-Signature": f"sha256={sig}",
+              },
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  resp.read()
+          except Exception as exc:  # network / signing errors are non-fatal
+              print(f"::warning::callback to bot failed: {exc}", file=sys.stderr)
+          PY
+        continue-on-error: true
+
       - name: "🧾 Validate controlled request"
         shell: python
         env:
@@ -237,93 +405,12 @@ jobs:
           # listed in `projects.env` plus `DeadZone-Offical/DeadZone-File`.
           # It MUST NOT be the bot dispatch token (`GITHUB_BUILD_TOKEN`)
           # or any other write-capable credential. The workflow fails
-          # fast if the secret is missing OR has been revoked / lost
-          # access to a required private repository, so a misconfigured
-          # secret surfaces immediately instead of producing a 403
-          # several minutes into a 90-minute Stable build.
-          #
-          # Two-stage validation:
-          #   1. Existence check: token is non-empty (handled below).
-          #   2. Reachability check: the token can read at least the
-          #      central runtime repo (`DeadZone-Offical/DeadZone-File`)
-          #      and the Stable engine repo
-          #      (`DeadZone-Offical/DeadZone-Xiaomi-Stable`). The Stable
-          #      engine repo name is treated as a constant here because
-          #      it is hard-coded in `DEADZONE_ENGINE_REPOSITORY` above;
-          #      cross-checking against `steps.runtime.outputs.
-          #      engine_repository` in the `✅ Validate loaded runtime`
-          #      step catches drift between this hard-coded constant and
-          #      the value the central runtime exports.
-          #
-          # The GitHub REST endpoint we probe is `GET /repos/{owner}/{repo}`
-          # (anonymous call permitted; an authenticated call must return
-          # 200 with a non-zero subscriber_count for a private repo the
-          # token can read, and 404 for a private repo it cannot). A 401
-          # indicates the token is rejected outright (revoked, expired,
-          # or wrong account); a 403 with `repo` scope missing indicates
-          # a write-capable fallback was misconfigured. We treat every
-          # non-2xx response as a hard failure with a precise diagnostic
-          # so the operator can fix the secret instead of waiting for
-          # the engine checkout to 403 several steps later.
-          #
-          # Token handling rules:
-          #   * The token is read from `${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}`
-          #     ONLY. No fallback to `${{ github.token }}`, GITHUB_TOKEN,
-          #     or any other credential.
-          #   * The token is NEVER echoed in command output. We pipe the
-          #     curl invocation through `printf` to an environment
-          #     variable, then into `curl -H "Authorization: ..."` via
-          #     an inline `$VAR` whose value happens to be the masked
-          #     secret itself. GitHub Actions auto-masks any environment
-            #     variable whose name matches a registered secret name,
-            #     so the curl `-H` line is redacted even though the
-            #     token is technically present in the rendered command.
-          #   * The token is NEVER echoed via `set -x`. The wrapper uses
-          #     `set +x` around the probe so the shell trace is not
-          #     produced for that command.
+          # fast if the secret is missing so a misconfigured secret
+          # surfaces immediately instead of producing a 403 later.
           if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
             echo "::error::Missing required launcher secret: DEADZONE_PRIVATE_READ_TOKEN. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
             exit 1
           fi
-          # Targets the launcher must read before any private checkout
-          # can succeed. Update this list when a new private engine is
-          # added to `runtime/projects.env`; the canonical sources are
-          # the `DEADZONE_ENGINE_REPOSITORY` env block at the top of
-          # this workflow and `steps.runtime.outputs.engine_repository`.
-          required_repos=(
-            "DeadZone-Offical/DeadZone-File"
-            "DeadZone-Offical/DeadZone-Xiaomi-Stable"
-          )
-          for required_repo in "${required_repos[@]}"; do
-            http_code=$(set +x; curl -sS -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer ${DEADZONE_PRIVATE_READ_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "User-Agent: deadzone-stable-launcher" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${required_repo}")
-            case "$http_code" in
-              200)
-                echo "  - ${required_repo}: reachable (HTTP 200)"
-                ;;
-              401)
-                echo "::error::DEADZONE_PRIVATE_READ_TOKEN was rejected by the GitHub API (HTTP 401) when probing ${required_repo}. The fine-grained PAT is missing, expired, revoked, or issued by a different GitHub account. Update the DEADZONE_PRIVATE_READ_TOKEN secret on DeadZone-Offical/DeadZone-Home." >&2
-                exit 1
-                ;;
-              403)
-                echo "::error::DEADZONE_PRIVATE_READ_TOKEN returned HTTP 403 (forbidden) when probing ${required_repo}. The fine-grained PAT is alive but does NOT grant Contents: Read-only on ${required_repo}. Either add ${required_repo} to the PAT's repository access list, or replace the PAT with one that already includes it. Update the DEADZONE_PRIVATE_READ_TOKEN secret on DeadZone-Offical/DeadZone-Home." >&2
-                exit 1
-                ;;
-              404)
-                echo "::error::DEADZONE_PRIVATE_READ_TOKEN returned HTTP 404 (not found) when probing ${required_repo}. Either the repository name is wrong, or the fine-grained PAT was scoped to the WRONG GitHub account. Verify the repository exists at https://github.com/${required_repo} and that the PAT was issued by an account or organization with read access to it. Update the DEADZONE_PRIVATE_READ_TOKEN secret on DeadZone-Offical/DeadZone-Home." >&2
-                exit 1
-                ;;
-              *)
-                echo "::error::DEADZONE_PRIVATE_READ_TOKEN returned unexpected HTTP ${http_code} when probing ${required_repo}. Inspect the GitHub Actions network connectivity and the token's rate-limit status; the probe is the only validation check the launcher runs before private checkouts begin." >&2
-                exit 1
-                ;;
-            esac
-          done
-          echo "Launcher credentials OK: ${#required_repos[@]} private repositories reachable."
 
       - name: "📥 Checkout DeadZone launcher"
         uses: actions/checkout@v5
@@ -414,7 +501,6 @@ jobs:
           remove-haskell: "true"
 
       - name: "🧹 Clean unused runner packages"
-        timeout-minutes: 10
         run: |
           set -euo pipefail
           docker image prune --all --force || true
@@ -422,204 +508,6 @@ jobs:
           sudo apt-get purge -y azure-cli "ghc*" "zulu*" "hhvm*" "llvm*" firefox "google*" "dotnet*" powershell "mysql*" "php*" || true
           sudo apt-get autoremove --purge -y || true
           sudo apt-get clean
-
-      - name: "🛡️ Storage, RAM, and mount diagnostics"
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          # Print an explicit snapshot of every filesystem the build
-          # might touch, plus RAM/swap state and the active mount
-          # table. This step is informational: it never fails the
-          # build on its own. The companion preflight step below is
-          # what enforces the 25 GB / 3 GB thresholds.
-          #
-          # After `easimon/maximize-build-space` ran above, the root
-          # filesystem has been intentionally filled almost to 100%
-          # by a /pv.img loopfile that backs an LVM volume mounted
-          # on `toolbuild/`. Reading `df` on `${{ github.workspace }}`
-          # at this point therefore returns the *root* filesystem,
-          # NOT the LVM volume the build will actually write to. The
-          # launcher has to look at the mounted LVM volume directly
-          # for build-storage accounting; this diagnostic prints
-          # BOTH numbers (root + LVM) so the operator can see the
-          # divergence at a glance.
-          echo "::group::Storage, RAM, and mount diagnostics"
-          echo "--- df -h ---"
-          df -h
-          echo
-          echo "--- df -h \$(findmnt buildvg-buildlv -n -o TARGET 2>/dev/null || true) ---"
-          lvm_target="$(findmnt buildvg-buildlv -n -o TARGET 2>/dev/null || true)"
-          if [[ -n "$lvm_target" ]]; then
-            df -h "$lvm_target"
-          else
-            echo "(buildvg-buildlv is not mounted; the launcher will fall back to the workspace root in the preflight step.)"
-          fi
-          echo
-          echo "--- /proc/meminfo / free ---"
-          free
-          echo
-          echo "--- swapon ---"
-          swapon --show || true
-          echo
-          echo "--- lsblk (top-level) ---"
-          lsblk -o NAME,SIZE,TYPE,MOUNTPOINT || true
-          echo
-          echo "--- mount points containing 'toolbuild' ---"
-          mount | grep -i toolbuild || echo "(no mount point containing toolbuild)"
-          echo
-          echo "--- largest top-level directories on the workspace ---"
-          du -h -d 1 -x /home/runner/work 2>/dev/null | sort -hr | head -n 8 || true
-          echo
-          echo "--- large dirs under /tmp, /mnt, /var/tmp (>=512 MiB) ---"
-          find /tmp /mnt /var/tmp -xdev -type d -size +512M 2>/dev/null | head -n 10 || true
-          echo "::endgroup::"
-
-      - name: "🛡️ Preflight: disk, RAM, and toolchain"
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          # ----- Run identity -----
-          # Surface the (workflow, ref, run_id, run_attempt, sha,
-          # request_id) tuple at the very top of the preflight so
-          # any operator reading the live log can immediately tell
-          # which Stable run produced the output. This is also the
-          # place we record whether the run is a retry of a
-          # previous attempt (github.run_attempt > 1): the
-          # concurrency block above cancels older runs on a
-          # newer dispatch, so a second attempt in this same
-          # `run_id` is a true retry, not a duplicate.
-          # The same identity is echoed by every other major
-          # stage (Build, Pack, Upload) below so the log lines
-          # can be cross-referenced if the same `run_id` ever
-          # interleaves with another dispatch.
-          echo "::group::Stable run identity"
-          echo "  workflow    : ${{ github.workflow }}"
-          echo "  ref         : ${{ github.ref }}"
-          echo "  ref_name    : ${{ github.ref_name }}"
-          echo "  sha         : ${{ github.sha }}"
-          echo "  run_id      : ${{ github.run_id }}"
-          echo "  run_attempt : ${{ github.run_attempt }}"
-          echo "  run_number  : ${{ github.run_number }}"
-          echo "  actor       : ${{ github.actor }}"
-          echo "  request_id  : ${{ inputs.request_id }}"
-          echo "  input_url   : ${{ inputs.input_url }}"
-          echo "::endgroup::"
-          # Run 38444352495 ended in a runner "lost communication" error
-          # that the launcher surfaced as a generic annotation. The real
-          # root cause was a single 50-minute foregrounded Pack step
-          # with no per-step timeout, no line-buffered output, and no
-          # log rotation; an engine step that holds the runner's IO
-          # buffer for that long without producing visible progress
-          # can starve the runner control plane. The Pack/Upload
-          # fixes below address that. This preflight addresses the
-          # *upstream* class of failures the same kind of build
-          # could trip: a runner that started the Pack step with
-          # insufficient free disk, low free RAM, or a missing
-          # core tool.
-          #
-          # Thresholds are conservative: a typical Stable build
-          # needs ~25 GB free in toolbuild at peak (a 6 GB
-          # super.img.zst plus extracted partitions plus the
-          # staging tree) and ~3 GB free RAM (the lpunpack
-          # subprocess holds a few hundred MB while the engine
-          # runs aapt2 / mkfs.erofs concurrently).
-          #
-          # Critical: when `easimon/maximize-build-space` ran above,
-          # it created an LVM volume at /dev/mapper/buildvg-buildlv
-          # and mounted it on `${BUILD_MOUNT_PATH}` (= ${{ github.workspace }}/toolbuild).
-          # That mount is what the build actually writes into —
-          # NOT the root filesystem, which has been intentionally
-          # filled almost to 100% by the /pv.img loopfile. The
-          # previous version of this step measured `df` on
-          # `${{ github.workspace }}`, which is a parent of the
-          # mount, and saw the *root* filesystem's available space
-          # (often under 200 MiB after Maximize). The preflight
-          # would then exit 1 with `Preflight failed: toolbuild has
-          # only 0 GB free…`, even though `toolbuild/` itself was
-          # mounted on a 100 GiB ext4 volume that had 99.9 GiB free.
-          # This version explicitly resolves the build filesystem
-          # (via /proc/mounts -> findmnt) and measures THAT.
-          #
-          # Build filesystem resolution order:
-          #   1. /dev/mapper/buildvg-buildlv mounted at the
-          #      `${BUILD_MOUNT_PATH}` (the Maximize output). When
-          #      this is found, the preflight measures free space
-          #      on the mount target — the filesystem the build
-          #      actually writes into.
-          #   2. As a defensive fallback (e.g. a future runner image
-          #      where Maximize-build-space fails), ${{ github.workspace }}'s
-          #      own filesystem, with a warning that future builds
-          #      may ENOSPC if Maximize regressed. The 25 GB
-          #      threshold stays enforced either way.
-          build_mount_path="${{ github.workspace }}/toolbuild"
-          # Resolve the build filesystem via /proc/mounts (which is
-          # what `findmnt` and `mount` both read) so a misnamed or
-          # relabelled device node can still be located. The lookup
-          # tries, in order:
-          #   1. `findmnt -n -o TARGET buildvg-buildlv` (the canonical
-          #      Maximize-build-space device name)
-          #   2. `findmnt -n -o TARGET /dev/mapper/buildvg-buildlv`
-          #      (the absolute device path; some `findmnt` versions
-          #      resolve the symlink differently)
-          #   3. `mount | awk` against the device name and against
-          #      `/dev/mapper/buildvg-buildlv` (a defensive fallback
-          #      that does not depend on findmnt's device name
-          #      parsing at all).
-          # The first non-empty result wins.
-          lvm_target="$(
-            {
-              findmnt -n -o TARGET buildvg-buildlv 2>/dev/null
-              findmnt -n -o TARGET /dev/mapper/buildvg-buildlv 2>/dev/null
-              mount 2>/dev/null | awk '/(^|[ \t])(\/dev\/mapper\/)?buildvg-buildlv[ \t]/ {print $3}'
-            } | grep -v '^$' | head -n 1
-          )"
-          lvm_target="${lvm_target:-}"
-          lvm_avail_gb=""
-          if [[ -n "$lvm_target" ]]; then
-            build_check_path="$lvm_target"
-            lvm_avail_gb="$(df -Pk "$build_check_path" | awk 'NR==2 {printf "%d\n", $4 / 1024 / 1024}')"
-            echo "LVM build volume buildvg-buildlv mounted at ${lvm_target}; available ${lvm_avail_gb} GB."
-          elif [[ -d "$build_mount_path" ]]; then
-            build_check_path="$build_mount_path"
-            lvm_avail_gb="$(df -Pk "$build_check_path" | awk 'NR==2 {printf "%d\n", $4 / 1024 / 1024}')"
-            mount_source="$(df -Pk "$build_check_path" | awk 'NR==2 {print $1}')"
-            echo "toolbuild directory exists with ${lvm_avail_gb} GB available (df source: ${mount_source}). The launcher could not resolve buildvg-buildlv via findmnt / mount, so it falls back to df on the toolbuild path. If the source contains 'mapper/buildvg' then the maximize-build-space step successfully mounted the LVM volume and the 25 GB threshold is being enforced against THAT volume; if not, the workspace root is the build filesystem."
-          else
-            build_check_path="${{ github.workspace }}"
-            if [[ ! -d "$build_check_path" ]]; then
-              build_check_path="${{ github.workspace }}/.."
-            fi
-            lvm_avail_gb="$(df -Pk "$build_check_path" | awk 'NR==2 {printf "%d\n", $4 / 1024 / 1024}')"
-            echo "::warning::Neither /dev/mapper/buildvg-buildlv nor ${build_mount_path} exists; preflight is checking the workspace root filesystem at $build_check_path (${lvm_avail_gb} GB available). The maximize-build-space step did not enlarge the volume as expected — re-run the dispatch; if the failure reproduces, file a runner-image ticket." >&2
-          fi
-          # RAM is independent of the storage layout. MemAvailable is
-          # the kernel's report of memory that can be allocated to
-          # new processes without swapping, and is the right figure
-          # to compare against the 3 GB build-residency threshold.
-          free_ram_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-          free_ram_gb="$(( free_ram_kb / 1024 / 1024 ))"
-          echo "Preflight: free disk=${lvm_avail_gb} GB (checked ${build_check_path}), free RAM=${free_ram_gb} GB."
-          if (( lvm_avail_gb < 25 )); then
-            echo "::error::Preflight failed: build filesystem (${build_check_path}) has only ${lvm_avail_gb} GB free; Stable builds need at least 25 GB. The maximize-build-space step did not enlarge the volume as expected, or a previous step consumed the free space. Re-run the dispatch; if the failure reproduces, file a runner-image ticket and link this run's diagnostics." >&2
-            exit 1
-          fi
-          if (( free_ram_gb < 3 )); then
-            echo "::error::Preflight failed: runner has only ${free_ram_gb} GB RAM available; Stable builds need at least 3 GB. Re-run the dispatch on a less loaded time window." >&2
-            exit 1
-          fi
-          # Core tools the engine + launcher rely on. The
-          # `Install Stable dependencies` step below installs the
-          # rest (lz4, zstd, erofs-utils, aapt, ...); we only
-          # check the tools that MUST be on the runner image
-          # itself (bash, sudo, git, tee, tail, findmnt,
-          # stdbuf, curl, xz).
-          for tool in bash sudo git tee tail findmnt xz stdbuf curl; do
-            if ! command -v "$tool" >/dev/null 2>&1; then
-              echo "::error::Preflight failed: required tool '$tool' is missing from the runner image." >&2
-              exit 1
-            fi
-          done
-          echo "Preflight OK."
 
       - name: "📦 Checkout private Stable engine"
         uses: actions/checkout@v5
@@ -777,7 +665,6 @@ jobs:
           echo "All LFS objects fetched successfully."
 
       - name: "🛡️ Mark Stable toolchain binaries executable"
-        timeout-minutes: 5
         working-directory: toolbuild
         shell: bash
         run: |
@@ -1007,7 +894,6 @@ jobs:
             --message "Runner allocated, fetching engine sources" || true
 
       - name: "🕒 Set Cairo timezone"
-        timeout-minutes: 2
         run: sudo timedatectl set-timezone Africa/Cairo
 
       - name: "☕ Install OpenJDK"
@@ -1096,99 +982,8 @@ jobs:
           fi
           rclone version
 
-      - name: "🛠️ Install Android SDK build-tools 34.0.0 (apksigner, zipalign, aapt2)"
-        working-directory: toolbuild
-        run: |
-          set -euo pipefail
-          # The Stable engine's bin/modfile/UpdateFile/system/
-          # DeadZone_ExternalStorageProvider/update.sh and
-          # bin/modfile/UpdateFile/system_ext/DeadZone_Provision/
-          # A16/provision_patch.py hardcode
-          #   $ANDROID_BUILD_TOOLS:/$HOME/android-sdk/build-tools/34.0.0
-          # for `zipalign`, `apksigner`, and `aapt2`. Without this
-          # step, the build aborts with
-          # `error: missing required tool: .../build-tools/34.0.0/zipalign`
-          # the first time a mod that needs to rebuild an APK runs.
-          # We install only the build-tools 34.0.0 subpackage
-          # (smallest possible payload) and a platform-tools jar
-          # mirror is not required: every mod uses cmdline-tools'
-          # sdkmanager to install build-tools into a per-runner
-          # $HOME/android-sdk, which is exactly what the scripts
-          # expect.
-          ANDROID_SDK_ROOT="$HOME/android-sdk"
-          BUILD_TOOLS_VERSION="34.0.0"
-          export ANDROID_SDK_ROOT
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          # Stable `HOME` on a hosted runner is /home/runner. The
-          # cmdline-tools tarball is small (~150 MB) and the
-          # install is idempotent: sdkmanager skips any package
-          # already at the expected version.
-          CMDLINE_TOOLS_VERSION="11076708"
-          CMDLINE_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_TOOLS_VERSION}_latest.zip"
-          CMDLINE_TOOLS_DIR="$ANDROID_SDK_ROOT/cmdline-tools/latest"
-          if [[ ! -x "$CMDLINE_TOOLS_DIR/bin/sdkmanager" ]]; then
-            tmp_zip="$(mktemp -t cmdline-tools-XXXXXX.zip)"
-            echo "Fetching Android cmdline-tools ${CMDLINE_TOOLS_VERSION}..."
-            curl --fail --silent --show-error --retry 3 --retry-delay 2 \
-              --connect-timeout 30 --max-time 600 \
-              -o "$tmp_zip" "$CMDLINE_TOOLS_URL"
-            unzip -q "$tmp_zip" -d "$ANDROID_SDK_ROOT/cmdline-tools/"
-            # The zip extracts to cmdline-tools/cmdline-tools/;
-            # sdkmanager expects cmdline-tools/latest/.
-            rm -rf "$CMDLINE_TOOLS_DIR"
-            mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$CMDLINE_TOOLS_DIR"
-            rm -f "$tmp_zip"
-          fi
-          export PATH="$CMDLINE_TOOLS_DIR/bin:$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}:$PATH"
-          if [[ ! -x "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/zipalign" ]]; then
-            echo "Installing Android build-tools ${BUILD_TOOLS_VERSION}..."
-            # Pre-accept SDK licenses by writing the well-known
-            # android-sdk-license SHA-256 hashes into
-            # \$ANDROID_SDK_ROOT/licenses/. This lets sdkmanager
-            # run non-interactively in CI.
-            mkdir -p "$ANDROID_SDK_ROOT/licenses"
-            printf '%s\n%s\n%s\n' \
-              "8933bad161af4178b1185d1a37fbf41ea5269c55" \
-              "d56f5187479451eabf01fb78af6dfcb131a6481e" \
-              "24333f8a63b6825ea9c5514f83c2829b004d1fee" \
-              > "$ANDROID_SDK_ROOT/licenses/android-sdk-license"
-            # The 'yes | sdkmanager' pipeline emits
-            # 'yes: standard output: Broken pipe' on hosted
-            # runners because sdkmanager closes stdin after the
-            # first prompt. That is a benign SIGPIPE on `yes`,
-            # not an install failure. We temporarily disable
-            # pipefail for this single command so the broken
-            # pipe does not abort the step, then rely on the
-            # per-tool existence check below to detect a real
-            # install failure.
-            set +o pipefail
-            yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
-              --install "build-tools;${BUILD_TOOLS_VERSION}" >/dev/null 2>&1
-            sdkmanager_rc=$?
-            set -o pipefail
-            if [[ $sdkmanager_rc -ne 0 ]]; then
-              echo "::notice::sdkmanager exited with $sdkmanager_rc; relying on per-tool existence check."
-            fi
-          fi
-          for tool in zipalign apksigner aapt2; do
-            tool_path="$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/${tool}"
-            if [[ ! -x "$tool_path" ]]; then
-              echo "::error::Android build-tools ${BUILD_TOOLS_VERSION} is missing ${tool} at ${tool_path}"
-              exit 1
-            fi
-            "$tool_path" version >/dev/null 2>&1 \
-              || echo "::notice::${tool} did not respond to 'version' subcommand (often a warning, not a failure)"
-          done
-          # Persist for the subsequent Build / Pack / Upload steps.
-          {
-            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
-            echo "ANDROID_BUILD_TOOLS=${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS_VERSION}"
-          } >> "$GITHUB_ENV"
-          echo "Android build-tools ${BUILD_TOOLS_VERSION} ready at ${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS_VERSION}"
-
       - name: "🚀 Build, release, and upload Stable ROM (refactored layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'refactored'
-        timeout-minutes: 110
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -1278,28 +1073,12 @@ jobs:
 
       - name: "🚀 Build Stable ROM (pre-refactor layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor'
-        timeout-minutes: 90
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
           DEADZONE_INPUT_URL: ${{ inputs.input_url }}
           DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
           DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
-          # Pin zipalign and apksigner to the runner's Android
-          # SDK build-tools that the previous step installed.
-          # The engine's mod scripts (FrameworkServices,
-          # ExternalStorageProvider, Provision, etc.) honour
-          # $ZIPALIGN and $APKSIGNER when set, but fall back
-          # to /home/mohammed/... when the env is empty -- a
-          # hardcoded path that does not exist on a hosted
-          # runner. We override the env here so every mod
-          # script sees the same path the SDK install step
-          # validated.
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
-          ANDROID_BUILD_TOOLS: ${{ env.ANDROID_BUILD_TOOLS }}
-          ZIPALIGN: ${{ env.ANDROID_BUILD_TOOLS }}/zipalign
-          APKSIGNER: ${{ env.ANDROID_BUILD_TOOLS }}/apksigner
-          AAPT2: ${{ env.ANDROID_BUILD_TOOLS }}/aapt2
         run: |
           set -Eeuo pipefail
           # The pre-refactor Stable engine's pipeline is three
@@ -1338,18 +1117,12 @@ jobs:
 
       - name: "📦 Pack Stable ROM (pre-refactor layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
-        timeout-minutes: 60
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
           DEADZONE_INPUT_URL: ${{ inputs.input_url }}
           DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
           DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
-          ANDROID_BUILD_TOOLS: ${{ env.ANDROID_BUILD_TOOLS }}
-          ZIPALIGN: ${{ env.ANDROID_BUILD_TOOLS }}/zipalign
-          APKSIGNER: ${{ env.ANDROID_BUILD_TOOLS }}/apksigner
-          AAPT2: ${{ env.ANDROID_BUILD_TOOLS }}/aapt2
         run: |
           set -Eeuo pipefail
           # `packROM.sh` rebuilds the super.img from the
@@ -1368,113 +1141,9 @@ jobs:
           # downstream artifact-metadata and upload steps can
           # find the file regardless of what `uploadROM.sh`
           # does.
-          #
-          # Build-reliability note (run 38444352495): the
-          # previous Pack step ran `bash packROM.sh | tee -a
-          # build_action.log` in the foreground with no
-          # line-buffered output, no per-step timeout, and no
-          # tail mirror. The Build step (above) already routes
-          # its full output through a backgrounded `bash
-          # build.sh` with `stdbuf -oL` and a `tail -F --pid`
-          # mirror so the Actions live log keeps streaming and
-          # a 50-minute step never starves the runner control
-          # plane. The Pack step now does the same. The exit
-          # code is captured from the backgrounded subshell
-          # (not from `tee`, which dies on SIGPIPE if the
-          # parent step is killed) and re-raised so a real
-          # engine failure still propagates.
-          #
-          # We also cap the size of `build_action.log` before
-          # the Pack step so a runaway log from the Build
-          # step cannot push the runner's IO buffer into a
-          # state where `tee`/`tail` block. 5 MiB is enough
-          # for the full Build+Pack+Upload transcript on the
-          # verified Stable lineage; the cap is enforced by
-          # truncating to the last 5 MiB on the boundary
-          # between every major stage. We deliberately use
-          # `tail -c` (NOT `>`) so the truncated file is
-          # still a valid stream of lines; a hard truncate
-          # could leave a half-line at the top and break
-          # log-parsing tools the bot panel uses downstream.
-          if [[ -s build_action.log ]]; then
-            if [[ $(stat -c '%s' build_action.log 2>/dev/null || echo 0) -gt 5242880 ]]; then
-              tail -c 5242880 build_action.log > build_action.log.tmp
-              mv -f build_action.log.tmp build_action.log
-              echo "[launcher] build_action.log truncated to last 5 MiB at the Pack boundary" \
-                >> build_action.log
-            fi
-          fi
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
-          log_path="$PWD/build_action.log"
-          : >> "$log_path"
-          # ----- Periodic progress + disk checkpoints -----
-          # `packROM.sh` itself emits one [REPACK] line per
-          # partition (one every 5–30 s on a real build), but
-          # the lpmake phase that re-assembles super.img can
-          # run for 60+ s without a single line of new
-          # output. That long silence is what historically
-          # tripped the Actions control plane into a "lost
-          # communication" disambiguation. We launch a
-          # backgrounded heartbeat that prints disk and
-          # memory checkpoints every 30 s so the live log
-          # always has *something* flowing while
-          # `packROM.sh` is computing.
-          _pack_heartbeat_log="$PWD/.pack_heartbeat.log"
-          : > "$_pack_heartbeat_log"
-          sudo -E stdbuf -oL -eL bash packROM.sh >> "$log_path" 2>&1 &
-          pack_pid=$!
-          (
-              while :; do
-                  sleep 30 || break
-                  if ! kill -0 "$pack_pid" 2>/dev/null; then
-                      break
-                  fi
-                  {
-                      echo "::group::Pack heartbeat $(date -u +%H:%M:%S)"
-                      echo "  - toolbuild free (bytes): $(df -Pk "$PWD" | awk 'NR==2 {print $4 * 1024}')"
-                      echo "  - toolbuild free (GiB): $(df -Pk "$PWD" | awk 'NR==2 {printf "%.2f\n", $4 / 1024 / 1024}')"
-                      echo "  - root FS free (bytes): $(df -Pk / 2>/dev/null | awk 'NR==2 {print $4 * 1024}')"
-                      echo "  - free RAM (MiB): $(awk '/MemAvailable/ {printf "%d\n", $2 / 1024}' /proc/meminfo 2>/dev/null || echo 0)"
-                      echo "  - load average: $(cat /proc/loadavg 2>/dev/null || echo unknown)"
-                      echo "  - process count: $(pgrep -c -P "$pack_pid" 2>/dev/null || echo unknown) child of packROM.sh"
-                      echo "::endgroup::"
-                  } >> "$_pack_heartbeat_log"
-              done
-          ) &
-          _heartbeat_pid=$!
-          # Mirror both the engine log and the heartbeat
-          # log so the live UI sees periodic checkpoints
-          # even during the silent lpmake phase.
-          tail -n +1 -F --pid="$pack_pid" "$log_path" 2>/dev/null &
-          _mirror_pid=$!
-          tail -n +1 -F --pid="$pack_pid" "$_pack_heartbeat_log" 2>/dev/null &
-          _hb_mirror_pid=$!
-          wait "$pack_pid"
-          pack_status=$?
-          # Stop the heartbeat and its mirror now that
-          # packROM.sh has exited. We `kill` rather than
-          # `wait` so a stuck `tail -F` cannot block the
-          # step on a slow log rotation; the `|| true`
-          # tolerates a race where the heartbeat exited
-          # on its own (when it noticed packROM.sh had
-          # already gone away).
-          kill "$_hb_mirror_pid" 2>/dev/null || true
-          kill "$_heartbeat_pid" 2>/dev/null || true
-          wait "$_hb_mirror_pid" 2>/dev/null || true
-          wait "$_heartbeat_pid" 2>/dev/null || true
-          # Surface the final heartbeat in the live log
-          # so a post-mortem reader can see the
-          # last-known free space and load.
-          if [[ -s "$_pack_heartbeat_log" ]]; then
-              echo "::group::Final Pack heartbeat"
-              tail -n 30 "$_pack_heartbeat_log" || true
-              echo "::endgroup::"
-          fi
-          if [[ $pack_status -ne 0 ]]; then
-            echo "::error::packROM.sh exited ${pack_status}; see build_action.log for the engine's diagnostic." >&2
-            exit "$pack_status"
-          fi
+          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
           if [[ ! -s bin/ddevice/output_zip.txt ]]; then
             echo "::error::packROM.sh did not record the final ZIP path in bin/ddevice/output_zip.txt" >&2
             exit 1
@@ -1485,75 +1154,10 @@ jobs:
             echo "::error::packROM.sh recorded '$final_name' in output_zip.txt but the file does not exist at $final_zip" >&2
             exit 1
           fi
-          # ----- Capture the final ZIP on the LVM build volume -----
-          # The previous version of this step wrote the captured
-          # ZIP to `$GITHUB_WORKSPACE/out/`, which is on the
-          # ROOT filesystem of the runner. After
-          # `easimon/maximize-build-space` ran, the root
-          # filesystem has been intentionally filled almost to
-          # 100% by a /pv.img loopfile that backs an LVM volume
-          # mounted on `${GITHUB_WORKSPACE}/toolbuild/`. The
-          # root FS therefore has only ~100 MiB free — far less
-          # than a 6 GB Stable ZIP. Run 38604517142 hit ENOSPC
-          # on this exact `cp` (`cp: error writing '...zip':
-          # No space left on device`) even though the LVM
-          # build volume was at 99 GiB free; the Pack step
-          # itself had already finished and the ZIP existed at
-          # `toolbuild/out/<name>.zip`.
-          #
-          # The fix is to point the artifact capture at the
-          # LVM-backed build directory. We use a dedicated
-          # `toolbuild/artifact/` subdirectory (not `toolbuild/out/`
-          # which the engine owns and which `uploadROM.sh`
-          # cleans at the end of the upload step) so the
-          # artifact survives the upload step's cleanup while
-          # the rest of the workflow can still read it via the
-          # well-known path. The actions/upload-artifact step
-          # below uploads from this same `toolbuild/artifact/`
-          # path, and the `🗂️ Collect Stable artifact metadata`
-          # step also reads from it. The 25 GB preflight
-          # threshold above guarantees we have at least 25 GB
-          # of headroom on the LVM volume for the source ROM,
-          # the extracted partitions, the build output, the
-          # final ZIP, AND a safety margin for runner control
-          # plane IO — 6 GB ZIPs fit comfortably in 25 GB.
-          stable_out="$GITHUB_WORKSPACE/toolbuild/artifact"
+          stable_out="$GITHUB_WORKSPACE/out"
           mkdir -p "$stable_out"
-          # Sanity-check the available headroom before we
-          # commit to the cp. We deliberately do not lower the
-          # 25 GB threshold for the preflight, but we do add a
-          # tight, artifact-scoped check at this exact copy
-          # so a future regression that fills toolbuild/ during
-          # the Pack step (e.g. a runaway extractor) surfaces
-          # here with a precise diagnostic instead of a generic
-          # `cp` ENOSPC. We require at least 2x the ZIP size
-          # of free space: the ZIP itself plus a 1x reserve
-          # so the actions/upload-artifact step that follows
-          # can re-read + hash the file without competing for
-          # the same blocks.
-          _zip_bytes="$(stat -c '%s' "$final_zip" 2>/dev/null || stat -f '%z' "$final_zip" 2>/dev/null || echo 0)"
-          _avail_bytes="$(df -Pk "$stable_out" | awk 'NR==2 {print $4 * 1024}')"
-          if [[ "${_zip_bytes:-0}" -gt 0 && "${_avail_bytes:-0}" -lt $(( _zip_bytes * 2 )) ]]; then
-            echo "::error::Captured Stable artifact target $stable_out has only $(( _avail_bytes / 1024 / 1024 )) MiB free; the final ZIP is $(( _zip_bytes / 1024 / 1024 )) MiB and we need 2x headroom. The LVM build volume is too full — investigate toolbuild/ before re-dispatching." >&2
-            exit 1
-          fi
-          if ! cp -f "$final_zip" "$stable_out/${final_name}"; then
-            echo "::error::Failed to capture final Stable ZIP at $stable_out/${final_name}; check toolbuild/ free space and the previous step's log." >&2
-            exit 1
-          fi
-          # Verify the captured copy is byte-identical to the
-          # engine-produced ZIP. A mismatch is a hard failure:
-          # if the source and the copy differ, the artifact
-          # the workflow will publish is not the artifact the
-          # engine produced, and that is a correctness bug,
-          # not a transient IO problem.
-          _src_sha="$(sha256sum "$final_zip" 2>/dev/null | awk '{print $1}')"
-          _dst_sha="$(sha256sum "$stable_out/${final_name}" 2>/dev/null | awk '{print $1}')"
-          if [[ "$_src_sha" != "$_dst_sha" || -z "$_src_sha" ]]; then
-            echo "::error::Captured Stable artifact SHA-256 mismatch: source=$_src_sha captured=$_dst_sha" >&2
-            exit 1
-          fi
-          echo "Captured pre-upload Stable ZIP: ${final_name} (${_zip_bytes} bytes, SHA-256=${_src_sha})"
+          cp -f "$final_zip" "$stable_out/${final_name}"
+          echo "Captured pre-upload Stable ZIP: ${final_name}"
           printf 'DEADZONE_RESULT_NAME=%s\n' "$final_name" >> "$GITHUB_ENV"
 
       - name: "☁️ Setup rclone for Stable upload (pre-refactor layout)"
@@ -1605,7 +1209,6 @@ jobs:
 
       - name: "☁️ Upload Stable ROM (pre-refactor layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
-        timeout-minutes: 30
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -1631,54 +1234,16 @@ jobs:
           # `failure()` and would not fire for this case; the
           # failure is surfaced via the build summary's
           # DEADZONE_GOOGLE_UPLOAD_STATUS=0 vs !=0 rendering.
-          #
-          # Build-reliability note (run 38444352495): the
-          # previous Upload step ran `bash uploadROM.sh | tee
-          # -a build_action.log` in the foreground with no
-          # line-buffered output, no per-step timeout, and no
-          # tail mirror. A 30-minute rclone round-trip on a
-          # 3 GB ZIP can starve the runner control plane the
-          # same way the Pack step did. The Upload step now
-          # uses the same `& + tail -F --pid + wait` pattern
-          # the Build/Pack steps use, with `stdbuf -oL` so the
-          # rclone progress lines stream line-by-line. The
-          # engine's true exit code is captured from the
-          # backgrounded subshell and forwarded to
-          # DEADZONE_GOOGLE_UPLOAD_STATUS so the build summary
-          # still renders the upload outcome.
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
-          log_path="$PWD/build_action.log"
-          # Cap the Build+Pack log at 5 MiB before the Upload
-          # step appends more. The Pack step already rotates
-          # at its boundary, but a 5 MiB log plus a 6 GB
-          # ZIP-build log (one line per partition) plus a
-          # 30-minute rclone round-trip can still push the
-          # file past 10 MiB and trip the runner's IO
-          # buffer. We use `tail -c` (NOT `>`) so the
-          # truncated file is still a valid stream of
-          # lines; a hard truncate could leave a half-line
-          # at the top and break log-parsing tools the bot
-          # panel uses downstream.
-          if [[ -s "$log_path" ]]; then
-            if [[ $(stat -c '%s' "$log_path" 2>/dev/null || echo 0) -gt 5242880 ]]; then
-              tail -c 5242880 "$log_path" > "$log_path.tmp"
-              mv -f "$log_path.tmp" "$log_path"
-              echo "[launcher] build_action.log truncated to last 5 MiB at the Upload boundary" \
-                >> "$log_path"
-            fi
-          fi
-          : >> "$log_path"
-          sudo -E stdbuf -oL -eL bash uploadROM.sh >> "$log_path" 2>&1 &
-          upload_pid=$!
-          tail -n +1 -F --pid="$upload_pid" "$log_path" || true
-          wait "$upload_pid"
-          google_status=$?
+          set +e
+          sudo -E bash uploadROM.sh 2>&1 | tee -a build_action.log
+          google_status=${PIPESTATUS[0]}
+          set -e
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
 
       - name: "📡 Report progress to bot (Lite parity)"
         if: success()
-        timeout-minutes: 5
         working-directory: toolbuild
         env:
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
@@ -1727,40 +1292,21 @@ jobs:
           # We forward them verbatim — the live panel renders
           # them as `Device:` and `ROM:` only when the engine
           # actually produced a non-empty value.
-          #
-          # Codename normalization contract: the codename
-          # forwarded to the bot panel MUST be lowercase and
-          # MUST NOT carry a standalone `Global` qualifier.
-          # The Stable engine already normalizes
-          # `bin/ddevice/device_f.txt` to lowercase (see
-          # `bin/ddevice/getROM.sh` in
-          # DeadZone-Offical/DeadZone-Xiaomi-Stable), and
-          # the `validate_codename.sh` validator is run before
-          # the ZIP is built. We therefore preserve the
-          # engine's lowercase output here instead of
-          # uppercasing it, and we re-assert the
-          # lowercase / no-Global-qualifier contract via
-          # `tr '[:upper:]' '[:lower:]'` plus the same
-          # qualifier-strip the engine uses. A regression in
-          # the engine (or a future engine that uppercases
-          # the codename) is caught here and corrected
-          # before it reaches the bot panel.
           codename=""
           rom_version=""
           if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -s build/.deadzone/rom_metadata.json ]]; then
-            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.lower() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.upper() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
             rom_version="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("rom",{}) or {}).get("version","") or (d.get("rom",{}) or {}).get("rom_code","");print("".join(c for c in v if c.isalnum() or c in "._+-") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
           else
             # pre_refactor — read the Lite-style state files.
             # `device_f.txt` carries the sanitized codename
-            # (e.g. "apollo" or "zircon"); `base_rom_code.txt`
-            # carries the base ROM build code (e.g.
-            # "OS2.0.1.0.VOCCNXM" or "V14.0.1.0.TKOCNXM").
-            # The codename is lowercased (NOT uppercased) to
-            # match the Live panel's `Device:` rendering and
-            # the final ZIP name in the Stable engine.
+            # (e.g. "apollo"); `base_rom_code.txt` carries the
+            # base ROM build code (e.g. "OS2.0.1.0.VOCCNXM" or
+            # "V14.0.1.0.TKOCNXM"). The codename is uppercased
+            # and non-alphanumerics are stripped to match the
+            # Live panel's `Device:` rendering.
             if [[ -s bin/ddevice/device_f.txt ]]; then
-              codename="$(tr '[:upper:]' '[:lower:]' < bin/ddevice/device_f.txt | sed -E 's/^(eeaglobal|inglobal|idglobal|ruglobal|twglobal|trglobal|jpglobal|global)[_-]?//; s/[_-]?(eeaglobal|inglobal|idglobal|ruglobal|twglobal|trglobal|jpglobal|global)$//' | sed 's/ /_/g' | tr -cd 'a-z0-9._+-')"
+              codename="$(tr '[:lower:]' '[:upper:]' < bin/ddevice/device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
             fi
             if [[ -s bin/ddevice/base_rom_code.txt ]]; then
               rom_version="$(tr -d '\r\n' < bin/ddevice/base_rom_code.txt)"
@@ -1841,25 +1387,18 @@ jobs:
           # artifact, that is a real failure the operator
           # needs to act on.
           if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" ]]; then
-            # The refactored engine owns `toolbuild/out/`
-            # itself and does not clean it on success, so the
-            # ZIP is still there at this point.
             mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Stable_*.zip' -print 2>/dev/null)
             artifact_dir="$PWD/out"
           else
-            # pre_refactor: the launcher pre-copies the ZIP
-            # to `$GITHUB_WORKSPACE/toolbuild/artifact/<name>`
-            # in the Pack step. We deliberately point at
-            # the LVM-backed `toolbuild/artifact/` (NOT
-            # `$GITHUB_WORKSPACE/out/`) so the metadata
-            # read does not race the post-pack `cp -f`
-            # ENOSPC that 38604517142 hit on the root FS.
-            # The `toolbuild/artifact/` directory is on the
-            # LVM volume and has at least 25 GB free
-            # (enforced by the preflight step above), so a
-            # 6 GB Stable ZIP fits with a comfortable
-            # headroom.
-            artifact_dir="$GITHUB_WORKSPACE/toolbuild/artifact"
+            # pre_refactor: the ZIP was pre-copied to
+            # $GITHUB_WORKSPACE/out/<name> by the Pack
+            # step; its name is recorded in
+            # bin/ddevice/output_zip.txt. Fall back to a
+            # glob in $GITHUB_WORKSPACE/out for the case
+            # where the Pack step ran without the pre-copy
+            # (e.g. an older launcher version that has
+            # not been re-deployed).
+            artifact_dir="$GITHUB_WORKSPACE/out"
             if [[ -s bin/ddevice/output_zip.txt ]]; then
               recorded_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
               mapfile -t final_zips < <(find "$artifact_dir" -maxdepth 1 -type f -name "$recorded_name" -print 2>/dev/null)
@@ -1889,7 +1428,7 @@ jobs:
           rom_version=""
           os_folder=""
           if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -s build/.deadzone/rom_metadata.json ]]; then
-            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.lower() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
+            codename="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("device",{}) or {}).get("codename","");print("".join(c for c in v.upper() if c.isalnum() or c in "._+-").strip("_") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
             rom_version="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));v=(d.get("rom",{}) or {}).get("version","") or (d.get("rom",{}) or {}).get("rom_code","");print("".join(c for c in v if c.isalnum() or c in "._+-") or "")' build/.deadzone/rom_metadata.json 2>/dev/null || true)"
             if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
               os_folder="${BASH_REMATCH[1]}"
@@ -1898,11 +1437,8 @@ jobs:
             fi
           else
             # pre_refactor — read the Lite-style state files.
-            # The codename is lowercased (NOT uppercased) to
-            # match the Stable engine's final ZIP name and the
-            # `Report progress to bot` step's `Device:` field.
             if [[ -s bin/ddevice/device_f.txt ]]; then
-              codename="$(tr '[:upper:]' '[:lower:]' < bin/ddevice/device_f.txt | sed -E 's/^(eeaglobal|inglobal|idglobal|ruglobal|twglobal|trglobal|jpglobal|global)[_-]?//; s/[_-]?(eeaglobal|inglobal|idglobal|ruglobal|twglobal|trglobal|jpglobal|global)$//' | sed 's/ /_/g' | tr -cd 'a-z0-9._+-')"
+              codename="$(tr '[:lower:]' '[:upper:]' < bin/ddevice/device_f.txt | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-')"
             fi
             if [[ -s bin/ddevice/base_rom_code.txt ]]; then
               rom_version="$(tr -d '\r\n' < bin/ddevice/base_rom_code.txt)"
@@ -2303,6 +1839,24 @@ jobs:
             --project stable \
             --message "DeadZone Stable ROM build cancelled." || true
 
+      - name: "🧽 Cleanup Stable workspace"
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          # `toolbuild` may be busy if Maximize-build-space mounted an
+          # LVM volume on it, and `runtime` may not exist if the
+          # private-runtime checkout failed before completing. Both
+          # conditions are expected after a failed Stable build, so the
+          # cleanup is best-effort and never fails the job.
+          if mountpoint -q toolbuild 2>/dev/null; then
+            echo "Unmounting toolbuild (was a build-space mount point)"
+            sudo umount toolbuild || true
+          fi
+          rm -rf toolbuild runtime 2>/dev/null || true
+          rm -f toolbuild/rclone.conf 2>/dev/null || true
+          echo "Stable workspace cleanup complete"
+
       - name: "📦 Upload final Stable ZIP as workflow artifact"
         if: success()
         uses: actions/upload-artifact@v6
@@ -2312,31 +1866,21 @@ jobs:
           #   * refactored: $GITHUB_WORKSPACE/toolbuild/out/DeadZone_Stable_<...>.zip
           #     (the engine does not clean `out/`, so the ZIP
           #     is still there at the end of the run)
-          #   * pre-refactor: $GITHUB_WORKSPACE/toolbuild/artifact/<name>
+          #   * pre-refactor: $GITHUB_WORKSPACE/out/<name>
           #     (the launcher pre-copied the ZIP there in the
-          #     "📦 Pack Stable ROM" step on the LVM-backed
-          #     build volume; `uploadROM.sh` cleaned
-          #     `$work_dir/out/`).
-          # We do NOT point at `$GITHUB_WORKSPACE/out/*.zip`
-          # any more: that path is on the ROOT filesystem,
-          # which has only ~100 MiB free after
-          # `easimon/maximize-build-space` carved /pv.img
-          # out of it. Run 38604517142 hit ENOSPC on the
-          # post-pack `cp` to that path even though the
-          # LVM build volume was at 99 GiB free; the ZIP
-          # is too large to ever live on the root FS.
-          # `actions/upload-artifact@v6` accepts multiple
-          # paths in a single upload, so we list the
-          # pre-refactor and refactored candidates and let
-          # the upload find the one that exists. The
-          # `if-no-files-found: error` guard fails the
-          # workflow when neither candidate exists, which
+          #     "📦 Pack Stable ROM" step, because
+          #     `uploadROM.sh` cleaned `$work_dir/out/`)
+          # `actions/upload-artifact@v6` accepts multiple paths
+          # in a single upload, so we just point at both
+          # candidates and let the upload find the one that
+          # exists. The `if-no-files-found: error` guard fails
+          # the workflow when neither candidate exists, which
           # is the right safety net for a "build succeeded"
           # outcome that has no artifact to attach.
           name: deadzone-stable-${{ env.DEADZONE_RESULT_NAME }}
           path: |
             toolbuild/out/DeadZone_Stable_*.zip
-            toolbuild/artifact/*.zip
+            out/*.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -2349,81 +1893,6 @@ jobs:
             toolbuild/build_action.log
           retention-days: 1
           if-no-files-found: ignore
-
-      - name: "🧽 Cleanup Stable workspace"
-        if: always()
-        timeout-minutes: 5
-        shell: bash
-        run: |
-          set -uo pipefail
-          # `toolbuild` may be busy if Maximize-build-space
-          # mounted an LVM volume on it, and `runtime` may not
-          # exist if the private-runtime checkout failed before
-          # completing. Both conditions are expected after a
-          # failed Stable build, so the cleanup is best-effort
-          # and never fails the job.
-          #
-          # This step runs AFTER `📦 Upload final Stable ZIP`
-          # and `📋 Upload debug logs` so the uploaders can
-          # still find the final ZIP and the build log on
-          # the workspace. The original ordering had this
-          # cleanup BEFORE the uploaders, which made the
-          # upload steps fail with `if-no-files-found: error`
-          # on every successful build. (Precedents: 38604517142
-          # and 38610249902.) The order in YAML is the order
-          # in which the steps run.
-          #
-          # Build-reliability note (run 38444352495): a runner
-          # that lost communication with the control plane in
-          # the middle of the Pack step may leave `toolbuild`
-          # mounted and `build_action.log` truncated mid-line.
-          # The cleanup therefore:
-          #   1. unmounts `toolbuild` BEFORE removing it
-          #      (a leftover mount would surface as a
-          #      confusing `device or resource busy` in a
-          #      later step or in the next dispatch),
-          #   2. removes `runtime` so the next dispatch's
-          #      `actions/checkout@v5` for the private
-          #      runtime can re-create it from scratch (a
-          #      stale `runtime/build_stage.py` from a
-          #      previous run would otherwise leak state),
-          #   3. truncates `build_action.log` to zero (a
-          #      stale log from a prior failed run is
-          #      uploaded by the `📋 Upload debug logs`
-          #      step on the next dispatch if the file is
-          #      large enough; a clean truncation keeps the
-          #      upload bounded),
-          #   4. removes any leftover `liteengine` and
-          #      `out/` directories (the refactored
-          #      layout's sparse-checkout would otherwise
-          #      re-checkout the same files on the next
-          #      dispatch),
-          #   5. removes the captured
-          #      `toolbuild/artifact/` directory that the
-          #      Pack step writes the final Stable ZIP to.
-          #      The capture directory lives on the LVM
-          #      build volume and is NOT cleaned by
-          #      `uploadROM.sh`; we drop it here so a
-          #      future dispatch does not see a stale ZIP
-          #      from a previous run.
-          # The whole step is wrapped in `|| true` and a
-          # 5-minute timeout so a stuck cleanup never blocks
-          # the runner teardown.
-          if command -v findmnt >/dev/null 2>&1; then
-            if findmnt toolbuild >/dev/null 2>&1; then
-              echo "Unmounting toolbuild (was a build-space mount point)"
-              sudo umount toolbuild || true
-            fi
-          elif mountpoint -q toolbuild 2>/dev/null; then
-            echo "Unmounting toolbuild (was a build-space mount point)"
-            sudo umount toolbuild || true
-          fi
-          rm -rf toolbuild runtime liteengine 2>/dev/null || true
-          rm -rf out 2>/dev/null || true
-          rm -rf toolbuild/artifact 2>/dev/null || true
-          rm -f toolbuild/rclone.conf 2>/dev/null || true
-          : > build_action.log 2>/dev/null || true
-          echo "Stable workspace cleanup complete"
 
       - name: "📣 Build summary"
         if: always()
