@@ -309,7 +309,51 @@ jobs:
         with:
           build-mount-path: ${{ github.workspace }}/toolbuild
           swap-size-mb: 1024
-          root-reserve-mb: 512
+          # 2 GB on root instead of the previous 512 MB.
+          #
+          # The runner's own diagnostic log at
+          #   /home/runner/actions-runner/cached/<ver>/_diag/Worker_*.utc.log
+          # is written continuously by the GitHub Actions agent
+          # for the entire duration of the job. On a 40+ minute
+          # Stable build (Build + Pack + Upload together) the log
+          # file grows large enough that 512 MB of headroom on
+          # the root filesystem is exhausted and the agent crashes
+          # with:
+          #   System.IO.IOException: No space left on device :
+          #     '/home/runner/actions-runner/cached/.../Worker_<ts>-utc.log'
+          # That crash tears down the entire job even though the
+          # build itself is fine — `packROM.sh` was still running
+          # when the agent died, so the workflow exits with
+          # `failure` and no artifact is uploaded. Run 38825878580
+          # hit exactly this signature: the Build step completed
+          # successfully and `packROM.sh` was 16+ minutes into
+          # the silent `lpmake` super.img re-assembly when the
+          # runner crashed on its own diagnostic log flush.
+          #
+          # Bumping `root-reserve-mb` to 2048 (the 4x the previous
+          # value) gives the agent enough headroom to flush the
+          # log for the full Stable job duration. With GitHub's
+          # documented 14 GB minimum on `ubuntu-latest`, this
+          # still leaves ~12 GB for the LVM build volume — more
+          # than enough for a Stable build (extracted baserom
+          # ~8 GB, intermediate super.img ~5 GB, final ZIP ~6 GB)
+          # because each of those stages replaces the previous
+          # one rather than accumulating. The 2 GB reserve also
+          # accommodates the workflow's `actions/upload-artifact`
+          # step (which re-reads the captured ZIP to compute
+          # SHA-256) without competing for the same blocks the
+          # engine is still writing.
+          root-reserve-mb: 2048
+          # overprovision-lvm keeps the LVM volume sparse: the
+          # actual physical blocks on the root FS are consumed
+          # only when the build writes to the LVM, so a long
+          # Pack step that hasn't yet produced a 6 GB ZIP still
+          # leaves the root FS reporting the 2 GB reserve
+          # instead of showing 13 GB of phantom "used" space.
+          # This is the documented escape hatch for the case
+          # where `root-reserve-mb` alone is not enough to keep
+          # the runner's own log writes alive.
+          overprovision-lvm: "true"
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
@@ -1077,10 +1121,44 @@ jobs:
             echo "::error::packROM.sh recorded '$final_name' in output_zip.txt but the file does not exist at $final_zip" >&2
             exit 1
           fi
-          stable_out="$GITHUB_WORKSPACE/out"
+          # Capture the final ZIP into a stable, upload-step-visible
+          # location on the LVM-backed build volume
+          # (`$GITHUB_WORKSPACE/toolbuild/artifact/`). A 6 GB
+          # Stable ZIP does NOT fit in `$GITHUB_WORKSPACE/out/`,
+          # which lives on the root filesystem (only `root-reserve-mb`
+          # MB free — currently 2048 MB, but the root FS is also
+          # where the runner agent writes its continuous diagnostic
+          # log). Copying to the LVM-backed `toolbuild/artifact/`
+          # subdirectory keeps the capture off the root FS entirely
+          # and on the same filesystem the engine's `out/` lives on.
+          #
+          # The `🧽 Cleanup Stable workspace` step (line ~1809)
+          # umounts `toolbuild/` and `rm -rf`s the directory, so
+          # the captured artifact would be lost on that step. The
+          # step ordering in this workflow runs the upload steps
+          # (final ZIP + debug logs) BEFORE the cleanup so the
+          # artifact is on a still-mounted LVM when
+          # `actions/upload-artifact@v6` reads it.
+          stable_out="$GITHUB_WORKSPACE/toolbuild/artifact"
           mkdir -p "$stable_out"
-          cp -f "$final_zip" "$stable_out/${final_name}"
-          echo "Captured pre-upload Stable ZIP: ${final_name}"
+          if ! cp -f "$final_zip" "$stable_out/${final_name}"; then
+            echo "::error::Failed to capture final Stable ZIP at $stable_out/${final_name}; the LVM build volume ran out of space during the cp. Investigate toolbuild/ free space (df -h toolbuild) and re-dispatch." >&2
+            exit 1
+          fi
+          # Verify the captured copy is byte-identical to the
+          # engine-produced ZIP. A mismatch is a hard failure: if
+          # the source and the copy differ, the artifact the
+          # workflow publishes is not the artifact the engine
+          # produced, and that is a correctness bug, not a
+          # transient IO problem.
+          _src_sha="$(sha256sum "$final_zip" 2>/dev/null | awk '{print $1}')"
+          _dst_sha="$(sha256sum "$stable_out/${final_name}" 2>/dev/null | awk '{print $1}')"
+          if [[ "$_src_sha" != "$_dst_sha" || -z "$_src_sha" ]]; then
+            echo "::error::Captured Stable artifact SHA-256 mismatch: source=$_src_sha captured=$_dst_sha" >&2
+            exit 1
+          fi
+          _zip_bytes="$(stat -c '%s' "$final_zip" 2>/dev/null || stat -f '%z' "$final_zip" 2>/dev/null || echo 0)"
+          echo "Captured pre-upload Stable ZIP: ${final_name} (${_zip_bytes} bytes, SHA-256=${_src_sha})"
           printf 'DEADZONE_RESULT_NAME=%s\n' "$final_name" >> "$GITHUB_ENV"
 
       - name: "☁️ Setup rclone for Stable upload (pre-refactor layout)"
@@ -1292,13 +1370,16 @@ jobs:
           #     there, and the engine does NOT clean `out/`)
           #
           #   * pre-refactor: the launcher pre-copied the ZIP
-          #     to `$GITHUB_WORKSPACE/out/<name>` in the
-          #     "📦 Pack Stable ROM" step, because
-          #     `uploadROM.sh` cleans `$PWD/out/` on success.
-          #     The final name is recorded in
-          #     `bin/ddevice/output_zip.txt` (which
-          #     `uploadROM.sh` writes just before its rclone
-          #     copy).
+          #     to `$GITHUB_WORKSPACE/toolbuild/artifact/<name>`
+          #     in the "📦 Pack Stable ROM" step. We capture
+          #     on the LVM-backed build volume (NOT on the
+          #     root FS at `$GITHUB_WORKSPACE/out/`) because
+          #     the root FS only has `root-reserve-mb` free
+          #     after `maximize-build-space` runs, and a 6 GB
+          #     Stable ZIP would ENOSPC there. The final name
+          #     is recorded in `bin/ddevice/output_zip.txt`
+          #     (which `uploadROM.sh` writes just before its
+          #     rclone copy).
           #
           # We accept either location. The `if: success()`
           # gate ensures a build that never produced a final
@@ -1314,14 +1395,22 @@ jobs:
             artifact_dir="$PWD/out"
           else
             # pre_refactor: the ZIP was pre-copied to
-            # $GITHUB_WORKSPACE/out/<name> by the Pack
-            # step; its name is recorded in
-            # bin/ddevice/output_zip.txt. Fall back to a
-            # glob in $GITHUB_WORKSPACE/out for the case
-            # where the Pack step ran without the pre-copy
-            # (e.g. an older launcher version that has
-            # not been re-deployed).
-            artifact_dir="$GITHUB_WORKSPACE/out"
+            # $GITHUB_WORKSPACE/toolbuild/artifact/<name>
+            # by the Pack step (the LVM-backed build
+            # volume; the root-FS `$GITHUB_WORKSPACE/out`
+            # copy was removed because a 6 GB Stable ZIP
+            # does not fit in the post-`maximize-build-space`
+            # root filesystem, which has only `root-reserve-mb`
+            # free — currently 2048 MB). The final name is
+            # recorded in `bin/ddevice/output_zip.txt`. Fall
+            # back to `$GITHUB_WORKSPACE/out` for the case
+            # where the Pack step ran without the LVM
+            # pre-copy (e.g. an older launcher version that
+            # has not been re-deployed).
+            artifact_dir="$GITHUB_WORKSPACE/toolbuild/artifact"
+            if [[ ! -d "$artifact_dir" ]]; then
+              artifact_dir="$GITHUB_WORKSPACE/out"
+            fi
             if [[ -s bin/ddevice/output_zip.txt ]]; then
               recorded_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
               mapfile -t final_zips < <(find "$artifact_dir" -maxdepth 1 -type f -name "$recorded_name" -print 2>/dev/null)
@@ -1762,24 +1851,6 @@ jobs:
             --project stable \
             --message "DeadZone Stable ROM build cancelled." || true
 
-      - name: "🧽 Cleanup Stable workspace"
-        if: always()
-        shell: bash
-        run: |
-          set -uo pipefail
-          # `toolbuild` may be busy if Maximize-build-space mounted an
-          # LVM volume on it, and `runtime` may not exist if the
-          # private-runtime checkout failed before completing. Both
-          # conditions are expected after a failed Stable build, so the
-          # cleanup is best-effort and never fails the job.
-          if mountpoint -q toolbuild 2>/dev/null; then
-            echo "Unmounting toolbuild (was a build-space mount point)"
-            sudo umount toolbuild || true
-          fi
-          rm -rf toolbuild runtime 2>/dev/null || true
-          rm -f toolbuild/rclone.conf 2>/dev/null || true
-          echo "Stable workspace cleanup complete"
-
       - name: "📦 Upload final Stable ZIP as workflow artifact"
         if: success()
         uses: actions/upload-artifact@v6
@@ -1789,19 +1860,40 @@ jobs:
           #   * refactored: $GITHUB_WORKSPACE/toolbuild/out/DeadZone_Stable_<...>.zip
           #     (the engine does not clean `out/`, so the ZIP
           #     is still there at the end of the run)
-          #   * pre-refactor: $GITHUB_WORKSPACE/out/<name>
+          #   * pre-refactor: $GITHUB_WORKSPACE/toolbuild/artifact/<name>
           #     (the launcher pre-copied the ZIP there in the
-          #     "📦 Pack Stable ROM" step, because
-          #     `uploadROM.sh` cleaned `$work_dir/out/`)
-          # `actions/upload-artifact@v6` accepts multiple paths
-          # in a single upload, so we just point at both
-          # candidates and let the upload find the one that
-          # exists. The `if-no-files-found: error` guard fails
-          # the workflow when neither candidate exists, which
-          # is the right safety net for a "build succeeded"
-          # outcome that has no artifact to attach.
+          #     "📦 Pack Stable ROM" step, on the LVM-backed
+          #     build volume. A 6 GB Stable ZIP does NOT fit
+          #     on the root FS at `$GITHUB_WORKSPACE/out/`,
+          #     which has only `root-reserve-mb` free after
+          #     `maximize-build-space` runs, so the capture is
+          #     done on the LVM instead. `$work_dir/out/` is
+          #     also tried as a fallback in case the engine
+          #     wrote the ZIP there directly.)
+          #
+          # The upload step runs BEFORE the
+          # `🧽 Cleanup Stable workspace` step (which umounts
+          # the LVM-backed `toolbuild/` and `rm -rf`s the
+          # directory) so the artifact is on a still-mounted
+          # filesystem when `actions/upload-artifact@v6`
+          # reads it. Without that ordering, the upload's
+          # first glob `toolbuild/out/DeadZone_Stable_*.zip`
+          # would never find the file because the mount has
+          # been torn down, and the only remaining candidate
+          # would be `out/*.zip` on the (much smaller) root
+          # FS — the failure mode run 38825878580 hit.
+          #
+          # `actions/upload-artifact@v6` accepts multiple
+          # paths in a single upload, so we just point at
+          # every candidate and let the upload find the one
+          # that exists. The `if-no-files-found: error`
+          # guard fails the workflow when no candidate
+          # exists, which is the right safety net for a
+          # "build succeeded" outcome that has no artifact
+          # to attach.
           name: deadzone-stable-${{ env.DEADZONE_RESULT_NAME }}
           path: |
+            toolbuild/artifact/*.zip
             toolbuild/out/DeadZone_Stable_*.zip
             out/*.zip
           if-no-files-found: error
@@ -1816,6 +1908,33 @@ jobs:
             toolbuild/build_action.log
           retention-days: 1
           if-no-files-found: ignore
+
+      - name: "🧽 Cleanup Stable workspace"
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          # `toolbuild` may be busy if Maximize-build-space mounted an
+          # LVM volume on it, and `runtime` may not exist if the
+          # private-runtime checkout failed before completing. Both
+          # conditions are expected after a failed Stable build, so the
+          # cleanup is best-effort and never fails the job.
+          #
+          # This step runs AFTER the
+          # `📦 Upload final Stable ZIP as workflow artifact` and
+          # `📋 Upload debug logs` steps above, which read from
+          # `toolbuild/`. If we umounted or `rm -rf`'d `toolbuild/`
+          # before those uploads, the upload step would have no
+          # file to read (the LVM mount is gone, and the
+          # root-FS copy at `$GITHUB_WORKSPACE/out/` either
+          # does not exist or ENOSPC'd on a 6 GB Stable ZIP).
+          if mountpoint -q toolbuild 2>/dev/null; then
+            echo "Unmounting toolbuild (was a build-space mount point)"
+            sudo umount toolbuild || true
+          fi
+          rm -rf toolbuild runtime 2>/dev/null || true
+          rm -f toolbuild/rclone.conf 2>/dev/null || true
+          echo "Stable workspace cleanup complete"
 
       - name: "📣 Build summary"
         if: always()
