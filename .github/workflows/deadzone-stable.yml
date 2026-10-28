@@ -443,10 +443,9 @@ jobs:
           # ~8 GB, intermediate super.img ~5 GB, final ZIP ~6 GB)
           # because each of those stages replaces the previous
           # one rather than accumulating. The 2 GB reserve also
-          # accommodates the workflow's `actions/upload-artifact`
-          # step (which re-reads the captured ZIP to compute
-          # SHA-256) without competing for the same blocks the
-          # engine is still writing.
+          # gives the runner agent enough headroom to flush its
+          # continuous diagnostic log without competing for the
+          # same blocks the engine is still writing.
           root-reserve-mb: 2048
           # overprovision-lvm keeps the LVM volume sparse: the
           # actual physical blocks on the root FS are consumed
@@ -2018,64 +2017,20 @@ jobs:
             --project stable \
             --message "DeadZone Stable ROM build cancelled." || true
 
-      - name: "📦 Upload final Stable ZIP as workflow artifact"
-        if: success()
-        uses: actions/upload-artifact@v6
-        with:
-          # The final ZIP lives at different paths depending on
-          # the engine layout:
-          #   * refactored: $GITHUB_WORKSPACE/toolbuild/out/DeadZone_Stable_<...>.zip
-          #     (the engine does not clean `out/`, so the ZIP
-          #     is still there at the end of the run)
-          #   * pre-refactor: $GITHUB_WORKSPACE/toolbuild/artifact/<name>
-          #     (the launcher captures the ZIP there in the
-          #     "🗂️ Capture Stable artifact" step, on the
-          #     LVM-backed build volume. A multi-GB Stable ZIP
-          #     does NOT fit on the root FS at
-          #     `$GITHUB_WORKSPACE/out/`, which has only
-          #     `root-reserve-mb` free after
-          #     `maximize-build-space` runs, so the capture is
-          #     done on the LVM instead. `$work_dir/out/` is
-          #     also tried as a fallback in case the engine
-          #     wrote the ZIP there directly.)
-          #
-          # The upload step runs BEFORE the
-          # `🧽 Cleanup Stable workspace` step (which umounts
-          # the LVM-backed `toolbuild/` and `rm -rf`s the
-          # directory) so the artifact is on a still-mounted
-          # filesystem when `actions/upload-artifact@v6`
-          # reads it. Without that ordering, the upload's
-          # first glob `toolbuild/out/DeadZone_Stable_*.zip`
-          # would never find the file because the mount has
-          # been torn down, and the only remaining candidate
-          # would be `out/*.zip` on the (much smaller) root
-          # FS — the failure mode run 38825878580 hit.
-          #
-          # `actions/upload-artifact@v6` accepts multiple
-          # paths in a single upload, so we just point at
-          # every candidate and let the upload find the one
-          # that exists. The `if-no-files-found: error`
-          # guard fails the workflow when no candidate
-          # exists, which is the right safety net for a
-          # "build succeeded" outcome that has no artifact
-          # to attach.
-          name: deadzone-stable-${{ env.DEADZONE_RESULT_NAME }}
-          path: |
-            toolbuild/artifact/*.zip
-            toolbuild/out/DeadZone_Stable_*.zip
-            out/*.zip
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: "📋 Upload debug logs"
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: build-logs-${{ github.run_number }}
-          path: |
-            toolbuild/build_action.log
-          retention-days: 1
-          if-no-files-found: ignore
+      # The final ROM is delivered ONLY through Google Drive
+      # (`rclone copyto` in the "☁️ Upload Stable ROM to Google
+      # Drive" step). Uploading the multi-GB Stable ZIP as a
+      # GitHub Actions artifact was removed: it duplicated the
+      # Drive delivery, consumed the repository's artifact
+      # storage quota, slowed down runner finalization (the
+      # uploader re-read the whole ZIP to compute SHA-256), and
+      # cluttered the run page with a second copy of a file
+      # that is already publicly downloadable from Drive.
+      #
+      # The same reasoning applies to the build log: the run
+      # log itself is retained by GitHub for the standard
+      # retention window, so shipping `build_action.log` as an
+      # artifact added no diagnostic value.
 
       - name: "🧽 Cleanup Stable workspace"
         if: always()
@@ -2089,12 +2044,11 @@ jobs:
           # cleanup is best-effort and never fails the job.
           #
           # This step runs AFTER the
-          # `📦 Upload final Stable ZIP as workflow artifact` and
-          # `📋 Upload debug logs` steps above, which read from
-          # `toolbuild/`. If we umounted or `rm -rf`'d `toolbuild/`
-          # before those uploads, the upload step would have no
-          # file to read (the LVM mount is gone, and the
-          # root-FS copy at `$GITHUB_WORKSPACE/out/` either
+          # "☁️ Upload Stable ROM to Google Drive" step, which reads
+          # the final ZIP from `toolbuild/artifact/`. If we umounted
+          # or `rm -rf`'d `toolbuild/` before that upload, rclone
+          # would have no file to copy (the LVM mount is gone, and
+          # the root-FS copy at `$GITHUB_WORKSPACE/out/` either
           # does not exist or ENOSPC'd on a 6 GB Stable ZIP).
           if mountpoint -q toolbuild 2>/dev/null; then
             echo "Unmounting toolbuild (was a build-space mount point)"
