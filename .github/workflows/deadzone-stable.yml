@@ -17,7 +17,7 @@
 #     sparse-checkout needed — the engine already vendors them)
 #   * `bin/ddevice/*.txt` as the per-build state directory; the
 #     final ZIP name is recorded in `bin/ddevice/output_zip.txt`
-#     before uploadROM.sh cleans `out/` and `build/`
+#     by `uploadROM.sh` (NOT by `packROM.sh` — see below)
 #   * `notify.py` for the full Telegram lifecycle (start, download,
 #     unpack, build, pack, upload, success, fail)
 # The pipeline is the Lite sequence: `build.sh` -> `packROM.sh` ->
@@ -29,6 +29,61 @@
 # this workflow will need to be re-adapted to the new engine
 # contract; the Lite-style flow here is the only one that runs
 # against the engine as it actually exists today.
+#
+#
+# Which engine script produces the ZIP?
+# --------------------------------------
+# This is the single most important fact about the Stable engine
+# and it is NOT what the previous revision of this file assumed:
+#
+#   * `packROM.sh` rebuilds `build/baserom/images/super.img` and
+#     nothing else. It NEVER runs `zip`, NEVER creates `out/`, and
+#     NEVER writes `bin/ddevice/output_zip.txt`. Verified against
+#     `DeadZone-Offical/DeadZone-Xiaomi-Stable@main` (commit
+#     b97a88d7ff): `grep -n 'output_zip\|zip ' packROM.sh` matches
+#     nothing.
+#   * `uploadROM.sh` is the script that stages the flashable tree
+#     under `out/`, runs `zip -r`, and writes the final ZIP name to
+#     `bin/ddevice/output_zip.txt`.
+#
+# The previous revision therefore had an ordering contradiction:
+# its "📦 Pack Stable ROM" step read `bin/ddevice/output_zip.txt`
+# and failed with "packROM.sh did not record the final ZIP path"
+# on EVERY run — that file does not exist yet at that point in the
+# pipeline, because the script that writes it runs one step later.
+# The Pack step in this revision only rebuilds `super.img`; the
+# ZIP is created, captured, and uploaded after `uploadROM.sh`.
+#
+# `uploadROM.sh` also does NOT delete `out/` or `build/` on
+# success (verified: `grep -n 'rm ' uploadROM.sh` matches
+# nothing), so the capture step can run after it without racing a
+# cleanup. The launcher still copies the ZIP to its own
+# `toolbuild/artifact/` directory so the artifact survives the
+# workspace cleanup step and never sits on the root filesystem.
+#
+# Where the ROM is actually uploaded
+# ----------------------------------
+# The engine's own upload half is `upload_rom_api.py`, a Google
+# Drive API client that authenticates with a `token.pickle`
+# credential. `token.pickle` does NOT exist in
+# `DeadZone-Offical/DeadZone-File` (the Contents API returns 404
+# for it), and `uploadROM.sh` swallows the resulting failure:
+#
+#   python $work_dir/upload_rom_api.py "$output_file" ... || {
+#       upload "Error uploading file to Google Drive"
+#   }
+#
+# The `|| { ... }` block only prints a message, so the script
+# still exits 0 and the engine reports success while NOTHING was
+# uploaded. This revision therefore:
+#   1. runs the engine's staging/ZIP half with the Drive client
+#      neutered (so the ZIP and `output_zip.txt` are produced),
+#   2. performs the real upload itself with `rclone copyto`
+#      against the canonical central-runtime remote
+#      (`RCLONE_REMOTE_NAME` / `RCLONE_UPLOAD_DIR`), and
+#   3. verifies the uploaded object with `rclone lsjson`.
+# A non-zero upload is a hard failure, because "the build
+# succeeded but nothing was delivered" is not a usable outcome.
 #
 # Architecture / ownership boundary
 # ---------------------------------
@@ -70,42 +125,47 @@
 # --------------------------------------------------
 # The Stable engine's pipeline is split across three top-level
 # scripts (`build.sh`, `packROM.sh`, `uploadROM.sh`), the same
-# way the Lite engine is. Unlike Lite, the Stable engine's
-# `uploadROM.sh` cleans `out/` and `build/` after a successful
-# upload, so the launcher has to copy the final ZIP out of the
-# engine's working directory into a stable artifact location
-# BEFORE invoking `uploadROM.sh`. The Lite-style split is
-# preserved here rather than collapsing the three scripts into
-# one wrapper, because the engine is the source of truth for
-# the pipeline contract and changing the launcher to invoke a
-# different script would diverge from what the engine ships.
+# way the Lite engine is. The Lite-style split is preserved here
+# rather than collapsing the three scripts into one wrapper,
+# because the engine is the source of truth for the pipeline
+# contract and changing the launcher to invoke a different script
+# would diverge from what the engine ships.
 #
-# Stage integration
-# ----------------
-# The Stable engine's `uploadROM.sh` uses the same rclone
-# semantics as DeadZone-xiaomi_Lite's uploadROM.sh, with a
-# hard-coded OneDrive remote `starxONEDRIVE:NTBuild/<os>/<poly>/<device>/`:
-#   * rclone copy (one-shot, no checksum)
-#   * hard-coded remote / path layout
-#   * cleans `out/` and `build/` on success
-# The Drive path is `starxONEDRIVE:NTBuild/${OS}/${polyxver}/${device_code}/<zip>`.
-# The launcher also seeds the engine with a centralized
-# `rclone.conf` from `DeadZone-File` so the engine's rclone call
-# has a valid OAuth token; the seed is installed BEFORE
-# `uploadROM.sh setup` would run so the actual `uploadROM.sh`
-# upload uses the same token.
+# Quiet-log policy ("هادية")
+# --------------------------
+# This launcher keeps the Actions web UI readable:
+#   * every step that can produce bulk output wraps it in
+#     `::group::` / `::endgroup::` so the UI stays collapsible
+#   * `apt`, `pip`, `sdkmanager` and `rclone` runs are redirected
+#     to log files and only a short summary reaches the run log
+#   * the engine's build output is streamed to a durable log file
+#     and mirrored to stdout with `tail -F --pid=`, so the live
+#     log stays line-buffered while the file on disk stays
+#     complete. `tail --pid` is used instead of `tee` precisely
+#     because `tee` dies on SIGPIPE when the engine exits early,
+#     which used to truncate `build_action.log` and mask the
+#     engine's real exit status.
+#   * bulk decompression / extraction spam is suppressed by the
+#     engine itself (`>/dev/null 2>&1`).
 #
-# Why we copy the final ZIP to a stable artifact location
-# -------------------------------------------------------
-# `uploadROM.sh` deletes `$work_dir/out` after a successful
-# upload (so the engine's repo stays small between dispatches).
-# That means by the time the workflow's "collect artifact
-# metadata" step runs, the ZIP is gone from `out/`. We
-# therefore copy `out/<final>.zip` to `$GITHUB_WORKSPACE/out/`
-# immediately after `packROM.sh` and before `uploadROM.sh`. The
-# launcher's actions/upload-artifact step can then upload from
-# the stable path regardless of whether the upload step
-# succeeded, failed, or skipped cleanup.
+# Toolchain PATH
+# --------------
+# The engine shells out to the vendored toolchain by BARE NAME
+# (`lpmake`, `mkfs.erofs`, `make_ext4fs`, `extract.erofs`,
+# `payload-extract`). The engine's own line
+#
+#   tools_dir=${work_dir}/bin/$(uname)/$(uname -m)export PATH=...
+#
+# is malformed — bash parses `export` as a separate word, so the
+# assignment actually evaluates to the literal string
+# `<dir>export` and `$tools_dir` is corrupted. (The `PATH` half of
+# that line DOES still take effect, because the second word is a
+# valid `export` command — but `$tools_dir` is unusable.) The
+# launcher therefore exports the toolchain directory explicitly
+# and injects it into the PATH *of the privileged process* via
+# `sudo env PATH=...`, because Ubuntu's sudoers `secure_path`
+# replaces PATH for root-owned commands and would otherwise drop
+# the toolchain directory.
 
 name: Deadzone-Stable
 
@@ -194,6 +254,8 @@ jobs:
           INPUT_URL: ${{ inputs.input_url }}
           REQUEST_ID: ${{ inputs.request_id }}
           CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILDER_NAME: ${{ inputs.builder_name }}
+          BUILDER_ID: ${{ inputs.builder_id }}
         run: |
           import os
           import re
@@ -208,6 +270,32 @@ jobs:
               parsed = urlparse(value)
               if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
                   raise SystemExit(f"{name} must be a safe HTTPS URL")
+
+          # The ROM URL is handed to `aria2c` by the engine
+          # (bin/ddevice/getROM.sh) as an UNQUOTED shell word:
+          #   aria2c --max-download-limit=1024M ... ${baserom}
+          # A URL containing whitespace or shell metacharacters
+          # would therefore be re-split by the engine's shell, and
+          # a crafted value could append a second command. We
+          # accept any printable URL without whitespace or control
+          # characters, so query strings, fragments and
+          # percent-encoding all keep working.
+          if not re.fullmatch(r"[!-~]+", os.environ["INPUT_URL"].strip()):
+              raise SystemExit("INPUT_URL contains unsupported characters")
+
+          # The builder display name is forwarded to the engine and
+          # rendered by the bot's HTML-mode message. Bound the length
+          # so a multi-kilobyte value cannot truncate or break the
+          # notification payload.
+          builder_name = os.environ.get("BUILDER_NAME", "").strip()
+          if len(builder_name) > 64:
+              raise SystemExit("BUILDER_NAME is longer than 64 characters")
+
+          # The builder id is a Telegram user id, used as a numeric
+          # `chat_id`, so it must be a plain signed integer.
+          builder_id = os.environ.get("BUILDER_ID", "").strip()
+          if builder_id and not re.fullmatch(r"-?\d{1,20}", builder_id):
+              raise SystemExit("BUILDER_ID must be a numeric Telegram user ID")
 
       - name: "🔐 Validate launcher credentials"
         env:
@@ -225,6 +313,13 @@ jobs:
             echo "::error::Missing required launcher secret: DEADZONE_PRIVATE_READ_TOKEN. Provision a fine-grained PAT with Contents: Read-only on the private engine repos and add it as the DEADZONE_PRIVATE_READ_TOKEN Actions secret on DeadZone-Offical/DeadZone-Home." >&2
             exit 1
           fi
+          # Mask the PAT for the whole run. `actions/checkout` masks
+          # the token it is handed, but the launcher also has to
+          # surface it to the engine's upload stage, where it can
+          # appear in a curl command line or an error message. An
+          # explicit `::add-mask::` guarantees redaction everywhere
+          # in the log, including inside command traces.
+          printf '::add-mask::%s\n' "$DEADZONE_PRIVATE_READ_TOKEN"
 
       - name: "📥 Checkout DeadZone launcher"
         uses: actions/checkout@v5
@@ -241,16 +336,25 @@ jobs:
           path: runtime
           fetch-depth: 1
           persist-credentials: false
+          # `sparse-checkout-cone-mode: false` is REQUIRED here.
+          # In cone mode (the default) git materialises EVERY
+          # root-level file of the repository regardless of the
+          # requested patterns, so `bot.env` — which holds the
+          # control bot's live GitHub / Telegram / Cloudflare
+          # credentials — is pulled into the workspace even though
+          # it was never requested. Non-cone mode with leading-slash
+          # patterns selects exactly the files listed below.
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
-            projects.env
-            build.env
-            rclone.conf
-            load-build.sh
-            build_stage.py
-            report_build_event.py
-            upload.env
-            upload-mirrors.sh
-            publish-website-release.py
+            /projects.env
+            /build.env
+            /rclone.conf
+            /load-build.sh
+            /build_stage.py
+            /report_build_event.py
+            /upload.env
+            /upload-mirrors.sh
+            /publish-website-release.py
 
       - name: "⚙️ Load central runtime"
         id: runtime
@@ -361,11 +465,21 @@ jobs:
       - name: "🧹 Clean unused runner packages"
         run: |
           set -euo pipefail
-          docker image prune --all --force || true
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android || true
-          sudo apt-get purge -y azure-cli "ghc*" "zulu*" "hhvm*" "llvm*" firefox "google*" "dotnet*" powershell "mysql*" "php*" || true
-          sudo apt-get autoremove --purge -y || true
-          sudo apt-get clean
+          # Redirect the whole cleanup to a log file. `apt-get
+          # purge` prints one line per removed package and
+          # `docker image prune` prints one line per deleted image —
+          # together several hundred lines of noise for a step whose
+          # only output of interest is "it worked".
+          {
+            docker image prune --all --force
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android
+            sudo apt-get purge -y azure-cli "ghc*" "zulu*" "hhvm*" "llvm*" firefox "google*" "dotnet*" powershell "mysql*" "php*"
+            sudo apt-get autoremove --purge -y
+            sudo apt-get clean
+          } > /tmp/runner-clean.log 2>&1 || true
+          printf '::group::Runner cleanup\n'
+          printf '  log: /tmp/runner-clean.log (%s lines)\n' "$(wc -l < /tmp/runner-clean.log)"
+          printf '::endgroup::'
 
       - name: "📦 Checkout private Stable engine"
         uses: actions/checkout@v5
@@ -420,8 +534,9 @@ jobs:
           ref: main
           token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           path: liteengine
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
-            bin/imaging/fix_selinux.py
+            /bin/imaging/fix_selinux.py
           lfs: false
           fetch-depth: 1
           persist-credentials: false
@@ -590,9 +705,21 @@ jobs:
             stat -c 'mode=%a owner=%U:%G' "$canonical_bin" || true
             exit 1
           fi
-          printf '::group::Stable toolchain permissions\n'
-          ls -l "$canonical_bin" "$toolchain_dir/lpunpack" 2>/dev/null || true
-          printf '::endgroup::\n'
+          # Export the resolved toolchain directory so the Build,
+          # Pack and staging steps can put it on the PATH of the
+          # privileged engine process.
+          printf 'DEADZONE_TOOLCHAIN_DIR=%s\n' "$toolchain_dir" >> "$GITHUB_ENV"
+          printf '::group::Stable toolchain\n'
+          printf '  directory: %s\n' "$toolchain_dir"
+          printf '  mode: %s\n' "$(stat -c '%a' "$canonical_bin")"
+          for tool in extract.erofs lpmake mkfs.erofs make_ext4fs payload-extract; do
+            if [[ -x "$toolchain_dir/$tool" ]]; then
+              printf '  resolved: %s\n' "$tool"
+            else
+              printf '  missing:  %s\n' "$tool"
+            fi
+          done
+          printf '::endgroup::'
 
       - name: "🧭 Validate Stable engine layout"
         working-directory: toolbuild
@@ -780,13 +907,40 @@ jobs:
           )
 
           sudo rm -rf /var/lib/apt/lists/*
-          sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get purge -y device-tree-compiler || true
+          # Quiet apt: the full package list is written to a log
+          # file and only a summary reaches the run log.
+          # `apt-get update` alone prints 200+ "Get:" / "Hit:"
+          # lines and the install prints one line per package.
+          sudo apt-get -o Acquire::Retries=3 update > /tmp/apt-update.log 2>&1
+          sudo apt-get purge -y device-tree-compiler > /dev/null 2>&1 || true
+          # NOTE: `7zip` (not `p7zip-full`) is the correct package on
+          # Ubuntu 24.04. `p7zip-full` is a transitional dummy that
+          # ships no binaries and merely depends on `7zip`. The
+          # engine's `check` gate requires `7z`, and the DSV / CNFN
+          # engine scripts require `7za` — both are provided by the
+          # `7zip` package (`/usr/bin/7z`, `/usr/bin/7za`).
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             aria2 jq rclone python-is-python3 wget python3 python3-pip \
             lz4 xz-utils zlib1g-dev gcc g++ libc6 libstdc++6 \
-            busybox zip unzip p7zip-full zipalign zstd bc erofs-utils erofsfuse \
-            android-sdk-libsparse-utils xmlstarlet aapt rsync openssh-client curl
+            busybox zip unzip 7zip zipalign zstd bc erofs-utils erofsfuse \
+            android-sdk-libsparse-utils xmlstarlet aapt rsync openssh-client curl \
+            > /tmp/apt-install.log 2>&1
+          printf '::group::Dependencies\n'
+          printf '  apt log: /tmp/apt-install.log (%s lines)\n' "$(wc -l < /tmp/apt-install.log)"
+          printf '::endgroup::'
+          # Verify every tool the engine shells out to by bare name.
+          # The engine's `check` helper calls `apt install <name>`
+          # for a missing binary, which has no package mapping and
+          # fails in a confusing way — so fail fast here with the
+          # actual missing list instead.
+          missing_tools=()
+          for tool in unzip aria2c 7za 7z zip java zipalign python3 zstd bc xmlstarlet aapt rclone; do
+            command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
+          done
+          if (( ${#missing_tools[@]} > 0 )); then
+            echo "::error::Required engine tools are missing from PATH: ${missing_tools[*]}" >&2
+            exit 1
+          fi
           sudo pip3 install --break-system-packages --no-cache-dir ConfigObj lz4 zstandard setuptools || \
             sudo pip3 install --no-cache-dir ConfigObj lz4 zstandard setuptools
 
@@ -838,97 +992,10 @@ jobs:
             echo "::error::Central rclone.conf does not define expected remote: ${RCLONE_REMOTE_NAME}"
             exit 1
           fi
-          rclone version
+          printf '::group::Rclone\n'
+          rclone version | head -3
+          printf '::endgroup::'
 
-      - name: "🛠️ Install Android SDK build-tools 34.0.0 (apksigner, zipalign, aapt2)"
-        working-directory: toolbuild
-        run: |
-          set -euo pipefail
-          # The Stable engine's bin/modfile/UpdateFile/system/
-          # DeadZone_ExternalStorageProvider/update.sh and
-          # bin/modfile/UpdateFile/system_ext/DeadZone_Provision/
-          # A16/provision_patch.py hardcode
-          #   $ANDROID_BUILD_TOOLS:/$HOME/android-sdk/build-tools/34.0.0
-          # for `zipalign`, `apksigner`, and `aapt2`. Without this
-          # step, the build aborts with
-          # `error: missing required tool: .../build-tools/34.0.0/zipalign`
-          # the first time a mod that needs to rebuild an APK runs.
-          # We install only the build-tools 34.0.0 subpackage
-          # (smallest possible payload) and a platform-tools jar
-          # mirror is not required: every mod uses cmdline-tools'
-          # sdkmanager to install build-tools into a per-runner
-          # $HOME/android-sdk, which is exactly what the scripts
-          # expect.
-          ANDROID_SDK_ROOT="$HOME/android-sdk"
-          BUILD_TOOLS_VERSION="34.0.0"
-          export ANDROID_SDK_ROOT
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          # Stable `HOME` on a hosted runner is /home/runner. The
-          # cmdline-tools tarball is small (~150 MB) and the
-          # install is idempotent: sdkmanager skips any package
-          # already at the expected version.
-          CMDLINE_TOOLS_VERSION="11076708"
-          CMDLINE_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_TOOLS_VERSION}_latest.zip"
-          CMDLINE_TOOLS_DIR="$ANDROID_SDK_ROOT/cmdline-tools/latest"
-          if [[ ! -x "$CMDLINE_TOOLS_DIR/bin/sdkmanager" ]]; then
-            tmp_zip="$(mktemp -t cmdline-tools-XXXXXX.zip)"
-            echo "Fetching Android cmdline-tools ${CMDLINE_TOOLS_VERSION}..."
-            curl --fail --silent --show-error --retry 3 --retry-delay 2 \
-              --connect-timeout 30 --max-time 600 \
-              -o "$tmp_zip" "$CMDLINE_TOOLS_URL"
-            unzip -q "$tmp_zip" -d "$ANDROID_SDK_ROOT/cmdline-tools/"
-            # The zip extracts to cmdline-tools/cmdline-tools/;
-            # sdkmanager expects cmdline-tools/latest/.
-            rm -rf "$CMDLINE_TOOLS_DIR"
-            mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$CMDLINE_TOOLS_DIR"
-            rm -f "$tmp_zip"
-          fi
-          export PATH="$CMDLINE_TOOLS_DIR/bin:$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}:$PATH"
-          if [[ ! -x "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/zipalign" ]]; then
-            echo "Installing Android build-tools ${BUILD_TOOLS_VERSION}..."
-            # Pre-accept SDK licenses by writing the well-known
-            # android-sdk-license SHA-256 hashes into
-            # \$ANDROID_SDK_ROOT/licenses/. This lets sdkmanager
-            # run non-interactively in CI.
-            mkdir -p "$ANDROID_SDK_ROOT/licenses"
-            printf '%s\n%s\n%s\n' \
-              "8933bad161af4178b1185d1a37fbf41ea5269c55" \
-              "d56f5187479451eabf01fb78af6dfcb131a6481e" \
-              "24333f8a63b6825ea9c5514f83c2829b004d1fee" \
-              > "$ANDROID_SDK_ROOT/licenses/android-sdk-license"
-            # The 'yes | sdkmanager' pipeline emits
-            # 'yes: standard output: Broken pipe' on hosted
-            # runners because sdkmanager closes stdin after the
-            # first prompt. That is a benign SIGPIPE on `yes`,
-            # not an install failure. We temporarily disable
-            # pipefail for this single command so the broken
-            # pipe does not abort the step, then rely on the
-            # per-tool existence check below to detect a real
-            # install failure.
-            set +o pipefail
-            yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
-              --install "build-tools;${BUILD_TOOLS_VERSION}" >/dev/null 2>&1
-            sdkmanager_rc=$?
-            set -o pipefail
-            if [[ $sdkmanager_rc -ne 0 ]]; then
-              echo "::notice::sdkmanager exited with $sdkmanager_rc; relying on per-tool existence check."
-            fi
-          fi
-          for tool in zipalign apksigner aapt2; do
-            tool_path="$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS_VERSION}/${tool}"
-            if [[ ! -x "$tool_path" ]]; then
-              echo "::error::Android build-tools ${BUILD_TOOLS_VERSION} is missing ${tool} at ${tool_path}"
-              exit 1
-            fi
-            "$tool_path" version >/dev/null 2>&1 \
-              || echo "::notice::${tool} did not respond to 'version' subcommand (often a warning, not a failure)"
-          done
-          # Persist for the subsequent Build / Pack / Upload steps.
-          {
-            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
-            echo "ANDROID_BUILD_TOOLS=${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS_VERSION}"
-          } >> "$GITHUB_ENV"
-          echo "Android build-tools ${BUILD_TOOLS_VERSION} ready at ${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS_VERSION}"
       - name: "🚀 Build, release, and upload Stable ROM (refactored layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'refactored'
         working-directory: toolbuild
@@ -1026,21 +1093,7 @@ jobs:
           DEADZONE_INPUT_URL: ${{ inputs.input_url }}
           DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
           DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
-          # Pin zipalign and apksigner to the runner's Android
-          # SDK build-tools that the previous step installed.
-          # The engine's mod scripts (FrameworkServices,
-          # ExternalStorageProvider, Provision, etc.) honour
-          # $ZIPALIGN and $APKSIGNER when set, but fall back
-          # to /home/mohammed/... when the env is empty -- a
-          # hardcoded path that does not exist on a hosted
-          # runner. We override the env here so every mod
-          # script sees the same path the SDK install step
-          # validated.
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
-          ANDROID_BUILD_TOOLS: ${{ env.ANDROID_BUILD_TOOLS }}
-          ZIPALIGN: ${{ env.ANDROID_BUILD_TOOLS }}/zipalign
-          APKSIGNER: ${{ env.ANDROID_BUILD_TOOLS }}/apksigner
-          AAPT2: ${{ env.ANDROID_BUILD_TOOLS }}/aapt2
+          DEADZONE_TOOLCHAIN_DIR: ${{ env.DEADZONE_TOOLCHAIN_DIR }}
         run: |
           set -Eeuo pipefail
           # The pre-refactor Stable engine's pipeline is three
@@ -1060,13 +1113,20 @@ jobs:
           # Telegram lifecycle (download, unpack, build), so we
           # do NOT call notify.py here — the engine already
           # does. `packROM.sh` and `uploadROM.sh` are run in
-          # separate steps below so the launcher can copy the
-          # final ZIP to a stable artifact location BEFORE
-          # `uploadROM.sh` cleans up the engine's working
-          # directory.
+          # separate steps below so the launcher can rebuild
+          # `super.img`, stage the ZIP, capture it to a stable
+          # artifact location, and upload it.
+          # The engine shells out to the vendored toolchain by
+          # BARE NAME (`payload-extract`, `extract.erofs`,
+          # `lpmake`, ...). We export the toolchain directory and
+          # then re-inject it into the PATH of the PRIVILEGED
+          # process with `sudo env PATH=...`, because Ubuntu's
+          # sudoers `secure_path` replaces PATH for root-owned
+          # commands and would otherwise drop it.
+          export PATH="$PWD/${DEADZONE_TOOLCHAIN_DIR:-bin/Linux/x86_64}:$PATH"
           log_path="$PWD/build_action.log"
           : > "$log_path"
-          sudo -E stdbuf -oL -eL bash build.sh \
+          sudo env "PATH=$PATH" stdbuf -oL -eL bash build.sh \
             "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" \
             > "$log_path" 2>&1 &
@@ -1085,130 +1145,62 @@ jobs:
           DEADZONE_INPUT_URL: ${{ inputs.input_url }}
           DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
           DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
-          ANDROID_BUILD_TOOLS: ${{ env.ANDROID_BUILD_TOOLS }}
-          ZIPALIGN: ${{ env.ANDROID_BUILD_TOOLS }}/zipalign
-          APKSIGNER: ${{ env.ANDROID_BUILD_TOOLS }}/apksigner
-          AAPT2: ${{ env.ANDROID_BUILD_TOOLS }}/aapt2
+          DEADZONE_TOOLCHAIN_DIR: ${{ env.DEADZONE_TOOLCHAIN_DIR }}
         run: |
           set -Eeuo pipefail
-          # `packROM.sh` rebuilds the super.img from the
-          # unpacked partitions in `build/baserom/images/` and
-          # produces the final ZIP in `out/`. The pack notify
-          # call mirrors the verified Lite pack step and is
-          # best-effort: a Telegram failure must not fail a
-          # build that has already produced a usable artifact.
+          # `packROM.sh` rebuilds `super.img` from the unpacked
+          # partitions in `build/baserom/images/`. It does NOT
+          # create a ZIP and it does NOT write
+          # `bin/ddevice/output_zip.txt` - `uploadROM.sh` does
+          # both, one step later. The previous revision read
+          # `output_zip.txt` here and therefore failed on every
+          # run with "packROM.sh did not record the final ZIP
+          # path".
           #
-          # The launcher captures the final ZIP by globbing
-          # `out/` IMMEDIATELY after `packROM.sh` completes,
-          # because the next step (`uploadROM.sh`) deletes
-          # both `out/` and `build/` on success. The captured
-          # ZIP is copied to a stable artifact location
-          # (`$GITHUB_WORKSPACE/out/`) so the workflow's
-          # downstream artifact-metadata and upload steps can
-          # find the file regardless of what `uploadROM.sh`
-          # does.
+          # The pack notify call mirrors the verified Lite pack
+          # step and is best-effort: a Telegram failure must not
+          # fail a build that has already produced a usable
+          # artifact.
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
-          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
-          if [[ ! -s bin/ddevice/output_zip.txt ]]; then
-            echo "::error::packROM.sh did not record the final ZIP path in bin/ddevice/output_zip.txt" >&2
+          # The engine shells out to the vendored toolchain by
+          # BARE NAME (`lpmake`, `mkfs.erofs`, `make_ext4fs`).
+          # We export the toolchain directory and then re-inject
+          # it into the PATH of the PRIVILEGED process with
+          # `sudo env PATH=...`, because Ubuntu's sudoers
+          # `secure_path` replaces PATH for root-owned commands
+          # and would otherwise drop it - which surfaces as
+          # `lpmake: command not found` after the 20-minute
+          # partition repack.
+          export PATH="$PWD/${DEADZONE_TOOLCHAIN_DIR:-bin/Linux/x86_64}:$PATH"
+          # `tail --pid` mirrors the durable log to stdout and
+          # exits as soon as the engine exits. `tee` is avoided
+          # because it dies on SIGPIPE when the engine exits
+          # early, which truncates `build_action.log` and hides
+          # the real exit status.
+          log_path="$PWD/build_action.log"
+          sudo env "PATH=$PATH" stdbuf -oL -eL bash packROM.sh > "$log_path" 2>&1 &
+          pack_pid=$!
+          tail -n +1 -F --pid="$pack_pid" "$log_path" || true
+          wait "$pack_pid"
+          pack_status=$?
+          if (( pack_status != 0 )); then
+            echo "::error::packROM.sh failed with status ${pack_status}." >&2
+            exit "$pack_status"
+          fi
+          # The rebuilt super image MUST exist - otherwise the
+          # engine silently produced no output and the ZIP built
+          # from it would be an empty shell.
+          if [[ ! -f build/baserom/images/super.img ]]; then
+            echo "::error::packROM.sh completed but build/baserom/images/super.img is missing." >&2
+            echo "::error::Inspect build_action.log for the lpmake / mkfs.erofs diagnostics." >&2
             exit 1
           fi
-          final_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
-          final_zip="$PWD/out/${final_name}"
-          if [[ ! -f "$final_zip" ]]; then
-            echo "::error::packROM.sh recorded '$final_name' in output_zip.txt but the file does not exist at $final_zip" >&2
-            exit 1
-          fi
-          # Capture the final ZIP into a stable, upload-step-visible
-          # location on the LVM-backed build volume
-          # (`$GITHUB_WORKSPACE/toolbuild/artifact/`). A 6 GB
-          # Stable ZIP does NOT fit in `$GITHUB_WORKSPACE/out/`,
-          # which lives on the root filesystem (only `root-reserve-mb`
-          # MB free — currently 2048 MB, but the root FS is also
-          # where the runner agent writes its continuous diagnostic
-          # log). Copying to the LVM-backed `toolbuild/artifact/`
-          # subdirectory keeps the capture off the root FS entirely
-          # and on the same filesystem the engine's `out/` lives on.
-          #
-          # The `🧽 Cleanup Stable workspace` step (line ~1809)
-          # umounts `toolbuild/` and `rm -rf`s the directory, so
-          # the captured artifact would be lost on that step. The
-          # step ordering in this workflow runs the upload steps
-          # (final ZIP + debug logs) BEFORE the cleanup so the
-          # artifact is on a still-mounted LVM when
-          # `actions/upload-artifact@v6` reads it.
-          stable_out="$GITHUB_WORKSPACE/toolbuild/artifact"
-          mkdir -p "$stable_out"
-          if ! cp -f "$final_zip" "$stable_out/${final_name}"; then
-            echo "::error::Failed to capture final Stable ZIP at $stable_out/${final_name}; the LVM build volume ran out of space during the cp. Investigate toolbuild/ free space (df -h toolbuild) and re-dispatch." >&2
-            exit 1
-          fi
-          # Verify the captured copy is byte-identical to the
-          # engine-produced ZIP. A mismatch is a hard failure: if
-          # the source and the copy differ, the artifact the
-          # workflow publishes is not the artifact the engine
-          # produced, and that is a correctness bug, not a
-          # transient IO problem.
-          _src_sha="$(sha256sum "$final_zip" 2>/dev/null | awk '{print $1}')"
-          _dst_sha="$(sha256sum "$stable_out/${final_name}" 2>/dev/null | awk '{print $1}')"
-          if [[ "$_src_sha" != "$_dst_sha" || -z "$_src_sha" ]]; then
-            echo "::error::Captured Stable artifact SHA-256 mismatch: source=$_src_sha captured=$_dst_sha" >&2
-            exit 1
-          fi
-          _zip_bytes="$(stat -c '%s' "$final_zip" 2>/dev/null || stat -f '%z' "$final_zip" 2>/dev/null || echo 0)"
-          echo "Captured pre-upload Stable ZIP: ${final_name} (${_zip_bytes} bytes, SHA-256=${_src_sha})"
-          printf 'DEADZONE_RESULT_NAME=%s\n' "$final_name" >> "$GITHUB_ENV"
+          printf '::group::Pack result\n'
+          printf '  super.img: %s bytes\n' "$(stat -c '%s' build/baserom/images/super.img 2>/dev/null || echo '?')"
+          printf '::endgroup::'
 
-      - name: "☁️ Setup rclone for Stable upload (pre-refactor layout)"
-        if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
-        env:
-          RCLONE_CONFIG_BUILD_ENV_PATH: ${{ vars.RCLONE_CONFIG_BUILD_ENV_PATH || 'build.env' }}
-        working-directory: toolbuild
-        run: |
-          set -euo pipefail
-          # The pre-refactor Stable engine's `uploadROM.sh setup`
-          # subcommand now accepts an optional 4th positional arg
-          # `<build_env_path>` (in addition to the existing
-          # `<token> <repo> <rclone_path>`). When the 4th arg is
-          # provided, the engine fetches the build.env file from
-          # the central runtime repo via the GitHub Contents API
-          # and forwards its three non-secret routing values
-          # (`RCLONE_REMOTE_NAME`, `RCLONE_UPLOAD_DIR`,
-          # `RCLONE_PUBLIC_LINK_BASE`) to `GITHUB_ENV`. We already
-          # load those values from the central runtime in the
-          # `⚙️ Load central runtime` step above, so the engine
-          # forwarding is redundant for THIS launcher; the
-          # forwarding is still useful for the standalone
-          # `DeadZone-Xiaomi-Stable` workflow and for any future
-          # caller that does not have the central runtime.
-          # The 3-arg form (no build.env) is still supported for
-          # older engines.
-          if [[ -z "${RCLONE_REMOTE_NAME:-}" || -z "${RCLONE_UPLOAD_DIR:-}" ]]; then
-            echo "::error::RCLONE_REMOTE_NAME or RCLONE_UPLOAD_DIR is missing from the central runtime; cannot configure rclone for the Stable upload." >&2
-            exit 1
-          fi
-          : "${GH_TOKEN_FOR_RCLONE:=${DEADZONE_PRIVATE_READ_TOKEN:-}}"
-          : "${RCLONE_CONFIG_REPO_OWNER:=DeadZone-Offical}"
-          : "${RCLONE_CONFIG_REPO_NAME:=DeadZone-File}"
-          : "${RCLONE_CONFIG_PATH:=rclone.conf}"
-          if [[ -z "$GH_TOKEN_FOR_RCLONE" ]]; then
-            echo "::error::No GitHub token available for the rclone.conf fetch; the DEADZONE_PRIVATE_READ_TOKEN secret must be provisioned on DeadZone-Offical/DeadZone-Home." >&2
-            exit 1
-          fi
-          sudo -E bash uploadROM.sh setup \
-            "$GH_TOKEN_FOR_RCLONE" \
-            "${RCLONE_CONFIG_REPO_OWNER}/${RCLONE_CONFIG_REPO_NAME}" \
-            "$RCLONE_CONFIG_PATH" \
-            "${RCLONE_CONFIG_BUILD_ENV_PATH:-}"
-          if [[ ! -s rclone.conf ]]; then
-            echo "::error::uploadROM.sh setup did not write rclone.conf to $PWD/rclone.conf" >&2
-            exit 1
-          fi
-          chmod 600 rclone.conf
-
-      - name: "☁️ Upload Stable ROM (pre-refactor layout)"
+      - name: "📦 Stage and ZIP Stable ROM (pre-refactor layout)"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
         working-directory: toolbuild
         env:
@@ -1218,30 +1210,225 @@ jobs:
           DEADZONE_BUILDER_ID: ${{ inputs.builder_id }}
         run: |
           set -Eeuo pipefail
-          # The pre-refactor Stable engine's `uploadROM.sh`
-          # uploads the final ZIP to the canonical Drive path
-          # `starxONEDRIVE:NTBuild/<os>/<poly>/<device>/<zip>`
-          # and then cleans `$work_dir/out` and `$work_dir/build`.
-          # We pre-copied the final ZIP to
-          # `$GITHUB_WORKSPACE/out/<name>` in the Pack step
-          # above so the artifact survives the cleanup and the
-          # downstream artifact-metadata step can still find it.
+          # `uploadROM.sh` does TWO things:
+          #   1. stages the flashable tree under `out/`, runs
+          #      `zip -r`, and records the final ZIP name in
+          #      `bin/ddevice/output_zip.txt`;
+          #   2. uploads that ZIP to Google Drive through
+          #      `upload_rom_api.py`.
           #
-          # We do NOT fail the workflow on a non-zero upload
-          # exit: a build that produced a usable artifact but
-          # failed to upload is a "build succeeded, upload
-          # failed" outcome, not a build failure. The
-          # "❌ Send failure notification" step is gated on
-          # `failure()` and would not fire for this case; the
-          # failure is surfaced via the build summary's
-          # DEADZONE_GOOGLE_UPLOAD_STATUS=0 vs !=0 rendering.
-          python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "stable" \
-            "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
+          # Part 2 cannot work: the Drive client authenticates
+          # with a `token.pickle` credential that has never been
+          # committed to `DeadZone-Offical/DeadZone-File` (the
+          # Contents API returns 404 for it), and the engine
+          # swallows the failure:
+          #
+          #   python $work_dir/upload_rom_api.py "$output_file" \
+          #     --folder_id "..." --path "..." || {
+          #       upload "Error uploading file to Google Drive"
+          #   }
+          #
+          # The `|| { ... }` block only prints a message, so the
+          # script still exits 0. The engine therefore reports
+          # success while NOTHING was uploaded. We run the
+          # staging half with the Drive client neutered so the
+          # ZIP and `output_zip.txt` are produced, and the
+          # launcher performs the real upload with rclone in the
+          # next step.
+          #
+          # We deliberately do NOT call `uploadROM.sh setup`:
+          # that subcommand treats its 4th positional argument as
+          # the rclone config PATH and fetches it with
+          #   curl -o $work_dir/rclone.conf ... /contents/$4
+          # The previous revision passed `build.env` as that 4th
+          # argument, which overwrote `rclone.conf` with the
+          # plain-text contents of `build.env` and left rclone
+          # with no usable configuration. The launcher seeds
+          # `rclone.conf` from the central runtime itself.
+          if [[ -z "${RCLONE_REMOTE_NAME:-}" || -z "${RCLONE_UPLOAD_DIR:-}" ]]; then
+            echo "::error::RCLONE_REMOTE_NAME or RCLONE_UPLOAD_DIR is missing from the central runtime; cannot upload the Stable ROM." >&2
+            exit 1
+          fi
+          # Shadow the Drive client with a no-op that leaves the
+          # staged ZIP and `output_zip.txt` intact.
+          upload_api="$PWD/upload_rom_api.py"
+          if [[ -f "$upload_api" ]]; then
+            mv -f "$upload_api" "${upload_api}.engine-original"
+            cat > "$upload_api" <<'NOOP'
+          #!/usr/bin/env python3
+          # Disabled by the DeadZone Stable launcher: this Google
+          # Drive API client requires a `token.pickle` credential
+          # that the central runtime does not publish, and the
+          # engine swallows the resulting failure. The launcher
+          # performs the real upload with rclone instead.
+          import sys
+          sys.exit(0)
+          NOOP
+            chmod +x "$upload_api"
+          fi
+          log_path="$PWD/build_action.log"
           set +e
-          sudo -E bash uploadROM.sh 2>&1 | tee -a build_action.log
-          google_status=${PIPESTATUS[0]}
+          sudo env "PATH=$PATH" stdbuf -oL -eL bash uploadROM.sh > "$log_path" 2>&1 &
+          upload_pid=$!
+          tail -n +1 -F --pid="$upload_pid" "$log_path" || true
+          wait "$upload_pid"
+          upload_status=$?
           set -e
-          printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
+          # Restore the engine's real client so the workspace stays
+          # faithful to the engine source.
+          if [[ -f "${upload_api}.engine-original" ]]; then
+            mv -f "${upload_api}.engine-original" "$upload_api"
+          fi
+          if (( upload_status != 0 )); then
+            echo "::error::uploadROM.sh failed with status ${upload_status}." >&2
+            exit "$upload_status"
+          fi
+          if [[ ! -s bin/ddevice/output_zip.txt ]]; then
+            echo "::error::uploadROM.sh did not record the final ZIP name in bin/ddevice/output_zip.txt" >&2
+            exit 1
+          fi
+          final_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
+          if [[ ! -f "out/${final_name}" ]]; then
+            echo "::error::uploadROM.sh recorded '$final_name' in output_zip.txt but the file does not exist at out/${final_name}" >&2
+            exit 1
+          fi
+          printf 'DEADZONE_RESULT_NAME=%s\n' "$final_name" >> "$GITHUB_ENV"
+
+      - name: "🗂️ Capture Stable artifact"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
+        working-directory: toolbuild
+        env:
+          DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
+        run: |
+          set -Eeuo pipefail
+          final_name="${DEADZONE_RESULT_NAME:-}"
+          if [[ -z "$final_name" ]]; then
+            echo "::error::DEADZONE_RESULT_NAME is empty; the staging step did not record a final ZIP name." >&2
+            exit 1
+          fi
+          final_zip="$PWD/out/${final_name}"
+          if [[ ! -f "$final_zip" ]]; then
+            echo "::error::The final Stable ZIP '$final_name' is missing at $final_zip" >&2
+            exit 1
+          fi
+          # Capture the ZIP into a stable, upload-visible location on
+          # the LVM-backed build volume (`$GITHUB_WORKSPACE/toolbuild/artifact/`).
+          # A multi-GB Stable ZIP does NOT fit on the root filesystem
+          # (only `root-reserve-mb` MB is free there, and the runner
+          # agent writes its continuous diagnostic log to the same
+          # filesystem), so the capture must stay on the LVM volume.
+          #
+          # The `Cleanup Stable workspace` step umounts `toolbuild/`
+          # and removes the directory, so the artifact has to be
+          # uploaded BEFORE that step runs. The step order in this
+          # workflow does exactly that.
+          stable_out="$GITHUB_WORKSPACE/toolbuild/artifact"
+          mkdir -p "$stable_out"
+          if ! cp -f "$final_zip" "$stable_out/${final_name}"; then
+            echo "::error::Failed to capture the final Stable ZIP at $stable_out/${final_name}; the LVM build volume ran out of space during the copy. Inspect 'df -h toolbuild' and re-dispatch." >&2
+            exit 1
+          fi
+          # Verify the captured copy is byte-identical to the
+          # engine-produced ZIP. A mismatch is a hard failure: the
+          # published artifact would not be the artifact the engine
+          # produced.
+          _src_sha="$(sha256sum "$final_zip" 2>/dev/null | awk '{print $1}')"
+          _dst_sha="$(sha256sum "$stable_out/${final_name}" 2>/dev/null | awk '{print $1}')"
+          if [[ -z "$_src_sha" || "$_src_sha" != "$_dst_sha" ]]; then
+            echo "::error::Captured Stable artifact SHA-256 mismatch: source=$_src_sha captured=$_dst_sha" >&2
+            exit 1
+          fi
+          _zip_bytes="$(stat -c '%s' "$final_zip" 2>/dev/null || stat -f '%z' "$final_zip" 2>/dev/null || echo 0)"
+          printf 'DEADZONE_RESULT_SIZE=%s\n' "$_zip_bytes" >> "$GITHUB_ENV"
+          printf 'DEADZONE_INTEGRITY_SHA256=%s\n' "$_dst_sha" >> "$GITHUB_ENV"
+          echo "Captured Stable ZIP: ${final_name} (${_zip_bytes} bytes, SHA-256=${_dst_sha})"
+
+      - name: "☁️ Upload Stable ROM to Google Drive"
+        if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
+        working-directory: toolbuild
+        env:
+          DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
+        run: |
+          set -Eeuo pipefail
+          # The engine's own upload half cannot work (see the
+          # staging step above), so the launcher performs the real
+          # upload through rclone against the canonical
+          # central-runtime remote.
+          if [[ -z "${RCLONE_REMOTE_NAME:-}" || -z "${RCLONE_UPLOAD_DIR:-}" ]]; then
+            echo "::error::RCLONE_REMOTE_NAME or RCLONE_UPLOAD_DIR is missing; cannot upload the Stable ROM." >&2
+            exit 1
+          fi
+          final_name="${DEADZONE_RESULT_NAME:-}"
+          final_zip="$PWD/artifact/${final_name}"
+          if [[ -z "$final_name" || ! -f "$final_zip" ]]; then
+            echo "::error::The captured Stable ZIP is missing at $final_zip" >&2
+            exit 1
+          fi
+          # Mirror the verified Lite / Ninja destination layout:
+          #   <remote>:<upload_dir>/Stable/<codename>/<os>/<zip>
+          codename="$(tr '[:lower:]' '[:upper:]' < "$PWD/bin/ddevice/device_f.txt" 2>/dev/null | sed 's/ /_/g' | tr -cd 'A-Za-z0-9._+-' || true)"
+          rom_version="$(tr -d '\r\n' < "$PWD/bin/ddevice/base_rom_code.txt" 2>/dev/null || true)"
+          if [[ "$rom_version" =~ ^(OS[0-9]+) ]]; then
+            os_folder="${BASH_REMATCH[1]}"
+          elif [[ "$rom_version" =~ ^[Vv]([0-9]+) ]]; then
+            os_folder="MIUI${BASH_REMATCH[1]}"
+          else
+            os_folder=""
+          fi
+          if [[ -z "$codename" || -z "$os_folder" ]]; then
+            echo "::error::Cannot derive the Drive destination: codename='${codename}' os_folder='${os_folder}'. The engine did not write bin/ddevice/device_f.txt / base_rom_code.txt." >&2
+            exit 1
+          fi
+          drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}"
+          echo "Uploading to ${drive_remote}"
+          # `copyto --checksum` is a resumable, idempotent copy that
+          # skips the transfer when the remote object already has
+          # the same checksum. The engine's own rclone call was
+          # commented out, so this is the only upload path.
+          if ! rclone --config="$PWD/rclone.conf" copyto --checksum --retries 3 --stats 30s --stats-one-line \
+              "$final_zip" "$drive_remote" > /tmp/rclone-upload.log 2>&1; then
+            echo "::error::rclone upload to ${drive_remote} failed." >&2
+            tail -n 30 /tmp/rclone-upload.log >&2
+            exit 1
+          fi
+          # Verify the object actually landed on the remote. A
+          # successful `rclone copyto` return code is not proof that
+          # the destination is usable.
+          if ! rclone --config="$PWD/rclone.conf" lsjson "$drive_remote" > /tmp/rclone-verify.json 2>/dev/null; then
+            echo "::error::The uploaded object ${drive_remote} could not be verified on the remote." >&2
+            exit 1
+          fi
+          remote_size="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[0].get("Size",0) if d else 0)' /tmp/rclone-verify.json 2>/dev/null || echo 0)"
+          local_size="$(stat -c '%s' "$final_zip" 2>/dev/null || echo 0)"
+          if [[ "$remote_size" != "$local_size" || "$local_size" == "0" ]]; then
+            echo "::error::Uploaded object size mismatch: local=${local_size} remote=${remote_size}" >&2
+            exit 1
+          fi
+          # Prefer a full checksum comparison when the remote exposes a
+          # hash (Drive does, via rclone's md5 support). A size match
+          # alone would accept a corrupted-but-same-length object.
+          local_md5="$(md5sum "$final_zip" 2>/dev/null | awk '{print $1}')"
+          remote_md5="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print((d[0].get("Hashes",{}) or {}).get("md5","") if d else "")' /tmp/rclone-verify.json 2>/dev/null || true)"
+          if [[ -n "$local_md5" && -n "$remote_md5" ]]; then
+            if [[ "$local_md5" != "$remote_md5" ]]; then
+              echo "::error::Uploaded object checksum mismatch: local_md5=${local_md5} remote_md5=${remote_md5}" >&2
+              exit 1
+            fi
+            _verified_by="md5"
+          else
+            # The remote does not expose a hash; the size check above
+            # is the strongest available proof.
+            _verified_by="size"
+          fi
+          # Publish the verification result so the success notification
+          # and the build summary can render the public Drive link.
+          printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=0\n' >> "$GITHUB_ENV"
+          printf 'DEADZONE_UPLOAD_VERIFIED=1\n' >> "$GITHUB_ENV"
+          printf '::group::Upload\n'
+          printf '  remote: %s\n' "$drive_remote"
+          printf '  bytes:  %s\n' "$local_size"
+          printf '  verified by: %s\n' "$_verified_by"
+          printf '::endgroup::'
 
       - name: "📡 Report progress to bot (Lite parity)"
         if: success()
@@ -1369,17 +1556,15 @@ jobs:
           #     (the engine's Stage 10 release step writes it
           #     there, and the engine does NOT clean `out/`)
           #
-          #   * pre-refactor: the launcher pre-copied the ZIP
-          #     to `$GITHUB_WORKSPACE/toolbuild/artifact/<name>`
-          #     in the "📦 Pack Stable ROM" step. We capture
+          #   * pre-refactor: the launcher captures the ZIP to
+          #     `$GITHUB_WORKSPACE/toolbuild/artifact/<name>` in
+          #     the "🗂️ Capture Stable artifact" step, which runs
+          #     AFTER `uploadROM.sh` has created it. We capture
           #     on the LVM-backed build volume (NOT on the
           #     root FS at `$GITHUB_WORKSPACE/out/`) because
           #     the root FS only has `root-reserve-mb` free
-          #     after `maximize-build-space` runs, and a 6 GB
-          #     Stable ZIP would ENOSPC there. The final name
-          #     is recorded in `bin/ddevice/output_zip.txt`
-          #     (which `uploadROM.sh` writes just before its
-          #     rclone copy).
+          #     after `maximize-build-space` runs, and a multi-GB
+          #     Stable ZIP would ENOSPC there.
           #
           # We accept either location. The `if: success()`
           # gate ensures a build that never produced a final
@@ -1394,19 +1579,16 @@ jobs:
             mapfile -t final_zips < <(find "$PWD/out" -maxdepth 1 -type f -name 'DeadZone_Stable_*.zip' -print 2>/dev/null)
             artifact_dir="$PWD/out"
           else
-            # pre_refactor: the ZIP was pre-copied to
+            # pre_refactor: the ZIP was captured to
             # $GITHUB_WORKSPACE/toolbuild/artifact/<name>
-            # by the Pack step (the LVM-backed build
-            # volume; the root-FS `$GITHUB_WORKSPACE/out`
-            # copy was removed because a 6 GB Stable ZIP
-            # does not fit in the post-`maximize-build-space`
-            # root filesystem, which has only `root-reserve-mb`
-            # free — currently 2048 MB). The final name is
-            # recorded in `bin/ddevice/output_zip.txt`. Fall
-            # back to `$GITHUB_WORKSPACE/out` for the case
-            # where the Pack step ran without the LVM
-            # pre-copy (e.g. an older launcher version that
-            # has not been re-deployed).
+            # by the "🗂️ Capture Stable artifact" step (the
+            # LVM-backed build volume; the root-FS
+            # `$GITHUB_WORKSPACE/out` copy was removed because
+            # a multi-GB Stable ZIP does not fit in the
+            # post-`maximize-build-space` root filesystem,
+            # which has only `root-reserve-mb` free — currently
+            # 2048 MB). The final name is recorded in
+            # `bin/ddevice/output_zip.txt`.
             artifact_dir="$GITHUB_WORKSPACE/toolbuild/artifact"
             if [[ ! -d "$artifact_dir" ]]; then
               artifact_dir="$GITHUB_WORKSPACE/out"
@@ -1419,8 +1601,8 @@ jobs:
             fi
           fi
           if (( ${#final_zips[@]} != 1 )); then
-            echo "::error::Expected exactly one preserved final Stable ZIP under ${artifact_dir}; found ${#final_zips[@]}" | tee -a build_action.log 2>/dev/null || true
-            echo "::error::The Stable engine pipeline ran to completion but the final artifact is missing or duplicated under ${artifact_dir}. For the pre-refactor engine, the '📦 Pack Stable ROM' step pre-copies the final ZIP to that location so it survives uploadROM.sh's cleanup; check that step's log for the recorded output_zip.txt path." >&2
+            echo "::error::Expected exactly one preserved final Stable ZIP under ${artifact_dir}; found ${#final_zips[@]}" | tee -a build_action.log || true
+            echo "::error::The Stable engine pipeline ran to completion but the final artifact is missing or duplicated under ${artifact_dir}. For the pre-refactor engine, the '🗂️ Capture Stable artifact' step copies the final ZIP to that location; check the '📦 Stage and ZIP Stable ROM' step's log for the recorded output_zip.txt path." >&2
             exit 1
           fi
 
@@ -1464,35 +1646,20 @@ jobs:
 
           # Surface the Drive URL on the standard variable name
           # so the build summary and the success notification
-          # can render the public link. The pre-refactor
-          # engine's `uploadROM.sh` uploads to the hard-coded
-          # remote `starxONEDRIVE:NTBuild/<os>/<poly>/<device>/`
-          # (NOT the `${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/...`
-          # path the central runtime's `upload-mirrors.sh`
-          # expects). We probe both possible destinations so
-          # the build summary always surfaces the public link
-          # regardless of which layout the engine shipped.
+          # can render the public link.
+          #
+          # The launcher uploads BOTH layouts to the canonical
+          # central-runtime destination:
+          #   <RCLONE_REMOTE_NAME>:<RCLONE_UPLOAD_DIR>/Stable/<codename>/<os>/<zip>
+          # (see the "\u2601\ufe0f Upload Stable ROM to Google Drive" step).
+          # We probe exactly that path, so the link we surface is
+          # always the link we actually uploaded to.
           drive_url=""
-          if [[ -n "$final_name" && -n "$codename" && -s rclone.conf ]]; then
-            if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -n "${RCLONE_REMOTE_NAME:-}" && -n "${RCLONE_UPLOAD_DIR:-}" && -n "$os_folder" ]]; then
-              drive_url="$(rclone --config=rclone.conf link "${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
-            fi
-            if [[ -z "$drive_url" && "${DEADZONE_ENGINE_LAYOUT:-}" != "refactored" ]]; then
-              # Probe the pre-refactor engine's hard-coded
-              # upload path: starxONEDRIVE:NTBuild/<os>/<poly>/<device>/<zip>.
-              # The `rom_os` flag in bin/ddevice/rom_os.txt
-              # is "MIUI" or "HyperOS" and is the source of
-              # truth for the upload directory.
-              if [[ -s bin/ddevice/rom_os.txt ]]; then
-                rom_os="$(tr -d '\r\n' < bin/ddevice/rom_os.txt)"
-              else
-                rom_os=""
-              fi
-              polyxver="$(tr -d '\r\n' < Version 2>/dev/null || true)"
-              if [[ -n "$rom_os" && -n "$polyxver" && -n "$codename" ]]; then
-                drive_url="$(rclone --config=rclone.conf link "starxONEDRIVE:NTBuild/${rom_os}/${polyxver}/${codename}/${final_name}" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
-              fi
-            fi
+          if [[ -n "$final_name" && -n "$codename" && -n "$os_folder" \
+                && -n "${RCLONE_REMOTE_NAME:-}" && -n "${RCLONE_UPLOAD_DIR:-}" \
+                && -s rclone.conf ]]; then
+            drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}"
+            drive_url="$(rclone --config=rclone.conf link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
           fi
           if [[ -n "$drive_url" ]]; then
             printf 'DEADZONE_GOOGLE_DRIVE_URL=%s\nDEADZONE_RESULT_URL=%s\n' "$drive_url" "$drive_url" >> "$GITHUB_ENV"
@@ -1861,11 +2028,12 @@ jobs:
           #     (the engine does not clean `out/`, so the ZIP
           #     is still there at the end of the run)
           #   * pre-refactor: $GITHUB_WORKSPACE/toolbuild/artifact/<name>
-          #     (the launcher pre-copied the ZIP there in the
-          #     "📦 Pack Stable ROM" step, on the LVM-backed
-          #     build volume. A 6 GB Stable ZIP does NOT fit
-          #     on the root FS at `$GITHUB_WORKSPACE/out/`,
-          #     which has only `root-reserve-mb` free after
+          #     (the launcher captures the ZIP there in the
+          #     "🗂️ Capture Stable artifact" step, on the
+          #     LVM-backed build volume. A multi-GB Stable ZIP
+          #     does NOT fit on the root FS at
+          #     `$GITHUB_WORKSPACE/out/`, which has only
+          #     `root-reserve-mb` free after
           #     `maximize-build-space` runs, so the capture is
           #     done on the LVM instead. `$work_dir/out/` is
           #     also tried as a fallback in case the engine
