@@ -349,8 +349,16 @@ jobs:
           ROM_URL: ${{ env.ROM_URL }}
         run: |
           python -m pip install --upgrade pip
+          # The runtime dependencies live in requirements.txt. The package
+          # itself is installed with --no-deps below, so this file is the
+          # ONLY place the dependencies are installed. Without it the
+          # central-record schema validation fails with:
+          #   "jsonschema is required for central-record validation"
           if (Test-Path "super-inspector/requirements.txt") {
             python -m pip install -r super-inspector/requirements.txt
+          } else {
+            Write-Host "::error::super-inspector/requirements.txt is missing; the runtime dependencies would not be installed."
+            throw "super-inspector/requirements.txt is missing"
           }
           # Install the engine package itself so `python -m deadzone_superinspector`
           # is importable from every later step (analyze, publish-rom-repo,
@@ -360,6 +368,10 @@ jobs:
             python -m pip install -e super-inspector --no-deps
           }
           python -m pip install pyinstaller
+          # Fail fast when a declared dependency did not make it into the
+          # environment. A missing jsonschema only surfaces much later, in
+          # the central-publish step, where the real cause is obscured.
+          python -c "import jsonschema; print('jsonschema', jsonschema.__version__)"
 
       - name: "🔍 Validate project structure"
         shell: pwsh
@@ -614,6 +626,72 @@ jobs:
           printf 'profile_dir=%s\n' "$(dirname "$device_json")" >> "$GITHUB_OUTPUT"
           echo "codename: ${codename:-unknown}"
           echo "profile_dir: $(dirname "$device_json" 2>/dev/null || echo unknown)"
+
+      - name: "🚀 Publish flash manifest to DeadZone-Xiaomi-Stable"
+        id: flash_manifest
+        if: steps.publish_creds.outputs.publish_token_present == 'true' && steps.publish_creds.outputs.rom_present == 'true'
+        shell: bash
+        env:
+          ROM_PATH: ${{ steps.publish_creds.outputs.rom_path_posix }}
+          DEADZONE_STABLE_REPO_TOKEN: ${{ secrets.DEADZONE_STABLE_REPO_TOKEN }}
+          DEADZONE_ROM_REPO_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.DEADZONE_ROM_REPO_TOKEN || '' }}
+          GH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.GH_TOKEN || '' }}
+          DEADZONE_STABLE_REPO_AUTHOR_NAME: 'deadzone-bot'
+          DEADZONE_STABLE_REPO_AUTHOR_EMAIL: 'bot@deadzone.offical'
+        run: |
+          set -euo pipefail
+          # The builder learns HOW the device flashes from the manifest.
+          # The manifest is written to
+          #   DeadZone-Xiaomi-Stable:bin/device_flash/<codename>/flash-manifest.json
+          # and carries only the flashing and formatting methods, never a
+          # partition list.
+          #
+          # DEADZONE_STABLE_REPO_TOKEN is the canonical credential.
+          #
+          # GH_TOKEN is preferred over DEADZONE_ROM_REPO_TOKEN as the
+          # fallback: the ROM-repo token is scoped to DeadZone-ROM-Repository
+          # and may have no write access to DeadZone-Xiaomi-Stable, while
+          # GH_TOKEN is the org-admin PAT the other publish steps use.
+          if [[ -z "${DEADZONE_STABLE_REPO_TOKEN:-}" ]]; then
+            if [[ -n "${GH_TOKEN:-}" ]]; then
+              echo '::warning::DEADZONE_STABLE_REPO_TOKEN is unset; falling back to GH_TOKEN.'
+              export DEADZONE_STABLE_REPO_TOKEN="$GH_TOKEN"
+            elif [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
+              echo '::warning::DEADZONE_STABLE_REPO_TOKEN is unset; falling back to DEADZONE_ROM_REPO_TOKEN.'
+              export DEADZONE_STABLE_REPO_TOKEN="$DEADZONE_ROM_REPO_TOKEN"
+            fi
+          fi
+          codename="${{ steps.analyze.outputs.codename }}"
+          echo "::group::Publishing flash manifest"
+          echo "rom_path  : $ROM_PATH"
+          echo "codename  : ${codename:-unknown}"
+          set +e
+          python3 -m deadzone_superinspector publish-flash-manifest "$ROM_PATH" \
+            --codename "$codename" \
+            --branch main \
+            --json 2> ./fastboot-profile/flash_manifest.stderr \
+            >  ./fastboot-profile/flash_manifest.json
+          rc=$?
+          set -e
+          echo "::endgroup::"
+          if [[ $rc -ne 0 ]]; then
+            echo '::error::publish-flash-manifest exited with a non-zero status.'
+            if [[ -s ./fastboot-profile/flash_manifest.stderr ]]; then
+              head -50 ./fastboot-profile/flash_manifest.stderr >&2
+            else
+              echo '(stderr was empty)' >&2
+            fi
+            exit $rc
+          fi
+          manifest_commit="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/flash_manifest.json')); print(d.get('commit_sha',''))" 2>/dev/null || true)"
+          manifest_dest="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/flash_manifest.json')); print(d.get('destination_path',''))" 2>/dev/null || true)"
+          manifest_no_op="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/flash_manifest.json')); print(str(bool(d.get('no_op'))).lower())" 2>/dev/null || echo true)"
+          printf 'commit_sha=%s\n' "$manifest_commit" >> "$GITHUB_OUTPUT"
+          printf 'destination_path=%s\n' "$manifest_dest" >> "$GITHUB_OUTPUT"
+          printf 'no_op=%s\n' "$manifest_no_op" >> "$GITHUB_OUTPUT"
+          echo "commit_sha   : ${manifest_commit:-none}"
+          echo "destination  : ${manifest_dest:-none}"
+          echo "no_op        : ${manifest_no_op}"
 
       - name: "📤 Publish per-build tree to DeadZone-ROM-Repository"
         if: steps.publish_creds.outputs.publish_token_present == 'true' && steps.publish_creds.outputs.rom_present == 'true'
