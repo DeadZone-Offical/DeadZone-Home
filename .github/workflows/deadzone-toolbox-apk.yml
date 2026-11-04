@@ -1,0 +1,156 @@
+# Build only DeadZone Toolbox from its private source repository.
+# Trigger this workflow from DeadZone-Home -> Actions -> DeadZone Toolbox APK.
+# The source is pinned to its main branch; this job never builds or flashes a ROM.
+#
+# Required Actions secrets on DeadZone-Home:
+# DEADZONE_PRIVATE_READ_TOKEN   fine-grained PAT; Contents: read on DeadZone-Toolbox-App
+# TOOLBOX_KEYSTORE_BASE64       base64 of the stable Android release .jks
+# TOOLBOX_STORE_PASSWORD       keystore password
+# TOOLBOX_KEY_ALIAS            release key alias
+# TOOLBOX_KEY_PASSWORD         release key password
+
+name: DeadZone Toolbox APK
+
+run-name: "DeadZone Toolbox · signed V1/V2/V3 · main"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deadzone-toolbox-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-toolbox:
+    name: "Build and verify signed APK"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Validate private checkout credential
+        shell: bash
+        env:
+          REPO_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$REPO_READ_TOKEN" ]]; then
+            echo "::error::Missing DEADZONE_PRIVATE_READ_TOKEN (Contents: read on private DeadZone-Toolbox-App)." >&2
+            exit 1
+          fi
+
+      - name: Checkout DeadZone Toolbox App main (private)
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Toolbox-App
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: toolbox
+          fetch-depth: 1
+          lfs: true
+          persist-credentials: false
+
+      - name: Report source revision
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git status --short
+          test -f gradle/wrapper/gradle-wrapper.jar
+          jar tf gradle/wrapper/gradle-wrapper.jar >/dev/null
+          if ! find DeadZone-Native-Core/dist/lib -type f -name '*.so' -print -quit | grep -q .; then
+            echo "::error::The native core libraries were not checked out." >&2
+            exit 1
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android 17 SDK and signing tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platforms;android-37" "build-tools;35.0.0" "platform-tools"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore stable release signing key
+        working-directory: toolbox
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.TOOLBOX_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.TOOLBOX_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.TOOLBOX_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.TOOLBOX_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KEYSTORE_BASE64" || -z "$STORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
+            echo "::error::Missing TOOLBOX signing secrets. Configure the stable release keystore and its three credentials." >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > ci-release.jks
+          test -s ci-release.jks
+          # Ignore the example credentials committed to the source repository.
+          # Gradle then reads the actual credentials from ORG_GRADLE_PROJECT_*.
+          sed -i -E '/^(keystoreFile|keystorePassword|keyAlias|keyPassword)=/d' gradle.properties
+          chmod 600 ci-release.jks
+
+      - name: Build release APK (V1 + V2 + V3)
+        working-directory: toolbox
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_keystoreFile: ci-release.jks
+          ORG_GRADLE_PROJECT_keystorePassword: ${{ secrets.TOOLBOX_STORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_keyAlias: ${{ secrets.TOOLBOX_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_keyPassword: ${{ secrets.TOOLBOX_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleRelease
+          test -s app/build/outputs/apk/release/app-release.apk
+
+      - name: Verify all three APK signature schemes
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/release/app-release.apk"
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          "$APKSIGNER" verify --verbose --print-certs --min-sdk-version 23 "$APK" | tee "$RUNNER_TEMP/toolbox-signature-report.txt"
+          for version in v1 v2 v3; do
+            if ! grep -Eq "^Verified using $version scheme .*: true$" "$RUNNER_TEMP/toolbox-signature-report.txt"; then
+              echo "::error::APK $version signing verification failed." >&2
+              exit 1
+            fi
+          done
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$APK" "$GITHUB_WORKSPACE/dist/DeadZone-Toolbox-App-V1-V2-V3.apk"
+          sha256sum "$GITHUB_WORKSPACE/dist/DeadZone-Toolbox-App-V1-V2-V3.apk" > "$GITHUB_WORKSPACE/dist/SHA256SUMS.txt"
+          cp "$RUNNER_TEMP/toolbox-signature-report.txt" "$GITHUB_WORKSPACE/dist/signature-report.txt"
+
+      - name: Remove temporary keystore
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$GITHUB_WORKSPACE/toolbox/ci-release.jks"
+
+      - name: Upload signed APK and verification reports
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZone-Toolbox-App-signed-V1-V2-V3
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
