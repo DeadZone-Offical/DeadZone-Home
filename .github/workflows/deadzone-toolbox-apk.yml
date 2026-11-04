@@ -114,6 +114,24 @@ jobs:
           umask 077
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > ci-release.jks
           test -s ci-release.jks
+
+          # Fail before the expensive Gradle build when the keystore and
+          # the configured Actions secrets do not belong together.
+          # Never print the password, private key or the CSR.
+          if ! keytool -list -keystore ci-release.jks -storepass "$STORE_PASSWORD" > /dev/null 2>&1; then
+            echo "::error::The TOOLBOX_STORE_PASSWORD does not unlock TOOLBOX_KEYSTORE_BASE64. Upload the matching JKS/password pair." >&2
+            exit 1
+          fi
+          if ! keytool -list -keystore ci-release.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null 2>&1; then
+            echo "::error::TOOLBOX_KEY_ALIAS is not present in the uploaded keystore." >&2
+            exit 1
+          fi
+          if ! keytool -certreq -keystore ci-release.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" -keypass "$KEY_PASSWORD" -file "$RUNNER_TEMP/deadzone-signing-preflight.csr" > /dev/null 2>&1; then
+            echo "::error::TOOLBOX_KEY_PASSWORD cannot unlock the private signing key for TOOLBOX_KEY_ALIAS." >&2
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/deadzone-signing-preflight.csr"
+
           # Ignore the example credentials committed to the source repository.
           # Gradle then reads the actual credentials from ORG_GRADLE_PROJECT_*.
           sed -i -E '/^(keystoreFile|keystorePassword|keyAlias|keyPassword)=/d' gradle.properties
