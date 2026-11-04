@@ -1,4 +1,4 @@
-# UI verification: final Elite green Home, top tabs, and light/dark launch resources
+# UI verification: final Elite layout, color presets, and live theme settings
 # Build only DeadZone Toolbox from its private source repository.
 # Trigger this workflow from DeadZone-Home -> Actions -> DeadZone Toolbox APK.
 # The source is pinned to its main branch; this job never builds or flashes a ROM.
