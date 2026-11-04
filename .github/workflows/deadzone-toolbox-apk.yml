@@ -73,7 +73,12 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          # The obsolete 'tools' SDK package is no longer distributed.
+          # Only platform-tools is required; cmdline-tools comes from the action.
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: 'false'
 
       - name: Install Android 17 SDK and signing tools
         shell: bash
