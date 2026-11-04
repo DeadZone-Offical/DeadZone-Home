@@ -60,7 +60,7 @@ jobs:
           git rev-parse HEAD
           git status --short
           test -f gradle/wrapper/gradle-wrapper.jar
-          jar tf gradle/wrapper/gradle-wrapper.jar >/dev/null
+          unzip -tq gradle/wrapper/gradle-wrapper.jar >/dev/null
           if ! find DeadZone-Native-Core/dist/lib -type f -name '*.so' -print -quit | grep -q .; then
             echo "::error::The native core libraries were not checked out." >&2
             exit 1
