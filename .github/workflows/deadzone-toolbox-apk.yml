@@ -78,15 +78,19 @@ jobs:
           set -euo pipefail
           CORE="DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so"
           test -s "$CORE"
-          readelf -h "$CORE" | grep -Fq "AArch64"
-          readelf -dW "$CORE" | grep -Eq 'BIND_NOW|Flags: NOW'
-          readelf -lW "$CORE" | grep -Fq "GNU_RELRO"
-          readelf -Ws "$CORE" | grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +JNI_OnLoad($|@)'
-          if readelf -Ws "$CORE" | grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +Java_'; then
+          HEADER="$(readelf -h "$CORE")"
+          DYNAMIC="$(readelf -dW "$CORE")"
+          PROGRAMS="$(readelf -lW "$CORE")"
+          SYMBOLS="$(readelf -Ws "$CORE")"
+          grep -Fq "AArch64" <<< "$HEADER"
+          grep -Eq 'BIND_NOW|Flags: NOW' <<< "$DYNAMIC"
+          grep -Fq "GNU_RELRO" <<< "$PROGRAMS"
+          grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +JNI_OnLoad($|@)' <<< "$SYMBOLS"
+          if grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +Java_' <<< "$SYMBOLS"; then
             echo "::error::Native core exposes Java-facing symbols." >&2
             exit 1
           fi
-          if readelf -dW "$CORE" | grep -E 'NEEDED' | grep -Eq 'libstd[.]dylib[.]so'; then
+          if grep -E 'NEEDED' <<< "$DYNAMIC" | grep -Eq 'libstd[.]dylib[.]so'; then
             echo "::error::Native core depends on an unsupported system library." >&2
             exit 1
           fi
