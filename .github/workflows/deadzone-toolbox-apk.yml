@@ -152,6 +152,7 @@ jobs:
           grep -Fq 'fun inspectKeybox(document: String)' "$SETTINGS"
           grep -Fq 'if (!inspectKeybox(xml).valid) return false' "$SETTINGS"
           grep -Fq 'repository.inspectKeybox(xml)' "$CORE"
+          grep -Fq 'enabled = keybox.valid' "$PIF"
           echo "PIF GMS wiring, profile format validation and keybox import preflight: present"
 
       - name: Build release APK (V1 + V2 + V3)
