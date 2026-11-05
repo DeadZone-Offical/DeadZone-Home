@@ -70,6 +70,7 @@ jobs:
           set -euo pipefail
           if python3 -m unittest discover -s injector -p 'test_*.py' -v > "$RUNNER_TEMP/deadzone-os-tests.log" 2>&1 &&
              python3 -m unittest discover -s tests -p 'test_*.py' -v >> "$RUNNER_TEMP/deadzone-os-tests.log" 2>&1 &&
+             python3 -m py_compile scripts/audit_a17_hook_callsites.py scripts/verify_android_class_replacement.py &&
              python3 scripts/rom_profile.py check a17-zircon > "$RUNNER_TEMP/deadzone-profile.log" 2>&1 &&
              sh -n module/customize.sh &&
              sh -n module/service.sh &&
