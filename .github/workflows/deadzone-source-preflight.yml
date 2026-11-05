@@ -1,7 +1,7 @@
 # DeadZone centralized CI for private source repositories.
 # All GitHub Actions workflows live in DeadZone-Home only.
 # Required Home secret: DEADZONE_PRIVATE_READ_TOKEN with read-only Contents
-# permission on DeadZone-Framework-Hooks and DeadZone-OS-Patches.
+# permission on the unified DeadZone repository.
 #
 # No private source, test logs, or build outputs are published from this
 # public repository. Production ROM flashing is intentionally excluded.
@@ -35,25 +35,16 @@ jobs:
           SOURCE_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
         run: |
           if [[ -z "$SOURCE_TOKEN" ]]; then
-            echo "::error::Set DEADZONE_PRIVATE_READ_TOKEN in DeadZone-Home with Contents:read on the private Framework Hooks and OS Patches repositories." >&2
+            echo "::error::Set DEADZONE_PRIVATE_READ_TOKEN in DeadZone-Home with Contents:read on the private DeadZone repository." >&2
             exit 1
           fi
 
-      - name: Checkout private DeadZone OS Patches
+      - name: Checkout unified private DeadZone main
         uses: actions/checkout@v4
         with:
-          repository: DeadZone-Offical/DeadZone-OS-Patches
+          repository: DeadZone-Offical/DeadZone
           ref: main
-          path: deadzone-os-patches
-          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
-          persist-credentials: false
-
-      - name: Checkout private DeadZone Framework Hooks
-        uses: actions/checkout@v4
-        with:
-          repository: DeadZone-Offical/DeadZone-Framework-Hooks
-          ref: main
-          path: deadzone-framework-hooks
+          path: deadzone
           token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           persist-credentials: false
 
@@ -64,13 +55,13 @@ jobs:
           java-version: '17'
 
       - name: Validate DeadZone Android 17 profile and injector
-        working-directory: deadzone-os-patches
+        working-directory: deadzone/DeadZone-OS-Patches
         shell: bash
         run: |
           set -euo pipefail
           if python3 -m unittest discover -s injector -p 'test_*.py' -v > "$RUNNER_TEMP/deadzone-os-tests.log" 2>&1 &&
              python3 -m unittest discover -s tests -p 'test_*.py' -v >> "$RUNNER_TEMP/deadzone-os-tests.log" 2>&1 &&
-             python3 -m py_compile scripts/audit_a17_hook_callsites.py scripts/verify_android_class_replacement.py &&
+             python3 -m py_compile scripts/audit_a17_hook_callsites.py scripts/verify_android_class_replacement.py scripts/gate_mya17_runtime_evidence.py scripts/build_mya17_rom_test.py &&
              python3 scripts/rom_profile.py check a17-zircon > "$RUNNER_TEMP/deadzone-profile.log" 2>&1 &&
              sh -n module/customize.sh &&
              sh -n module/service.sh &&
@@ -82,7 +73,7 @@ jobs:
           fi
 
       - name: Verify DeadZone framework decoder and Java compilation
-        working-directory: deadzone-framework-hooks
+        working-directory: deadzone/DeadZone-Framework-Hooks
         shell: bash
         run: |
           set -euo pipefail
@@ -98,5 +89,5 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -rf deadzone-os-patches deadzone-framework-hooks
+          rm -rf deadzone
           rm -f "$RUNNER_TEMP"/deadzone-*.log
