@@ -246,6 +246,13 @@ jobs:
         run: |
           set -euo pipefail
           APK="app/build/outputs/apk/release/app-release.apk"
+          NATIVE="DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so"
+          SOURCE_SHA="$(sha256sum "$NATIVE" | cut -d' ' -f1)"
+          APK_SHA="$(unzip -p "$APK" lib/arm64-v8a/libdeadzone_core.so | sha256sum | cut -d' ' -f1)"
+          if [[ "$SOURCE_SHA" != "$APK_SHA" ]]; then
+            echo "::error::DeadZone APK native library does not match the freshly compiled source."
+            exit 1
+          fi
           APKSIGNER="$ANDROID_HOME/build-tools/37.0.0/apksigner"
           "$APKSIGNER" verify --verbose --print-certs --min-sdk-version 23 "$APK" | tee "$RUNNER_TEMP/toolbox-signature-report.txt"
           for version in v1 v2 v3; do
@@ -255,6 +262,7 @@ jobs:
             fi
           done
           mkdir -p "$GITHUB_WORKSPACE/dist"
+          printf '%s  %s\n' "$SOURCE_SHA" "lib/arm64-v8a/libdeadzone_core.so" > "$GITHUB_WORKSPACE/dist/native-core-SHA256.txt"
           cp "$APK" "$GITHUB_WORKSPACE/dist/DeadZone-Toolbox-App-V1-V2-V3.apk"
           sha256sum "$GITHUB_WORKSPACE/dist/DeadZone-Toolbox-App-V1-V2-V3.apk" > "$GITHUB_WORKSPACE/dist/SHA256SUMS.txt"
           cp "$RUNNER_TEMP/toolbox-signature-report.txt" "$GITHUB_WORKSPACE/dist/signature-report.txt"
