@@ -1,0 +1,74 @@
+# DeadZone database publishing is centralized in DeadZone-Home.
+# Only public data and its manifest are modified.
+# Required Home secret: DEADZONE_DATABASE_WRITE_TOKEN with Contents:write
+# exclusively on the public DeadZone-Toolbox-Database repository.
+name: DeadZone Database Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "New monotonic public database revision (e.g. 2)"
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deadzone-public-database-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Validate and publish database manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify database write credential
+        shell: bash
+        env:
+          DATABASE_TOKEN: ${{ secrets.DEADZONE_DATABASE_WRITE_TOKEN }}
+        run: |
+          if [[ -z "$DATABASE_TOKEN" ]]; then
+            echo "::error::Configure DEADZONE_DATABASE_WRITE_TOKEN (Contents:write exclusively on DeadZone-Toolbox-Database)." >&2
+            exit 1
+          fi
+
+      - name: Checkout DeadZone public database main
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Toolbox-Database
+          ref: main
+          path: database
+          token: ${{ secrets.DEADZONE_DATABASE_WRITE_TOKEN }}
+          persist-credentials: true
+
+      - name: Validate and generate next database manifest
+        working-directory: database
+        shell: bash
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          [[ "$REVISION" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Invalid revision"; exit 1; }
+          python3 tools/release.py --revision "$REVISION"
+          python3 tools/validate.py
+          python3 -m unittest discover -s tests -v
+
+      - name: Publish manifest only to public main
+        working-directory: database
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "DeadZone Database Bot"
+          git config user.email "deadzone-database-bot@users.noreply.github.com"
+          git add manifest.json
+          git diff --cached --quiet && { echo "Database manifest unchanged"; exit 0; }
+          git commit -m "data: publish DeadZone database revision ${{ inputs.revision }}"
+          git push origin HEAD:main
+
+      - name: Remove checked-out data and credentials
+        if: always()
+        shell: bash
+        run: rm -rf database
