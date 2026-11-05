@@ -4,7 +4,7 @@
 # This workflow never flashes, installs or alters a device.
 name: DeadZone Framework + Services Build
 
-run-name: "DeadZone Framework · ${{ inputs.platform || 'a16' }} · ${{ inputs.build_mode || 'hooks-only' }}"
+run-name: "DeadZone Framework · ${{ inputs.platform || 'a17' }} · ${{ inputs.build_mode || 'hooks-only' }}"
 
 on:
   push:
@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      PLATFORM: ${{ inputs.platform || 'a16' }}
+      PLATFORM: ${{ inputs.platform || 'a17' }}
       BUILD_MODE: ${{ inputs.build_mode || 'hooks-only' }}
       STOCK_JARS_URL: ${{ inputs.stock_jars_url }}
       STOCK_JARS_SHA256: ${{ inputs.stock_jars_sha256 }}
@@ -142,6 +142,56 @@ jobs:
           grep -q 'Lcom/deadzone/framework/DeadZoneCore;' "$RUNNER_TEMP/hook-dexdump.txt"
           grep -q 'Lcom/deadzone/framework/DeadZoneHook;' "$RUNNER_TEMP/hook-dexdump.txt"
 
+      - name: Build add-only DeadZone DEX for the working MyA17 ROM
+        if: env.PLATFORM == 'a17' && env.BUILD_MODE == 'hooks-only'
+        working-directory: hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace \
+            -PandroidSdk="$ANDROID_HOME" \
+            -PandroidJar="$ANDROID_HOME/platforms/android-35/android.jar" \
+            deadzoneMyA17AddonDex
+          test -s build/mya17/dex/classes.dex
+
+      - name: Check MyA17 add-on against the installed DeadZone runtime ABI
+        if: env.PLATFORM == 'a17' && env.BUILD_MODE == 'hooks-only'
+        working-directory: hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_mya17_addon.py \
+            --candidate build/mya17/dex/classes.dex \
+            --baseline profiles/MYA17_EXISTING_RUNTIME_SYMBOLS.json \
+            --report build/mya17/abi-report.json
+
+      - name: Package additive MyA17 DEX after ABI success
+        if: env.PLATFORM == 'a17' && env.BUILD_MODE == 'hooks-only'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist/mya17"
+          cp hooks/build/mya17/dex/classes.dex "$GITHUB_WORKSPACE/dist/mya17/classes8.dex"
+          cp hooks/build/mya17/abi-report.json "$GITHUB_WORKSPACE/dist/mya17/abi-report.json"
+          {
+            echo "DeadZone MyA17 additive Java classes"
+            echo "Source commit: $(git -C hooks rev-parse HEAD)"
+            echo "Android compile API: 35"
+            echo "Target: append as framework.jar/classes8.dex, not a replacement for classes7.dex"
+            echo "The working JARs and device have not been modified or boot-tested."
+            echo "Do not flash without independently validating the built JAR and recovery path."
+          } > "$GITHUB_WORKSPACE/dist/mya17/README.txt"
+          (cd "$GITHUB_WORKSPACE/dist/mya17" && sha256sum classes8.dex > SHA256SUMS.txt)
+
+      - name: Upload the ABI-checked MyA17 addon DEX
+        if: env.PLATFORM == 'a17' && env.BUILD_MODE == 'hooks-only'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZone-MyA17-Additive-DEX-ABI-CHECKED
+          path: dist/mya17/
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Capture verified hook DEX and source revisions
         shell: bash
         run: |
@@ -164,7 +214,7 @@ jobs:
       - name: Upload compiled hook DEX
         uses: actions/upload-artifact@v4
         with:
-          name: DeadZone-Framework-Hooks-${{ inputs.platform || 'a16' }}-DEX
+          name: DeadZone-Framework-Hooks-${{ inputs.platform || 'a17' }}-DEX
           path: dist/hooks/
           if-no-files-found: error
           retention-days: 14
