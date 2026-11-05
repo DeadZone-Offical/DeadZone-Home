@@ -3,10 +3,6 @@ name: DeadZone Unified Source Smoke
 run-name: DeadZone Unified · Main · Test Sources and APK
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/deadzone-unified-smoke.yml'
   workflow_dispatch:
     inputs:
       build_framework_hooks:
