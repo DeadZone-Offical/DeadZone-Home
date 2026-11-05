@@ -216,8 +216,10 @@ jobs:
             echo "::error::DeadZone ROM toolbox must not use standalone Zygisk status"
             exit 1
           fi
-          grep -Fq 'DeadZoneRomPolicy.switch(core.enabled, core.gmsSpoof)' "$SETTINGS"
-          grep -Fq 'DeadZoneRomPolicy.switch(core.enabled, core.spoofGameProps)' "$SETTINGS"
+          grep -Fq 'DeadZoneRomPolicy.switch(core.enabled, requested)' "$SETTINGS"
+          grep -Fq 'DeadZoneRomPublisher.publish(' "$SETTINGS"
+          grep -Fq 'stagedDisabledState = encode(disabledJson)' "$SETTINGS"
+          grep -Fq 'DeadZoneRomPolicy.switch(settings.enabled, settings.hideAppList)' "$SETTINGS"
           python3 -m py_compile tools/build_flashable.py
           grep -Fq 'if "AndroidManifest.xml" not in application.namelist()' tools/build_flashable.py
           if grep -Fq 'ro.control_privapp_permissions=' tools/build_flashable.py; then
