@@ -71,6 +71,26 @@ jobs:
             exit 1
           fi
 
+      - name: Validate bundled ARM64 native core
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          CORE="DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so"
+          test -s "$CORE"
+          readelf -h "$CORE" | grep -Fq "AArch64"
+          readelf -dW "$CORE" | grep -Eq 'BIND_NOW|Flags: NOW'
+          readelf -lW "$CORE" | grep -Fq "GNU_RELRO"
+          readelf -Ws "$CORE" | grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +JNI_OnLoad($|@)'
+          if readelf -Ws "$CORE" | grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +Java_'; then
+            echo "::error::Native core exposes Java-facing symbols." >&2
+            exit 1
+          fi
+          if readelf -dW "$CORE" | grep -E 'NEEDED' | grep -Eq 'libstd[.]dylib[.]so'; then
+            echo "::error::Native core depends on an unsupported system library." >&2
+            exit 1
+          fi
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
