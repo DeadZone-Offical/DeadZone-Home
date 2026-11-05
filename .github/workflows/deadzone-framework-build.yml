@@ -4,9 +4,13 @@
 # This workflow never flashes, installs or alters a device.
 name: DeadZone Framework + Services Build
 
-run-name: "DeadZone Framework · ${{ inputs.platform }} · ${{ inputs.build_mode }}"
+run-name: "DeadZone Framework · ${{ inputs.platform || 'a16' }} · ${{ inputs.build_mode || 'hooks-only' }}"
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deadzone-framework-build.yml'
   workflow_dispatch:
     inputs:
       platform:
@@ -47,8 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      PLATFORM: ${{ inputs.platform }}
-      BUILD_MODE: ${{ inputs.build_mode }}
+      PLATFORM: ${{ inputs.platform || 'a16' }}
+      BUILD_MODE: ${{ inputs.build_mode || 'hooks-only' }}
       STOCK_JARS_URL: ${{ inputs.stock_jars_url }}
       STOCK_JARS_SHA256: ${{ inputs.stock_jars_sha256 }}
 
@@ -160,7 +164,7 @@ jobs:
       - name: Upload compiled hook DEX
         uses: actions/upload-artifact@v4
         with:
-          name: DeadZone-Framework-Hooks-${{ inputs.platform }}-DEX
+          name: DeadZone-Framework-Hooks-${{ inputs.platform || 'a16' }}-DEX
           path: dist/hooks/
           if-no-files-found: error
           retention-days: 14
