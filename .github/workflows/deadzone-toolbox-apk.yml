@@ -1,3 +1,4 @@
+# DeadZone MyA17 integrated test: rebuild signed Toolbox from current main after Integrity Lab changes.
 # DeadZone UI verification, colors, and release build settings
 # Build only DeadZone Toolbox from its private source repository.
 # Trigger this workflow from DeadZone-Home -> Actions -> DeadZone Toolbox APK.
