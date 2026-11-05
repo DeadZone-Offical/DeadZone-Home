@@ -208,6 +208,12 @@ jobs:
           grep -Fq 'repository.inspectKeybox(xml)' "$CORE"
           grep -Fq 'fun publishKeybox(context: Context, xml: String)' \
             app/src/main/java/com/deadzone/toolbox/core/HookBridge.kt
+          ROOT_TOOLS="app/src/main/java/com/deadzone/toolbox/module/root/RootTools.kt"
+          ROOT_VM="app/src/main/java/com/deadzone/toolbox/ui/root/RootViewModel.kt"
+          grep -Fq 'suspend fun deadZoneZygiskStatus()' "$ROOT_TOOLS"
+          grep -Fq 'suspend fun deadZoneModuleStatus()' "$ROOT_TOOLS"
+          grep -Fq '"deadzone_zygisk_status" -> rootTools.deadZoneZygiskStatus()' "$ROOT_VM"
+          grep -Fq '"deadzone_module_status" -> rootTools.deadZoneModuleStatus()' "$ROOT_VM"
           python3 -m py_compile tools/build_flashable.py
           grep -Fq 'if "AndroidManifest.xml" not in application.namelist()' tools/build_flashable.py
           if grep -Fq 'ro.control_privapp_permissions=' tools/build_flashable.py; then
