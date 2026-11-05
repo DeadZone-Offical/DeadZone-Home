@@ -1,4 +1,4 @@
-# UI verification: final Elite layout, color presets, and live theme settings
+# DeadZone UI verification, colors, and release build settings
 # Build only DeadZone Toolbox from its private source repository.
 # Trigger this workflow from DeadZone-Home -> Actions -> DeadZone Toolbox APK.
 # The source is pinned to its main branch; this job never builds or flashes a ROM.
@@ -197,6 +197,14 @@ jobs:
             exit 1
           fi
           echo "Integrity PIF/Keybox normalization, real publication checks and safe packaging: present"
+
+      - name: Run DeadZone application unit tests
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:testDebugUnitTest
 
       - name: Build release APK (V1 + V2 + V3)
         working-directory: toolbox
