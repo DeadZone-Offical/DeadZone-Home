@@ -1,0 +1,102 @@
+name: DeadZone Property Helper ARM64
+
+run-name: "DeadZone Property Helper · ARM64 · Main"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deadzone-property-helper.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deadzone-property-helper-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: "Validate source and build Android ARM64 executable"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Validate private source permission
+        shell: bash
+        env:
+          SOURCE_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SOURCE_TOKEN" ]]; then
+            echo "::error::Set DEADZONE_PRIVATE_READ_TOKEN with Contents:read on DeadZone-Native-Core."
+            exit 1
+          fi
+
+      - name: Checkout DeadZone Native Core main
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Native-Core
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: native
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run offline property helper tests
+        shell: bash
+        working-directory: native
+        run: |
+          set -euo pipefail
+          python3 tools/property-helper/test_host.py
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "ndk;27.2.12479018"
+          test -f "$ANDROID_HOME/ndk/27.2.12479018/build/cmake/android.toolchain.cmake"
+
+      - name: Build standalone DeadZone ARM64 property helper
+        working-directory: native
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: |
+          set -euo pipefail
+          bash scripts/build_property_helper.sh
+          FILE="dist/bin/arm64-v8a/deadzone_prop"
+          test -s "$FILE"
+          readelf -h "$FILE" | grep -Fq AArch64
+          readelf -h "$FILE" | grep -Fq 'DYN (Position-Independent Executable file)'
+          readelf -l "$FILE" | grep -Fq '/system/bin/linker64'
+          if readelf -d "$FILE" | grep -Eq 'NEEDED.*libdeadzone_core[.]so'; then
+            echo "::error::Unexpected dependency on JNI core library."
+            exit 1
+          fi
+
+      - name: Package helper and checksums (not flashable)
+        working-directory: native
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp dist/bin/arm64-v8a/deadzone_prop "$GITHUB_WORKSPACE/dist/deadzone_prop"
+          sha256sum "$GITHUB_WORKSPACE/dist/deadzone_prop" > "$GITHUB_WORKSPACE/dist/SHA256SUMS.txt"
+          readelf -h "$GITHUB_WORKSPACE/dist/deadzone_prop" > "$GITHUB_WORKSPACE/dist/ELF_REPORT.txt"
+          printf '%s\n' 'Not flashable. Use only with the optional --property-helper builder flag.' \
+            > "$GITHUB_WORKSPACE/dist/README.txt"
+
+      - name: Upload ARM64 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZone-Property-Helper-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
