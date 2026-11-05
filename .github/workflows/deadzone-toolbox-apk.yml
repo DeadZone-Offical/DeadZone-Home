@@ -71,30 +71,6 @@ jobs:
             exit 1
           fi
 
-      - name: Validate bundled ARM64 native core
-        working-directory: toolbox
-        shell: bash
-        run: |
-          set -euo pipefail
-          CORE="DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so"
-          test -s "$CORE"
-          HEADER="$(readelf -h "$CORE")"
-          DYNAMIC="$(readelf -dW "$CORE")"
-          PROGRAMS="$(readelf -lW "$CORE")"
-          SYMBOLS="$(readelf -Ws "$CORE")"
-          grep -Fq "AArch64" <<< "$HEADER"
-          grep -Eq 'BIND_NOW|Flags: NOW' <<< "$DYNAMIC"
-          grep -Fq "GNU_RELRO" <<< "$PROGRAMS"
-          grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +JNI_OnLoad($|@)' <<< "$SYMBOLS"
-          if grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +Java_' <<< "$SYMBOLS"; then
-            echo "::error::Native core exposes Java-facing symbols." >&2
-            exit 1
-          fi
-          if grep -Eq 'NEEDED.*libstd[.]dylib[.]so' <<< "$DYNAMIC"; then
-            echo "::error::Native core depends on an unsupported system library." >&2
-            exit 1
-          fi
-
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -118,6 +94,48 @@ jobs:
           sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0" --channel=3
           test -f "$ANDROID_HOME/platforms/android-37.0/android.jar"
           test -x "$ANDROID_HOME/build-tools/37.0.0/apksigner"
+
+      - name: Run DeadZone native host regression tests
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash DeadZone-Native-Core/scripts/run_host_tests.sh
+
+      - name: Build DeadZone ARM64 native core from main source
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "ndk;27.2.12479018"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+          export DEADZONE_ABIS="arm64-v8a"
+          bash DeadZone-Native-Core/scripts/build_ndk.sh
+          test -s DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so
+
+      - name: Validate bundled ARM64 native core
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          CORE="DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so"
+          test -s "$CORE"
+          HEADER="$(readelf -h "$CORE")"
+          DYNAMIC="$(readelf -dW "$CORE")"
+          PROGRAMS="$(readelf -lW "$CORE")"
+          SYMBOLS="$(readelf -Ws "$CORE")"
+          grep -Fq "AArch64" <<< "$HEADER"
+          grep -Eq 'BIND_NOW|Flags: NOW' <<< "$DYNAMIC"
+          grep -Fq "GNU_RELRO" <<< "$PROGRAMS"
+          grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +JNI_OnLoad($|@)' <<< "$SYMBOLS"
+          if grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +Java_' <<< "$SYMBOLS"; then
+            echo "::error::Native core exposes Java-facing symbols." >&2
+            exit 1
+          fi
+          if grep -Eq 'NEEDED.*libstd[.]dylib[.]so' <<< "$DYNAMIC"; then
+            echo "::error::Native core depends on an unsupported system library." >&2
+            exit 1
+          fi
 
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
