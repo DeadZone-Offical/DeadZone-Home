@@ -157,6 +157,9 @@ jobs:
           grep -Fq 'fun integrityIntegrationDiagnostics()' "$SETTINGS"
           grep -Fq 'fun keyboxNeedsRepublish(): Boolean' "$SETTINGS"
           grep -Fq 'fun restoreNativeKeyboxFromPublished(): Boolean' "$SETTINGS"
+          grep -Fq 'certificateBase64.filterNot { it.isWhitespace() }' "$SETTINGS"
+          grep -Fq 'Keybox rejected by XML/X.509 preflight' "$CORE" || \
+            grep -Fq 'Saved keybox rejected by XML/X.509 preflight' "$CORE"
           grep -Fq 'repository.restoreNativeKeyboxFromPublished()' "$CORE"
           grep -Fq 'fun republishSavedKeybox()' "$CORE"
           grep -Fq 'viewModel.keyboxNeedsRepublish()' "$PIF"
