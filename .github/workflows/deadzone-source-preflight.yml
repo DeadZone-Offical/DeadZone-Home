@@ -67,18 +67,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if python3 -m unittest discover -s injector -p 'test_*.py' -v > "$RUNNER_TEMP/deadzone-os-tests.log" 2>&1 &&
-             python3 -m unittest discover -s tests -p 'test_*.py' -v >> "$RUNNER_TEMP/deadzone-os-tests.log" 2>&1 &&
-             python3 -m py_compile scripts/audit_a17_hook_callsites.py scripts/verify_android_class_replacement.py scripts/gate_mya17_runtime_evidence.py scripts/build_mya17_rom_test.py &&
-             python3 scripts/rom_profile.py check a17-zircon > "$RUNNER_TEMP/deadzone-profile.log" 2>&1 &&
-             sh -n module/customize.sh &&
-             sh -n module/service.sh &&
-             sh -n module/post-fs-data.sh; then
-            echo "DeadZone OS Patches: preflight passed."
-          else
-            echo "::error::DeadZone OS Patches validation failed; inspect the private repository locally. Detailed private test logs were not published." >&2
+          # Keep private test output on the runner. Publish only failure
+          # identifiers, never source snippets or sensitive local data.
+          if ! python3 -m unittest discover -s injector -p 'test_*.py' -v > "$RUNNER_TEMP/deadzone-os-tests.log" 2>&1; then
+            grep -E '^(FAIL|ERROR): test_[a-zA-Z0-9_]+' "$RUNNER_TEMP/deadzone-os-tests.log" |
+              sed -E 's/^(FAIL|ERROR): (test_[^ ]+).*/\1: \2/' || true
+            echo "::error::DeadZone injector regression tests failed." >&2
             exit 1
           fi
+          if [[ -d tests ]] && ! python3 -m unittest discover -s tests -p 'test_*.py' -v > "$RUNNER_TEMP/deadzone-secondary-tests.log" 2>&1; then
+            grep -E '^(FAIL|ERROR): test_[a-zA-Z0-9_]+' "$RUNNER_TEMP/deadzone-secondary-tests.log" |
+              sed -E 's/^(FAIL|ERROR): (test_[^ ]+).*/\1: \2/' || true
+            echo "::error::DeadZone OS supplemental regression tests failed." >&2
+            exit 1
+          fi
+          python3 -m py_compile scripts/audit_a17_hook_callsites.py scripts/verify_android_class_replacement.py scripts/gate_mya17_runtime_evidence.py scripts/build_mya17_rom_test.py scripts/audit_framework_overlay.py
+          python3 scripts/rom_profile.py check a17-zircon > "$RUNNER_TEMP/deadzone-profile.log" 2>&1
+          sh -n module/customize.sh
+          sh -n module/service.sh
+          sh -n module/post-fs-data.sh
+          echo "DeadZone OS Patches: preflight passed."
 
       - name: Verify DeadZone framework decoder and Java compilation
         working-directory: deadzone/DeadZone-Framework-Hooks
