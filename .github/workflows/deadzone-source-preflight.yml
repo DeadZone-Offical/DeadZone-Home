@@ -81,7 +81,7 @@ jobs:
             echo "::error::DeadZone OS supplemental regression tests failed." >&2
             exit 1
           fi
-          python3 -m py_compile scripts/audit_a17_hook_callsites.py scripts/verify_android_class_replacement.py scripts/gate_mya17_runtime_evidence.py scripts/build_mya17_rom_test.py scripts/audit_framework_overlay.py scripts/dex_instruction_walk.py scripts/audit_mya17_stock_pair.py
+          python3 -m py_compile scripts/audit_a17_hook_callsites.py scripts/verify_android_class_replacement.py scripts/gate_mya17_runtime_evidence.py scripts/build_mya17_rom_test.py scripts/audit_framework_overlay.py scripts/dex_instruction_walk.py scripts/audit_mya17_stock_pair.py scripts/audit_mya17_stock2_oem.py
           python3 scripts/rom_profile.py check a17-zircon > "$RUNNER_TEMP/deadzone-profile.log" 2>&1
           sh -n module/customize.sh
           sh -n module/service.sh
