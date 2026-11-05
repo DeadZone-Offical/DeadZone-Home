@@ -155,6 +155,11 @@ jobs:
           grep -Fq 'repository.normalizePifDocument(document)' "$PIF"
           grep -Fq 'fun normalizePifDocument(document: String)' "$SETTINGS"
           grep -Fq 'fun integrityIntegrationDiagnostics()' "$SETTINGS"
+          grep -Fq 'fun keyboxNeedsRepublish(): Boolean' "$SETTINGS"
+          grep -Fq 'fun restoreNativeKeyboxFromPublished(): Boolean' "$SETTINGS"
+          grep -Fq 'repository.restoreNativeKeyboxFromPublished()' "$CORE"
+          grep -Fq 'fun republishSavedKeybox()' "$CORE"
+          grep -Fq 'viewModel.keyboxNeedsRepublish()' "$PIF"
           grep -Fq 'repository.inspectKeybox(xml)' "$CORE"
           grep -Fq 'fun publishKeybox(context: Context, xml: String)' \
             app/src/main/java/com/deadzone/toolbox/core/HookBridge.kt
