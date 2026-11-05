@@ -38,6 +38,14 @@ jobs:
             echo "::error::Set DEADZONE_PRIVATE_READ_TOKEN in DeadZone-Home with Contents:read on the private DeadZone repository." >&2
             exit 1
           fi
+          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            -H "Authorization: Bearer $SOURCE_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            'https://api.github.com/repos/DeadZone-Offical/DeadZone')"
+          if [[ "$status" != "200" ]]; then
+            echo "::error::The configured token cannot read DeadZone-Offical/DeadZone (HTTP $status). Grant this private repository Contents:read in the fine-grained token's repository selection." >&2
+            exit 1
+          fi
 
       - name: Checkout unified private DeadZone main
         uses: actions/checkout@v4
