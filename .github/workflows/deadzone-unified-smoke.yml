@@ -3,6 +3,10 @@ name: DeadZone Unified Source Smoke
 run-name: DeadZone Unified · Main · Test Sources and APK
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deadzone-unified-smoke.yml'
   workflow_dispatch:
     inputs:
       build_framework_hooks:
@@ -88,6 +92,16 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Test DeadZone ROM Toolbox publication and rollback
+        working-directory: deadzone/DeadZone-Toolbox-App
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_keystoreFile: ci-release.jks
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:testDebugUnitTest
+
       - name: Build DeadZone test APK
         working-directory: deadzone
         shell: bash
@@ -102,7 +116,7 @@ jobs:
           sha256sum dist/DeadZone-Toolbox-Test-debug.apk > dist/SHA256SUMS.txt
 
       - name: Build framework hook DEX
-        if: ${{ inputs.build_framework_hooks }}
+        if: ${{ github.event_name == 'push' || inputs.build_framework_hooks }}
         working-directory: deadzone
         shell: bash
         run: |
