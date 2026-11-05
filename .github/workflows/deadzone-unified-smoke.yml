@@ -1,0 +1,123 @@
+name: DeadZone Unified Source Smoke
+
+run-name: DeadZone Unified · Main · Test Sources and APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_framework_hooks:
+        description: Build DeadZone Framework DEX
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deadzone-unified-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: Validate access to the unified private source
+        shell: bash
+        env:
+          SOURCE_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SOURCE_TOKEN" ]]; then
+            echo "::error::DEADZONE_PRIVATE_READ_TOKEN needs Contents: read on DeadZone-Offical/DeadZone." >&2
+            exit 1
+          fi
+
+      - name: Checkout unified DeadZone main
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: deadzone
+          submodules: false
+          lfs: false
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify single-repository source layout
+        working-directory: deadzone
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          python3 tools/unified_module.py --mode preflight
+          python3 -m unittest tools.test_unified_module -v
+          python3 -m py_compile tools/unified_module.py
+          test ! -e .gitmodules
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Verify Native Core on Linux
+        working-directory: deadzone
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/unified_module.py --mode test-native
+          python3 DeadZone-Native-Core/scripts/audit_native_binary.py \
+            DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so --abi arm64-v8a
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: 'false'
+
+      - name: Install Android 17 build platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0" --channel=3
+          test -f "$ANDROID_HOME/platforms/android-37.0/android.jar"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build DeadZone test APK
+        working-directory: deadzone
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/unified_module.py --mode build-debug-apk
+          APK="DeadZone-Toolbox-App/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --min-sdk-version 33 "$APK"
+          mkdir -p dist
+          cp "$APK" dist/DeadZone-Toolbox-Test-debug.apk
+          sha256sum dist/DeadZone-Toolbox-Test-debug.apk > dist/SHA256SUMS.txt
+
+      - name: Build framework hook DEX
+        if: ${{ inputs.build_framework_hooks }}
+        working-directory: deadzone
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/unified_module.py --mode build-hooks
+          test -s DeadZone-Framework-Hooks/build/dex/classes.dex
+          mkdir -p dist
+          cp DeadZone-Framework-Hooks/build/dex/classes.dex dist/DeadZone-Hooks-classes.dex
+          sha256sum dist/DeadZone-Hooks-classes.dex >> dist/SHA256SUMS.txt
+
+      - name: Publish non-flashable test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZone-Unified-Main-Test
+          path: deadzone/dist/
+          if-no-files-found: warn
+          retention-days: 7
