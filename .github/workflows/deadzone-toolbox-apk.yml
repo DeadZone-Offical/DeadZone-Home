@@ -201,6 +201,8 @@ jobs:
       - name: Run DeadZone application unit tests
         working-directory: toolbox
         shell: bash
+        env:
+          ORG_GRADLE_PROJECT_keystoreFile: ci-release.jks
         run: |
           set -euo pipefail
           chmod +x ./gradlew
