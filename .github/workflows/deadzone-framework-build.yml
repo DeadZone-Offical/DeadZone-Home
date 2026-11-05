@@ -1,0 +1,305 @@
+# DeadZone Framework Hooks build + opt-in ROM-specific framework/services patch.
+# Safe default: build and verify the new Java hook DEX only.
+# Patched framework.jar and services.jar need CLEAN JARs from the EXACT ROM.
+# This workflow never flashes, installs or alters a device.
+name: DeadZone Framework + Services Build
+
+run-name: "DeadZone Framework · ${{ inputs.platform }} · ${{ inputs.build_mode }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Target ROM family (the source JARs must match its exact build)"
+        type: choice
+        required: true
+        default: a16
+        options:
+          - a16
+          - a17
+      build_mode:
+        description: "Build hooks DEX only, or also patch matching stock framework/services JARs"
+        type: choice
+        required: true
+        default: hooks-only
+        options:
+          - hooks-only
+          - patch-jars
+      stock_jars_url:
+        description: "patch-jars only: HTTPS URL of ZIP holding clean framework.jar + services.jar"
+        type: string
+        required: false
+      stock_jars_sha256:
+        description: "patch-jars only: SHA-256 checksum of the stock JAR ZIP (64 hex characters)"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deadzone-framework-${{ github.ref }}-${{ inputs.platform }}
+  cancel-in-progress: false
+
+jobs:
+  build-framework:
+    name: "Build Hooks and optional ROM-matched framework/services"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PLATFORM: ${{ inputs.platform }}
+      BUILD_MODE: ${{ inputs.build_mode }}
+      STOCK_JARS_URL: ${{ inputs.stock_jars_url }}
+      STOCK_JARS_SHA256: ${{ inputs.stock_jars_sha256 }}
+
+    steps:
+      - name: Verify private repository credential and inputs
+        shell: bash
+        env:
+          READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$READ_TOKEN" ]]; then
+            echo "::error::Configure DEADZONE_PRIVATE_READ_TOKEN with Contents: read on DeadZone-Framework-Hooks and DeadZone-Toolbox-App." >&2
+            exit 1
+          fi
+          if [[ "$PLATFORM" != "a16" && "$PLATFORM" != "a17" ]]; then
+            echo "::error::Unsupported platform: $PLATFORM" >&2
+            exit 1
+          fi
+          if [[ "$BUILD_MODE" == "patch-jars" ]]; then
+            if [[ ! "$STOCK_JARS_URL" =~ ^https:// ]]; then
+              echo "::error::A HTTPS stock_jars_url is required for patch-jars." >&2
+              exit 1
+            fi
+            if [[ ! "$STOCK_JARS_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "::error::A 64-character stock_jars_sha256 is required for patch-jars." >&2
+              exit 1
+            fi
+          elif [[ "$BUILD_MODE" != "hooks-only" ]]; then
+            echo "::error::Unknown build mode." >&2
+            exit 1
+          fi
+
+      - name: Checkout Framework Hooks main
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Framework-Hooks
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: hooks
+          persist-credentials: false
+
+      - name: Checkout Toolbox build tools main
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Toolbox-App
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: toolbox
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: 'false'
+
+      - name: Install Android compile platform and DEX build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-35" "build-tools;36.0.0"
+          test -s "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -x "$ANDROID_HOME/build-tools/36.0.0/d8"
+          test -x "$ANDROID_HOME/build-tools/36.0.0/dexdump"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and verify pure-Java Framework Hooks DEX
+        working-directory: hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace \
+            -PandroidSdk="$ANDROID_HOME" \
+            -PandroidJar="$ANDROID_HOME/platforms/android-35/android.jar" \
+            buildDex verifyNoAndroidX verifyPureJava
+          test -s build/dex/classes.dex
+          "$ANDROID_HOME/build-tools/36.0.0/dexdump" -f build/dex/classes.dex > "$RUNNER_TEMP/hook-dexdump.txt"
+          grep -q 'Lcom/deadzone/framework/DeadZoneCore;' "$RUNNER_TEMP/hook-dexdump.txt"
+          grep -q 'Lcom/deadzone/framework/DeadZoneHook;' "$RUNNER_TEMP/hook-dexdump.txt"
+
+      - name: Capture verified hook DEX and source revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist/hooks"
+          cp hooks/build/dex/classes.dex "$GITHUB_WORKSPACE/dist/hooks/classes.dex"
+          {
+            echo "DeadZone Framework Hooks build"
+            echo "Target family: $PLATFORM"
+            echo "Framework Hooks commit: $(git -C hooks rev-parse HEAD)"
+            echo "Toolbox build scripts commit: $(git -C toolbox rev-parse HEAD)"
+            echo "Build mode: $BUILD_MODE"
+            echo "Output: hooks/classes.dex (verified pure Java)"
+            echo "Android compile API: 35 (original project configuration)"
+            echo "No stock platform JAR has been modified by this step."
+          } > "$GITHUB_WORKSPACE/dist/hooks/BUILD-INFO.txt"
+          (cd "$GITHUB_WORKSPACE/dist" && sha256sum hooks/classes.dex > hooks/SHA256SUMS.txt)
+          cat "$GITHUB_WORKSPACE/dist/hooks/BUILD-INFO.txt"
+
+      - name: Upload compiled hook DEX
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZone-Framework-Hooks-${{ inputs.platform }}-DEX
+          path: dist/hooks/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Download and validate exact-ROM stock JAR archive
+        if: inputs.build_mode == 'patch-jars'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
+            --max-time 1800 --output "$RUNNER_TEMP/deadzone-stock-jars.zip" "$STOCK_JARS_URL"
+          echo "$STOCK_JARS_SHA256  $RUNNER_TEMP/deadzone-stock-jars.zip" | sha256sum --check --status
+          mkdir -p "$GITHUB_WORKSPACE/stock-jars"
+          python3 - "$RUNNER_TEMP/deadzone-stock-jars.zip" "$GITHUB_WORKSPACE/stock-jars" <<'PY'
+          import shutil
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          archive, target = Path(sys.argv[1]), Path(sys.argv[2])
+          if archive.stat().st_size > 650 * 1024 * 1024:
+              raise SystemExit("Stock archive exceeds the 650 MiB safety limit")
+          with zipfile.ZipFile(archive) as zf:
+              if zf.testzip() is not None:
+                  raise SystemExit("Stock JAR ZIP failed integrity verification")
+              for name in ("framework.jar", "services.jar"):
+                  matches = [
+                      entry for entry in zf.infolist()
+                      if not entry.is_dir() and Path(entry.filename).name == name
+                  ]
+                  if len(matches) != 1:
+                      raise SystemExit(
+                          f"Expected exactly one {name} in the stock ZIP; found {len(matches)}"
+                      )
+                  entry = matches[0]
+                  if not (1024 < entry.file_size < 450 * 1024 * 1024):
+                      raise SystemExit(f"{name}: invalid or oversized JAR")
+                  with zf.open(entry) as source, (target / name).open("wb") as output:
+                      shutil.copyfileobj(source, output)
+                  with zipfile.ZipFile(target / name) as jar:
+                      if jar.testzip() is not None:
+                          raise SystemExit(f"Invalid JAR archive: {name}")
+                      dex_names = [
+                          n for n in jar.namelist()
+                          if n.startswith("classes") and n.endswith(".dex")
+                      ]
+                      if not dex_names:
+                          raise SystemExit(f"{name} has no classes*.dex. Use dex-containing ROM JARs.")
+                  print(f"[ok] Stock {name}: {entry.file_size} bytes, {len(dex_names)} DEX files")
+          PY
+          (cd "$GITHUB_WORKSPACE/stock-jars" && sha256sum framework.jar services.jar)
+
+      - name: Obtain apktool for ROM-specific surgical patching
+        if: inputs.build_mode == 'patch-jars'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
+            --output "$HOME/bin/apktool.jar" \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
+          unzip -tq "$HOME/bin/apktool.jar" > /dev/null
+          java -jar "$HOME/bin/apktool.jar" --version
+          echo "Using fixed apktool 2.9.3 for DeadZone surgical build tooling."
+
+      - name: Patch framework.jar and services.jar against matching stock JARs
+        if: inputs.build_mode == 'patch-jars'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 toolbox/tools/build_platform.py \
+            "$PLATFORM" \
+            "$GITHUB_WORKSPACE/stock-jars" \
+            "$GITHUB_WORKSPACE/dist/platform" \
+            --hook "$GITHUB_WORKSPACE/hooks/build/dex/classes.dex"
+
+      - name: Validate and package the patched JARs (never flash)
+        if: inputs.build_mode == 'patch-jars'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/platform/framework.jar
+          test -s dist/platform/services.jar
+          python3 - "$GITHUB_WORKSPACE/dist/platform" <<'PY'
+          import sys
+          import zipfile
+          from pathlib import Path
+          target = Path(sys.argv[1])
+          for jar_name in ("framework.jar", "services.jar"):
+              with zipfile.ZipFile(target / jar_name) as jar:
+                  if jar.testzip() is not None:
+                      raise SystemExit(f"Invalid patched {jar_name}")
+                  dex_files = [
+                      n for n in jar.namelist()
+                      if n.startswith("classes") and n.endswith(".dex")
+                  ]
+                  if not dex_files:
+                      raise SystemExit(f"No DEX files in patched {jar_name}")
+                  print(f"[ok] Patched {jar_name}: {len(dex_files)} DEX files")
+          PY
+          {
+            echo "DeadZone patched platform JARs - verification required before flashing"
+            echo "Platform family: $PLATFORM"
+            echo "Framework Hooks revision: $(git -C hooks rev-parse HEAD)"
+            echo "Toolbox build scripts revision: $(git -C toolbox rev-parse HEAD)"
+            echo "Stock JAR archive SHA-256: $STOCK_JARS_SHA256"
+            echo "IMPORTANT: These JARs are valid ONLY for the exact source ROM build."
+            echo "A successful build is not a device boot verification."
+            echo "No flashing or system partition writes were performed."
+          } > dist/platform/BUILD-INFO.txt
+          (cd dist/platform && sha256sum framework.jar services.jar > SHA256SUMS.txt)
+
+      - name: Upload verified patch results for exact ROM only
+        if: inputs.build_mode == 'patch-jars'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZone-Patched-Framework-Services-${{ inputs.platform }}
+          path: dist/platform/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### DeadZone Framework build"
+            echo ""
+            echo "- Platform family: \`$PLATFORM\`"
+            echo "- Build mode: \`$BUILD_MODE\`"
+            if [[ -f hooks/build/dex/classes.dex ]]; then
+              echo "- Hooks DEX: produced"
+            else
+              echo "- Hooks DEX: not produced"
+            fi
+            if [[ -s dist/platform/framework.jar && -s dist/platform/services.jar ]]; then
+              echo "- Matched framework.jar / services.jar: produced (NOT tested on a device)"
+            else
+              echo "- Patched platform JARs: not produced"
+            fi
+            echo "- This workflow never flashes firmware."
+          } >> "$GITHUB_STEP_SUMMARY"
