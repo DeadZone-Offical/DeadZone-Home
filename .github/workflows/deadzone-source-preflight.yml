@@ -1,0 +1,100 @@
+# DeadZone centralized CI for private source repositories.
+# All GitHub Actions workflows live in DeadZone-Home only.
+# Required Home secret: DEADZONE_PRIVATE_READ_TOKEN with read-only Contents
+# permission on DeadZone-Framework-Hooks and DeadZone-OS-Patches.
+#
+# No private source, test logs, or build outputs are published from this
+# public repository. Production ROM flashing is intentionally excluded.
+name: DeadZone Private Source Preflight
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deadzone-source-preflight.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deadzone-private-source-preflight
+  cancel-in-progress: true
+
+jobs:
+  source-validation:
+    name: Private Source Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Require read-only access to private DeadZone repos
+        shell: bash
+        env:
+          SOURCE_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+        run: |
+          if [[ -z "$SOURCE_TOKEN" ]]; then
+            echo "::error::Set DEADZONE_PRIVATE_READ_TOKEN in DeadZone-Home with Contents:read on the private Framework Hooks and OS Patches repositories." >&2
+            exit 1
+          fi
+
+      - name: Checkout private DeadZone OS Patches
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-OS-Patches
+          ref: main
+          path: deadzone-os-patches
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Checkout private DeadZone Framework Hooks
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Framework-Hooks
+          ref: main
+          path: deadzone-framework-hooks
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Java for the DeadZone framework
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Validate DeadZone Android 17 profile and injector
+        working-directory: deadzone-os-patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          if python3 -m unittest discover -s injector -p 'test_*.py' -v > "$RUNNER_TEMP/deadzone-os-tests.log" 2>&1 &&
+             python3 scripts/rom_profile.py check a17-zircon > "$RUNNER_TEMP/deadzone-profile.log" 2>&1 &&
+             sh -n module/customize.sh &&
+             sh -n module/service.sh &&
+             sh -n module/post-fs-data.sh; then
+            echo "DeadZone OS Patches: preflight passed."
+          else
+            echo "::error::DeadZone OS Patches validation failed; inspect the private repository locally. Detailed private test logs were not published." >&2
+            exit 1
+          fi
+
+      - name: Verify DeadZone framework decoder and Java compilation
+        working-directory: deadzone-framework-hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          if bash scripts/verify_strings.sh > "$RUNNER_TEMP/deadzone-string-gate.log" 2>&1 &&
+             python3 scripts/compile_check.py > "$RUNNER_TEMP/deadzone-framework-compile.log" 2>&1; then
+            echo "DeadZone Framework Hooks: decoder self-test and compile passed."
+          else
+            echo "::error::DeadZone Framework Hooks validation failed; inspect the private repository locally. Detailed private test logs were not published." >&2
+            exit 1
+          fi
+
+      - name: Remove private checkout and temporary logs
+        if: always()
+        shell: bash
+        run: |
+          rm -rf deadzone-os-patches deadzone-framework-hooks
+          rm -f "$RUNNER_TEMP"/deadzone-*.log
