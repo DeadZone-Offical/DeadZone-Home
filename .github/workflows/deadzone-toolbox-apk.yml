@@ -138,6 +138,22 @@ jobs:
           sed -i -E '/^(keystoreFile|keystorePassword|keyAlias|keyPassword)=/d' gradle.properties
           chmod 600 ci-release.jks
 
+      - name: Verify Integrity and Keybox source contracts
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          PIF="app/src/main/java/com/deadzone/toolbox/ui/utilities/SpoofMaterialsScreens.kt"
+          SETTINGS="app/src/main/java/com/deadzone/toolbox/data/SettingsRepository.kt"
+          CORE="app/src/main/java/com/deadzone/toolbox/ui/core/CoreViewModel.kt"
+          grep -Fq 'checked = core.gmsSpoof' "$PIF"
+          grep -Fq 'parsePifDocument(document)' "$PIF"
+          grep -Fq 'fun isWellFormedPif(document: String)' "$SETTINGS"
+          grep -Fq 'fun inspectKeybox(document: String)' "$SETTINGS"
+          grep -Fq 'if (!inspectKeybox(xml).valid) return false' "$SETTINGS"
+          grep -Fq 'repository.inspectKeybox(xml)' "$CORE"
+          echo "PIF GMS wiring, profile format validation and keybox import preflight: present"
+
       - name: Build release APK (V1 + V2 + V3)
         working-directory: toolbox
         shell: bash
