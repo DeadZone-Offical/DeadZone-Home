@@ -90,7 +90,7 @@ jobs:
             echo "::error::Native core exposes Java-facing symbols." >&2
             exit 1
           fi
-          if grep -E 'NEEDED' <<< "$DYNAMIC" | grep -Eq 'libstd[.]dylib[.]so'; then
+          if grep -Eq 'NEEDED.*libstd[.]dylib[.]so' <<< "$DYNAMIC"; then
             echo "::error::Native core depends on an unsupported system library." >&2
             exit 1
           fi
