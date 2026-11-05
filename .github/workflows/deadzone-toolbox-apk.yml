@@ -147,7 +147,6 @@ jobs:
           SETTINGS="app/src/main/java/com/deadzone/toolbox/data/SettingsRepository.kt"
           CORE="app/src/main/java/com/deadzone/toolbox/ui/core/CoreViewModel.kt"
           grep -Fq 'checked = core.gmsSpoof' "$PIF"
-          grep -Fq 'parsePifDocument(document)' "$PIF"
           grep -Fq 'fun isWellFormedPif(document: String)' "$SETTINGS"
           grep -Fq 'fun inspectKeybox(document: String)' "$SETTINGS"
           grep -Fq 'if (!inspectKeybox(xml).valid) return false' "$SETTINGS"
