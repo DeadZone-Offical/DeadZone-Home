@@ -378,6 +378,15 @@ jobs:
           fi
           echo "Integrity PIF/Keybox normalization, real publication checks and safe packaging: present"
 
+      - name: Verify reference-video features and DeadZone Spoof source
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_video_reference.py
+          python3 scripts/verify_spoof_sources.py
+          echo "[+] Video routes, key mapping, official attestation diagnostics and native ABI references verified"
+
       - name: Run the contract of the keys against the framework registry
         working-directory: toolbox
         shell: bash
