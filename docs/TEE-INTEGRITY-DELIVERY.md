@@ -56,6 +56,8 @@ them.
 | `c425b7c` | refactor: make the hook facade stateless and the engines lazily built |
 | `02dc8fd` | feat: add the Android 17 injection points of the reference implementation |
 | `42afec1` | docs: publish the upstream analysis and the feature parity matrix |
+| `9b81168` | docs: record the executed injection and add the tool that reads the DEX surface |
+| `ff834d9` | test: verify the injection plan against the real platform artifacts |
 
 ### DeadZone-Toolbox-App
 
@@ -79,7 +81,7 @@ them.
 
 | Commit | Subject |
 |---|---|
-| see §8 | docs: publish the delivery report and the reproducible build |
+| `9e59d90` | docs: publish the delivery report and the reproducible build of the integration |
 
 The `main` branch of every repository is untouched. The separate Java
 reconstruction branch `feature/java-framework-rebuild-a17` of the hook
@@ -103,6 +105,7 @@ estimated.
 | Native build | `bash scripts/build_ndk.sh` | 4 ABIs, export surface verified |
 | Platform injection | `./gradlew injectAndroid17` | 16 + 2 hook points, verification passed |
 | Platform verification | `./gradlew verifyAndroid17` | 0 classes lost, 0 duplicated |
+| Plan compatibility | `python3 scripts/platform_plan_check.py` | 27 checks, 0 failures |
 
 The boot safety suite covers twelve invariants over the sources that end
 up in the boot class path: no development component, no dangling
@@ -197,6 +200,12 @@ strategy for that is a decision of the project, not of a commit.
 6. **One backup level of the keybox.** The upstream keeps a timestamped
    directory of them. DeadZone keeps one document, which is enough to
    recover from a bad import.
+7. **The anchor of every hook point is verified by existence, not by
+   execution.** The plan check proves that the class, the method and the
+   descriptor exist in the target artifacts. The anchor instruction is
+   verified by the injection itself, which fails when the anchor is not
+   found, but the semantics of the anchor were read by hand from the
+   disassembly and were not executed on a device.
 
 ---
 
@@ -204,10 +213,10 @@ strategy for that is a decision of the project, not of a commit.
 
 | Repository | Pull request |
 |---|---|
-| DeadZone-Framework-Hooks | `https://github.com/DeadZone-Offical/DeadZone-Framework-Hooks/pull/1` |
-| DeadZone-Toolbox-App | `https://github.com/DeadZone-Offical/DeadZone-Toolbox-App/pull/1` |
+| DeadZone-Framework-Hooks | `https://github.com/DeadZone-Offical/DeadZone-Framework-Hooks/pull/2` |
+| DeadZone-Toolbox-App | `https://github.com/DeadZone-Offical/DeadZone-Toolbox-App/pull/2` |
 | DeadZone-Native-Core | `https://github.com/DeadZone-Offical/DeadZone-Native-Core/pull/1` |
-| DeadZone-Home | `https://github.com/DeadZone-Offical/DeadZone-Home/pull/1` |
+| DeadZone-Home | `https://github.com/DeadZone-Offical/DeadZone-Home/pull/9` |
 
 **None of them is merged.** A runtime critical modification must not be
 merged before its applicable validation has passed, and the device boot
