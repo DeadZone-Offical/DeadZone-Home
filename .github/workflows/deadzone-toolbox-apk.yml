@@ -58,15 +58,34 @@ jobs:
           fi
 
           # The token has to reach both private repositories. The check
-          # happens here, before the expensive build, and the token is
-          # never printed.
+          # happens here, before the expensive build.
+          #
+          # The token is never placed in a URL and never printed. The
+          # helper that answers the credential request reads it from the
+          # environment, so it never reaches the command line, the
+          # process list or the log.
+          ASKPASS="$(mktemp)"
+          trap 'rm -f "$ASKPASS"' EXIT
+          cat > "$ASKPASS" <<'ASKPASS_EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s' 'x-access-token' ;;
+            *Password*) printf '%s' "$DEADZONE_READ_TOKEN" ;;
+          esac
+          ASKPASS_EOF
+          chmod 700 "$ASKPASS"
+          export DEADZONE_READ_TOKEN="$REPO_READ_TOKEN"
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
           for repo in DeadZone-Offical/DeadZone-Toolbox-App DeadZone-Offical/DeadZone-Framework-Hooks; do
-            if ! git ls-remote --exit-code -h "https://x-access-token:${REPO_READ_TOKEN}@github.com/${repo}.git" > /dev/null 2>&1; then
+            if ! git ls-remote --exit-code -h "https://github.com/${repo}.git" > /dev/null 2>&1; then
               echo "::error::DEADZONE_PRIVATE_READ_TOKEN cannot read ${repo}. Grant the token Contents: read on that repository." >&2
               exit 1
             fi
             echo "[+] the credential reads ${repo}"
           done
+          unset DEADZONE_READ_TOKEN
 
       - name: Checkout DeadZone Toolbox App main (private)
         uses: actions/checkout@v4
