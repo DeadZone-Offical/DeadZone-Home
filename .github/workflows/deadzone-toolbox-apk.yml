@@ -363,7 +363,9 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/dist"
           printf '%s  %s\n' "$SOURCE_SHA" "lib/arm64-v8a/libdeadzone_core.so" > "$GITHUB_WORKSPACE/dist/native-core-SHA256.txt"
           cp "$APK" "$GITHUB_WORKSPACE/dist/DeadZone-Toolbox-App-V1-V2-V3.apk"
-          sha256sum "$GITHUB_WORKSPACE/dist/DeadZone-Toolbox-App-V1-V2-V3.apk" > "$GITHUB_WORKSPACE/dist/SHA256SUMS.txt"
+          # The name of the file is relative, so the sums can be checked
+          # again after the artifact was downloaded, wherever it lands.
+          ( cd "$GITHUB_WORKSPACE/dist" && sha256sum DeadZone-Toolbox-App-V1-V2-V3.apk > SHA256SUMS.txt )
           cp "$RUNNER_TEMP/toolbox-signature-report.txt" "$GITHUB_WORKSPACE/dist/signature-report.txt"
 
       - name: Verify the release artifacts are complete
@@ -384,7 +386,7 @@ jobs:
               exit 1
             fi
           done
-          sha256sum --check "$DIST/SHA256SUMS.txt"
+          ( cd "$DIST" && sha256sum --check SHA256SUMS.txt )
           echo "[+] the release artifact carries the signed APK and its reports"
 
       - name: Remove temporary keystore
