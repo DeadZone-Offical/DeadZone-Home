@@ -133,7 +133,11 @@ The run produces:
 ```
 > Task :verifyBootSafety
 DeadZone boot safety regression suite
-800 checks, 0 failures
+837 checks, 0 failures
+
+> Task :verifyAssets
+DeadZone - asset compatibility check
+31 checks, 0 failures
 
 > Task :verifyP0Integration
 [*] DeadZoneProfilesTest
@@ -148,13 +152,16 @@ DeadZone capability registry tests
 [*] DeadZoneKeyboxManagerTest
 DeadZone keybox manager tests
 45 checks, 0 failures
+[*] DeadZoneRuntimeRepairTest
+DeadZone P0 repair tests
+53 checks, 0 failures
 [+] the P0 integration passes its host tests
 
 > Task :verifyPureJava
 [+] the DEX is pure Java, no library is loaded
 
 > Task :verifyRemainingJava
-PASS 10 lifecycle assertions
+PASS 11 lifecycle assertions
 PASS 12 admin safety assertions
 
 BUILD SUCCESSFUL
@@ -174,14 +181,18 @@ A device boot is a separate, still pending, step, and it is described in
 
 ```bash
 cd _repos/DeadZone-Toolbox-App
-./gradlew --offline --no-daemon test
+./gradlew --no-daemon check
 ```
 
 ```
 BUILD SUCCESSFUL
 ```
 
-159 tests, 0 failures. The count per suite:
+159 tests, 0 failures. The check also runs the static analysis of the
+build, which reports two exceptions that are declared in `app/lint.xml`:
+the permissions that only a system application may hold and the
+enumeration of every installed application. Both are the reason the
+toolbox exists, and the reason is written down in that file.
 
 | Suite | Tests |
 |---|---|
@@ -256,10 +267,20 @@ stock artifacts of the target build.
 [+] the verification passed
 
 > Task :verifyAndroid17
-[+] framework.jar: 38290 classes, 0 lost, 0 duplicated
-[+] services.jar: 23854 classes, 0 lost, 0 duplicated
+[+] framework.jar: 38291 classes, 0 lost, 0 duplicated
+[+] services.jar: 23855 classes, 0 lost, 0 duplicated
 [+] every check passed
+
+> Task :verifyInjectionIdempotency
+[+] framework.jar: already present (4 call sites), 0 legacy call(s) removed, appended nothing
+[+] services.jar: already present (3 call sites), 0 legacy call(s) removed, appended nothing
+[+] the injector is idempotent
 ```
+
+The idempotency gate runs the pipeline a second time over its own output
+and compares the digests of the two jars. They are equal, byte for byte,
+so a build that runs twice produces the same artifact and reports the
+truth about the second run.
 
 The verification proves that the injection is lossless: no class of the
 platform was lost and no class was duplicated, and the method id tables
