@@ -147,15 +147,15 @@ jobs:
                   raise SystemExit(f"::error::Missing expected key registry: {path}")
 
           pinned = dict(re.findall(
-              r'm\\.put\\("DZ_KEY_([A-Z_]+)",\\s*"([^"]+)"\\);',
+              r'm\.put\("DZ_KEY_([A-Z_]+)",\s*"([^"]+)"\);',
               pinned_path.read_text(encoding="utf-8"),
           ))
           toolbox = dict(re.findall(
-              r'const val\\s+([A-Z_]+)\\s*=\\s*"([^"]+)"',
+              r'const val\s+([A-Z_]+)\s*=\s*"([^"]+)"',
               toolbox_path.read_text(encoding="utf-8"),
           ))
           live = dict(re.findall(
-              r'public static final String\\s+([A-Z_]+)\\s*=\\s*"(deadzone_[a-z0-9_]+)"',
+              r'public static final String\s+([A-Z_]+)\s*=\s*"(deadzone_[a-z0-9_]+)"',
               live_path.read_text(encoding="utf-8"),
           ))
           if len(pinned) < 20 or len(toolbox) < 20 or len(live) < 20:
@@ -205,8 +205,8 @@ jobs:
           ]
           out = root / "dist/framework-contract-report.txt"
           out.parent.mkdir(parents=True, exist_ok=True)
-          out.write_text("\\n".join(report) + "\\n", encoding="utf-8")
-          print("\\n".join(report))
+          out.write_text("\n".join(report) + "\n", encoding="utf-8")
+          print("\n".join(report))
           if missing:
               print(
                   "::warning::Current Framework is missing "
@@ -215,10 +215,10 @@ jobs:
                     "Building APK is permitted; runtime feature parity is NOT certified."
               )
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
-              summary.write("### Toolbox / live Framework key check\\n")
-              summary.write(f"- Live shared keys: **{len(common)}**\\n")
-              summary.write(f"- Legacy Toolbox keys absent in Framework: **{len(missing)}**\\n")
-              summary.write("- [Build != runtime spoof verification]\\n")
+              summary.write("### Toolbox / live Framework key check\n")
+              summary.write(f"- Live shared keys: **{len(common)}**\n")
+              summary.write(f"- Legacy Toolbox keys absent in Framework: **{len(missing)}**\n")
+              summary.write("- [Build != runtime spoof verification]\n")
           PY
 
       - name: Set up Java 17
