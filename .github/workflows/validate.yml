@@ -1,0 +1,211 @@
+name: DeadZone Shared Build Validation
+
+# DEADZONE: shared, reusable validation step for DeadZone-Home ROM build
+# master workflows. This is an OPTIONAL component for NEW projects.
+#
+# Existing master workflows (lite.yml, jesse.yml, custom-gamingplus.yml,
+# custom-legend.yml, custom-ninja.yml, port*.yml) already perform their
+# own inline Python validation and MUST NOT be retrofitted to call this
+# workflow -- that would be a breaking change to inputs/secrets and to
+# the inline error messages the bot depends on. New master workflows
+# MAY call this workflow via `workflow_call` to centralize the
+# controlled-request validation.
+#
+# What it does
+# ------------
+# 1. Validates `request_id` matches `<project_name>_[A-Za-z0-9]{8,80}`.
+# 2. Validates `input_url`:
+#      - scheme is https
+#      - has a hostname
+#      - has no embedded username / password
+#      - does not point at loopback, link-local, or private RFC1918 space
+# 3. Validates `callback_url` the same way (https, no creds).
+# 4. Confirms the `GH_TOKEN` secret is present.
+# 5. Emits the expected engine_repository slug as an environment
+#    variable (`ENGINE_REPOSITORY`) and as a step output
+#    (`engine_repository`) so the calling workflow can:
+#      - export it via `steps.validate.outputs.engine_repository`, and
+#      - read it from `$GITHUB_ENV` for shell steps.
+#
+# IMPORTANT: this workflow uses environment files and job-output files
+# (`$GITHUB_ENV`, `$GITHUB_OUTPUT`) instead of the deprecated
+# `::set-output` / `$GITHUB_OUTPUT` write syntax. Do NOT reintroduce
+# `::set-output` -- GitHub Actions will surface it as a warning and may
+# stop honouring it in the future.
+
+on:
+  workflow_call:
+    inputs:
+      input_url:
+        required: true
+        type: string
+      builder_name:
+        required: false
+        type: string
+        default: ""
+      builder_id:
+        required: false
+        type: string
+        default: ""
+      request_id:
+        required: true
+        type: string
+      callback_url:
+        required: true
+        type: string
+      project_name:
+        required: true
+        type: string
+        # Lowercase project slug, e.g. "gamingplus", "legend",
+        # "ninja", "lite", "jesse", "port", "port_coloros",
+        # "port_oxygenos", "port_realmeui".
+    secrets:
+      GH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate controlled request
+    runs-on: ubuntu-latest
+    outputs:
+      engine_repository: ${{ steps.validate.outputs.engine_repository }}
+    steps:
+      - name: Validate controlled request
+        id: validate
+        shell: python
+        env:
+          INPUT_URL: ${{ inputs.input_url }}
+          BUILDER_NAME: ${{ inputs.builder_name }}
+          BUILDER_ID: ${{ inputs.builder_id }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          ENGINE_REPOSITORY_ENV_FILE: $GITHUB_ENV
+          ENGINE_REPOSITORY_OUTPUT_FILE: $GITHUB_OUTPUT
+        run: |
+          import ipaddress
+          import os
+          import re
+          import socket
+          from urllib.parse import urlparse
+
+          # ------------------------------------------------------------------
+          # 1. Read and lightly scrub every input.
+          # ------------------------------------------------------------------
+          project_name = os.environ["PROJECT_NAME"].strip().lower()
+          request_id   = os.environ["REQUEST_ID"].strip()
+          input_url    = os.environ["INPUT_URL"].strip()
+          callback_url = os.environ["CALLBACK_URL"].strip()
+          gh_token     = os.environ.get("GH_TOKEN", "").strip()
+
+          # ------------------------------------------------------------------
+          # 2. Compute the engine_repository slug.
+          #    Convention: DeadZone-Offical/DeadZone-xiaomi_<Project>
+          #    with the first letter capitalised. The runtime may override
+          #    this value, but exposing the expected slug here lets callers
+          #    sanity-check it against their own project map.
+          # ------------------------------------------------------------------
+          title_project = project_name[:1].upper() + project_name[1:]
+          engine_repository = f"DeadZone-Offical/DeadZone-xiaomi_{title_project}"
+
+          # ------------------------------------------------------------------
+          # 3. request_id must be `<project>_<A-Za-z0-9>{8,80}`.
+          # ------------------------------------------------------------------
+          if not re.fullmatch(r"[a-z][a-z0-9_]*", project_name):
+              raise SystemExit(
+                  "Invalid PROJECT_NAME: must match [a-z][a-z0-9_]*"
+              )
+
+          pattern = rf"^{re.escape(project_name)}_[A-Za-z0-9]{{8,80}}$"
+          if not re.fullmatch(pattern, request_id):
+              raise SystemExit(
+                  f"Invalid DeadZone request ID for project {project_name!r}: "
+                  f"expected pattern {pattern!r}"
+              )
+
+          # ------------------------------------------------------------------
+          # 4. URL helper: enforce scheme, no creds, no loopback/private.
+          # ------------------------------------------------------------------
+          def _safe_https_url(label, value, *, allow_local=False):
+              if not value:
+                  raise SystemExit(f"{label} is empty")
+              if len(value) > 2048:
+                  raise SystemExit(
+                      f"{label} is longer than 2048 chars"
+                  )
+              parsed = urlparse(value)
+              if parsed.scheme != "https":
+                  raise SystemExit(
+                      f"{label} must use the https scheme (got {parsed.scheme!r})"
+                  )
+              if not parsed.hostname:
+                  raise SystemExit(
+                      f"{label} must include a hostname"
+                  )
+              if parsed.username or parsed.password:
+                  raise SystemExit(
+                      f"{label} must not embed credentials"
+                  )
+              # Resolve the hostname to all its IPs and reject any
+              # loopback / link-local / private / multicast address.
+              # This is what protects the runner from SSRF-style
+              # callbacks aimed at 127.0.0.1, 169.254.169.254, etc.
+              try:
+                  infos = socket.getaddrinfo(parsed.hostname, None)
+              except socket.gaierror as exc:
+                  raise SystemExit(
+                      f"{label} hostname does not resolve: {exc}"
+                  )
+              for family, *_rest, sockaddr in infos:
+                  ip_str = sockaddr[0]
+                  try:
+                      ip = ipaddress.ip_address(ip_str)
+                  except ValueError:
+                      continue
+                  if (
+                      ip.is_loopback
+                      or ip.is_link_local
+                      or ip.is_private
+                      or ip.is_multicast
+                      or ip.is_unspecified
+                      or ip.is_reserved
+                  ):
+                      if not allow_local:
+                          raise SystemExit(
+                              f"{label} resolves to a non-public address: {ip_str}"
+                          )
+              return parsed
+
+          _safe_https_url("INPUT_URL", input_url)
+          _safe_https_url("CALLBACK_URL", callback_url)
+
+          # ------------------------------------------------------------------
+          # 5. GH_TOKEN must be present.
+          # ------------------------------------------------------------------
+          if not gh_token:
+              raise SystemExit(
+                  "Missing required repository secret: GH_TOKEN"
+              )
+
+          # ------------------------------------------------------------------
+          # 6. Persist the engine_repository slug using the modern
+          #    environment-file and $GITHUB_OUTPUT mechanisms. We never use
+          #    the deprecated `::set-output` workflow command.
+          # ------------------------------------------------------------------
+          env_file = os.environ["ENGINE_REPOSITORY_ENV_FILE"]
+          with open(env_file, "a", encoding="utf-8") as fp:
+              fp.write(f"ENGINE_REPOSITORY={engine_repository}\n")
+
+          output_file = os.environ["ENGINE_REPOSITORY_OUTPUT_FILE"]
+          with open(output_file, "a", encoding="utf-8") as fp:
+              fp.write(f"engine_repository={engine_repository}\n")
+
+          # Emit a human-readable summary that shows up in the run log.
+          print(f"[validate] project_name={project_name}")
+          print(f"[validate] engine_repository={engine_repository}")
+          print("[validate] INPUT_URL and CALLBACK_URL accepted")
+          print("[validate] GH_TOKEN present")
