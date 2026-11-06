@@ -5,7 +5,8 @@
 # The source is pinned to its main branch; this job never builds or flashes a ROM.
 #
 # Required Actions secrets on DeadZone-Home:
-# DEADZONE_PRIVATE_READ_TOKEN   fine-grained PAT; Contents: read on DeadZone-Toolbox-App
+# DEADZONE_PRIVATE_READ_TOKEN   fine-grained PAT; Contents: read on
+#                               DeadZone-Toolbox-App AND DeadZone-Framework-Hooks
 # TOOLBOX_KEYSTORE_BASE64       base64 of the stable Android release .jks
 # TOOLBOX_STORE_PASSWORD       keystore password
 # TOOLBOX_KEY_ALIAS            release key alias
@@ -29,6 +30,15 @@ concurrency:
   group: deadzone-toolbox-apk-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # The registry of the keys of the settings is the contract between the
+  # toolbox and the hook layer of the platform. The hook layer lives in
+  # its own repository, so the build has to be told where to find it.
+  # The environment variable makes the lookup deterministic and does not
+  # depend on the layout of the checkout.
+  DEADZONE_FRAMEWORK_REGISTRY: ${{ github.workspace }}/framework/tools/DeadZoneStringRegistry.java
+  DEADZONE_FRAMEWORK_HOME: ${{ github.workspace }}/framework
+
 jobs:
   build-toolbox:
     name: "Build and verify signed APK"
@@ -43,9 +53,20 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "$REPO_READ_TOKEN" ]]; then
-            echo "::error::Missing DEADZONE_PRIVATE_READ_TOKEN (Contents: read on private DeadZone-Toolbox-App)." >&2
+            echo "::error::Missing DEADZONE_PRIVATE_READ_TOKEN (Contents: read on private DeadZone-Toolbox-App and DeadZone-Framework-Hooks)." >&2
             exit 1
           fi
+
+          # The token has to reach both private repositories. The check
+          # happens here, before the expensive build, and the token is
+          # never printed.
+          for repo in DeadZone-Offical/DeadZone-Toolbox-App DeadZone-Offical/DeadZone-Framework-Hooks; do
+            if ! git ls-remote --exit-code -h "https://x-access-token:${REPO_READ_TOKEN}@github.com/${repo}.git" > /dev/null 2>&1; then
+              echo "::error::DEADZONE_PRIVATE_READ_TOKEN cannot read ${repo}. Grant the token Contents: read on that repository." >&2
+              exit 1
+            fi
+            echo "[+] the credential reads ${repo}"
+          done
 
       - name: Checkout DeadZone Toolbox App main (private)
         uses: actions/checkout@v4
@@ -56,6 +77,16 @@ jobs:
           path: toolbox
           fetch-depth: 1
           lfs: true
+          persist-credentials: false
+
+      - name: Checkout DeadZone Framework Hooks main (private)
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Framework-Hooks
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: framework
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Report source revision
@@ -71,6 +102,30 @@ jobs:
             echo "::error::The native core libraries were not checked out." >&2
             exit 1
           fi
+
+      - name: Verify the framework contract is reachable
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The registry of the keys is the authoritative source of the
+          # names of the keys of the settings. The toolbox verifies its
+          # mirror against it, so a build that cannot see it cannot
+          # claim that the two sides agree.
+          if [[ ! -f "$DEADZONE_FRAMEWORK_REGISTRY" ]]; then
+            echo "::error::The framework registry was not checked out at ${DEADZONE_FRAMEWORK_REGISTRY}." >&2
+            echo "::error::Check out DeadZone-Offical/DeadZone-Framework-Hooks into the 'framework' directory." >&2
+            exit 1
+          fi
+          if [[ ! -s "$DEADZONE_FRAMEWORK_REGISTRY" ]]; then
+            echo "::error::The framework registry at ${DEADZONE_FRAMEWORK_REGISTRY} is empty." >&2
+            exit 1
+          fi
+          KEY_COUNT="$(grep -c 'm\.put("DZ_KEY_' "$DEADZONE_FRAMEWORK_REGISTRY" || true)"
+          if [[ "$KEY_COUNT" -lt 1 ]]; then
+            echo "::error::The framework registry at ${DEADZONE_FRAMEWORK_REGISTRY} declares no settings key." >&2
+            exit 1
+          fi
+          echo "[+] the framework registry declares ${KEY_COUNT} settings keys"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -229,6 +284,18 @@ jobs:
           fi
           echo "Integrity PIF/Keybox normalization, real publication checks and safe packaging: present"
 
+      - name: Run the contract of the keys against the framework registry
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The contract between the toolbox and the hook layer is
+          # enforced by the tool that writes the mirror of the keys. The
+          # check is read-only, so it can never change the mirror, and it
+          # reports every key that is missing, unknown or wrong.
+          python3 tools/sync_setting_keys.py --check
+          echo "[+] the mirror of the keys matches the framework registry"
+
       - name: Run DeadZone application unit tests
         working-directory: toolbox
         shell: bash
@@ -279,6 +346,27 @@ jobs:
           cp "$APK" "$GITHUB_WORKSPACE/dist/DeadZone-Toolbox-App-V1-V2-V3.apk"
           sha256sum "$GITHUB_WORKSPACE/dist/DeadZone-Toolbox-App-V1-V2-V3.apk" > "$GITHUB_WORKSPACE/dist/SHA256SUMS.txt"
           cp "$RUNNER_TEMP/toolbox-signature-report.txt" "$GITHUB_WORKSPACE/dist/signature-report.txt"
+
+      - name: Verify the release artifacts are complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The artifact has to carry the signed APK and every report that
+          # proves it. A missing file fails here, before the upload, so
+          # the run never publishes a half filled artifact.
+          DIST="$GITHUB_WORKSPACE/dist"
+          for name in \
+            DeadZone-Toolbox-App-V1-V2-V3.apk \
+            SHA256SUMS.txt \
+            native-core-SHA256.txt \
+            signature-report.txt; do
+            if [[ ! -s "$DIST/$name" ]]; then
+              echo "::error::The release artifact is incomplete: $name is missing." >&2
+              exit 1
+            fi
+          done
+          sha256sum --check "$DIST/SHA256SUMS.txt"
+          echo "[+] the release artifact carries the signed APK and its reports"
 
       - name: Remove temporary keystore
         if: always()
