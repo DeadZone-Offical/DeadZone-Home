@@ -32,7 +32,7 @@ them.
 | The toolbox controls and the diagnostics | `ui/identity/IdentityScreens.kt`, `module/diagnostics/` | Delivered |
 | The native and Java compatibility work | `DeadZone-Native-Core`, `DeadZone-Framework-Hooks` | Delivered |
 | The conflict and the boot safety checks | `DeadZoneCapabilityRegistry.java`, `scripts/boot_safety_check.py` | Delivered |
-| The automated regression tests | 159 + 282 + 116 + 833 | Delivered |
+| The automated regression tests | 159 + 282 + 116 + 837 | Delivered |
 | The Android 17 integration artifacts | `mezo/out/patched/` | Produced and statically verified |
 | The reproducible build documentation | `DeadZone-Home/docs/TEE-INTEGRITY-BUILD.md` | Delivered |
 | The feature parity matrix | `DeadZone-Framework-Hooks/docs/TEE-INTEGRITY-FEATURE-MATRIX.md` | Delivered |
@@ -60,6 +60,9 @@ them.
 | `ff834d9` | test: verify the injection plan against the real platform artifacts |
 | `b2689fd` | fix: repair the bootloop and the inert runtime of the reconstruction |
 | `b367f1a` | docs: record the boot repair in the parity matrix and refresh the numbers |
+| `151a9c7` | fix: make the injector idempotent and complete the parity matrix |
+| `5842867` | build: let the asset check find the published documents |
+| `8e0b712` | docs: record the fourth defect and the asset gate in the parity matrix |
 
 ### DeadZone-Toolbox-App
 
@@ -103,7 +106,7 @@ estimated.
 | Toolbox unit tests and analysis | `./gradlew check` | 159 tests, 0 failures, the analysis passes |
 | Framework host tests | `./gradlew check` | 282 checks, 0 failures |
 | Native core host tests | `bash scripts/run_host_tests.sh` | 116 checks, 0 failures |
-| Boot safety | `python3 scripts/boot_safety_check.py` | 833 checks, 0 failures |
+| Boot safety | `python3 scripts/boot_safety_check.py` | 837 checks, 0 failures |
 | Contract views | `python3 tools/contract.py --check` | 4 views, up to date, in the three repositories |
 | Contract mirrors | `md5sum tools/contract.py` | 3 mirrors, byte identical |
 | Native build | `bash scripts/build_ndk.sh` | 4 ABIs, export surface verified |
@@ -111,6 +114,7 @@ estimated.
 | Platform verification | `./gradlew verifyAndroid17` | 0 classes lost, 0 duplicated |
 | Plan compatibility | `python3 scripts/platform_plan_check.py` | 27 checks, 0 failures |
 | Hook linkage | `python3 scripts/hook_signature_check.py` | 18 injected calls, every one resolved |
+| Injection idempotency | `./gradlew verifyInjectionIdempotency` | a second run over its own output is byte identical |
 
 The boot safety suite covers twelve invariants over the sources that end
 up in the boot class path: no development component, no dangling
