@@ -32,7 +32,7 @@ them.
 | The toolbox controls and the diagnostics | `ui/identity/IdentityScreens.kt`, `module/diagnostics/` | Delivered |
 | The native and Java compatibility work | `DeadZone-Native-Core`, `DeadZone-Framework-Hooks` | Delivered |
 | The conflict and the boot safety checks | `DeadZoneCapabilityRegistry.java`, `scripts/boot_safety_check.py` | Delivered |
-| The automated regression tests | 159 + 206 + 116 + 800 | Delivered |
+| The automated regression tests | 159 + 282 + 116 + 833 | Delivered |
 | The Android 17 integration artifacts | `mezo/out/patched/` | Produced and statically verified |
 | The reproducible build documentation | `DeadZone-Home/docs/TEE-INTEGRITY-BUILD.md` | Delivered |
 | The feature parity matrix | `DeadZone-Framework-Hooks/docs/TEE-INTEGRITY-FEATURE-MATRIX.md` | Delivered |
@@ -58,6 +58,8 @@ them.
 | `42afec1` | docs: publish the upstream analysis and the feature parity matrix |
 | `9b81168` | docs: record the executed injection and add the tool that reads the DEX surface |
 | `ff834d9` | test: verify the injection plan against the real platform artifacts |
+| `b2689fd` | fix: repair the bootloop and the inert runtime of the reconstruction |
+| `b367f1a` | docs: record the boot repair in the parity matrix and refresh the numbers |
 
 ### DeadZone-Toolbox-App
 
@@ -70,6 +72,7 @@ them.
 | `2f5546e` | feat: add the identity surfaces to the toolbox |
 | `017be33` | feat: route the new identity surfaces from the navigation |
 | `df7d255` | test: verify the views of the contract and the agreement of the components |
+| `8ae9138` | fix: let the check of the toolbox resolve its own test dependencies |
 
 ### DeadZone-Native-Core
 
@@ -82,6 +85,7 @@ them.
 | Commit | Subject |
 |---|---|
 | `9e59d90` | docs: publish the delivery report and the reproducible build of the integration |
+| `31fad28` | docs: record the pull request links and the executed plan compatibility check |
 
 The `main` branch of every repository is untouched. The separate Java
 reconstruction branch `feature/java-framework-rebuild-a17` of the hook
@@ -96,16 +100,17 @@ estimated.
 
 | Suite | Command | Result |
 |---|---|---|
-| Toolbox unit tests | `./gradlew test` | 159 tests, 0 failures |
-| Framework host tests | `./gradlew check` | 206 checks, 0 failures |
+| Toolbox unit tests and analysis | `./gradlew check` | 159 tests, 0 failures, the analysis passes |
+| Framework host tests | `./gradlew check` | 282 checks, 0 failures |
 | Native core host tests | `bash scripts/run_host_tests.sh` | 116 checks, 0 failures |
-| Boot safety | `python3 scripts/boot_safety_check.py` | 800 checks, 0 failures |
-| Contract views | `python3 tools/contract.py --repository ...` | 4 views, up to date |
-| Contract mirrors | `python3 tools/test_contract_mirrors.py` | 3 mirrors, identical |
+| Boot safety | `python3 scripts/boot_safety_check.py` | 833 checks, 0 failures |
+| Contract views | `python3 tools/contract.py --check` | 4 views, up to date, in the three repositories |
+| Contract mirrors | `md5sum tools/contract.py` | 3 mirrors, byte identical |
 | Native build | `bash scripts/build_ndk.sh` | 4 ABIs, export surface verified |
 | Platform injection | `./gradlew injectAndroid17` | 16 + 2 hook points, verification passed |
 | Platform verification | `./gradlew verifyAndroid17` | 0 classes lost, 0 duplicated |
 | Plan compatibility | `python3 scripts/platform_plan_check.py` | 27 checks, 0 failures |
+| Hook linkage | `python3 scripts/hook_signature_check.py` | 18 injected calls, every one resolved |
 
 The boot safety suite covers twelve invariants over the sources that end
 up in the boot class path: no development component, no dangling
@@ -119,6 +124,44 @@ The suite is a static analysis. **It does not prove that the device
 boots.** The boot of the device on the real ROM is the one step of this
 delivery that is still pending, and it is described as a procedure, not
 as a result, in `DeadZone-Framework-Hooks/docs/HARDWARE-VALIDATION.md`.
+
+---
+
+## 3a. The bootloop of the previous revision
+
+The reconstruction that produced the bootloop was never verified against
+the real platform. Its analysis is in
+`DeadZone-Framework-Hooks/docs/BOOTLOOP-FORENSIC-ANALYSIS.md`, and the
+commit `b2689fd` carries the repair. Two classes of defect were found.
+
+**The defect that ended the boot.** The injector writes a call to
+`interceptGetSecurityLevel(IKeystoreService, int)` into the body of
+`IKeystoreService$Stub$Proxy.getSecurityLevel`, but the facade only
+declared an overload with three parameters. The call did not resolve,
+and the keystore service of the system server died with a
+`NoSuchMethodError` during the boot of the device.
+
+The facade now declares the descriptor of the reference implementation,
+and `scripts/hook_signature_check.py` reads the patched artifacts and
+compares every injected call against the declarations of the runtime DEX
+file. The drift between the injector and the facade is impossible from
+now on.
+
+**The defects that made the runtime inert.** Six of them were found and
+repaired:
+
+| Finding | Defect | Repair |
+|---|---|---|
+| 2.1 | The toolbox publishes the state as a Base64 document and the runtime parsed it as plain JSON, so the load failed and no hook ever fired | The runtime decodes the document before it parses it |
+| 2.2 | The unified profile document was only written when the user opened the identity screen | The runtime merges the unified document with the legacy shape of the state document |
+| 2.3 | Two live profile models that disagreed about the same package | One merge, and the unified document owns the package it names |
+| 2.4 | The build fields were never written because the profile list was empty | The merged profile list feeds the build |
+| 2.5 | The two hiding switches of a package were collapsed into one set | `DeadZoneRuntimeVisibility` carries both switches |
+| 2.6 | The platform processes were excluded from the hiding, and the hooks of the hiding live in the system server | The identity of a device and the visibility of a package have separate gates |
+| 2.7 | The answer of the feature query read the fingerprint of the device instead of the fingerprint of the profile of the caller | The answer reads the profile of the caller |
+
+Every repair is covered by `tests/DeadZoneRuntimeRepairTest.java` on a
+host JVM, so a regression of a repair is caught before a device sees it.
 
 ---
 
@@ -206,6 +249,11 @@ strategy for that is a decision of the project, not of a commit.
    verified by the injection itself, which fails when the anchor is not
    found, but the semantics of the anchor were read by hand from the
    disassembly and were not executed on a device.
+8. **The repair of the runtime has never seen a device.** The seven
+   defects of the reconstruction were found by comparing the code against
+   the artifacts and the upstream reference, and each repair is covered by
+   a host test. The repair has the same status as the rest of the
+   delivery: the boot is unverified.
 
 ---
 
