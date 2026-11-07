@@ -55,6 +55,7 @@ jobs:
           token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           path: toolbox
           fetch-depth: 1
+          lfs: true
           persist-credentials: false
 
       - name: Verify reconstructed source layout
