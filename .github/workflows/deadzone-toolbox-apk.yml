@@ -22,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deadzone-toolbox-apk-${ github.ref }}
+  group: deadzone-toolbox-apk-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -39,7 +39,7 @@ jobs:
       - name: Verify private source credential
         shell: bash
         env:
-          READ_TOKEN: ${ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
         run: |
           set -euo pipefail
           if [[ -z "$READ_TOKEN" ]]; then
@@ -52,7 +52,7 @@ jobs:
         with:
           repository: DeadZone-Offical/DeadZone-Toolbox-App
           ref: main
-          token: ${ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           path: toolbox
           fetch-depth: 1
           persist-credentials: false
@@ -164,10 +164,10 @@ jobs:
         working-directory: toolbox
         shell: bash
         env:
-          KEYSTORE_BASE64: ${ secrets.TOOLBOX_KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${ secrets.TOOLBOX_STORE_PASSWORD }}
-          KEY_ALIAS: ${ secrets.TOOLBOX_KEY_ALIAS }}
-          KEY_PASSWORD: ${ secrets.TOOLBOX_KEY_PASSWORD }}
+          KEYSTORE_BASE64: ${{ secrets.TOOLBOX_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.TOOLBOX_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.TOOLBOX_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.TOOLBOX_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           if [[ -z "$KEYSTORE_BASE64" || -z "$STORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
@@ -198,9 +198,9 @@ jobs:
         shell: bash
         env:
           ORG_GRADLE_PROJECT_keystoreFile: ci-release.jks
-          ORG_GRADLE_PROJECT_keystorePassword: ${ secrets.TOOLBOX_STORE_PASSWORD }}
-          ORG_GRADLE_PROJECT_keyAlias: ${ secrets.TOOLBOX_KEY_ALIAS }}
-          ORG_GRADLE_PROJECT_keyPassword: ${ secrets.TOOLBOX_KEY_PASSWORD }}
+          ORG_GRADLE_PROJECT_keystorePassword: ${{ secrets.TOOLBOX_STORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_keyAlias: ${{ secrets.TOOLBOX_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_keyPassword: ${{ secrets.TOOLBOX_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           ./gradlew --no-daemon --max-workers=2 :app:assembleRelease
