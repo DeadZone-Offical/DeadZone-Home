@@ -1,20 +1,15 @@
-# DeadZone MyA17 integrated test: rebuild signed Toolbox from current main after Integrity Lab changes.
-# DeadZone UI verification, colors, and release build settings
-# Build only DeadZone Toolbox from its private source repository.
-# Trigger this workflow from DeadZone-Home -> Actions -> DeadZone Toolbox APK.
-# The source is pinned to its main branch; this job never builds or flashes a ROM.
+# Build the reconstructed Kotlin/Java + Rust Toolbox from its own source.
+# The previous C++/legacy-SettingsRepository workflow is not compatible
+# with the zero-base Rust reconstruction. No pre-built .so is committed.
 #
-# Required Actions secrets on DeadZone-Home:
-# DEADZONE_PRIVATE_READ_TOKEN   fine-grained PAT; Contents: read on
-#                               DeadZone-Toolbox-App AND DeadZone-Framework-Hooks
-# TOOLBOX_KEYSTORE_BASE64       base64 of the stable Android release .jks
-# TOOLBOX_STORE_PASSWORD       keystore password
-# TOOLBOX_KEY_ALIAS            release key alias
-# TOOLBOX_KEY_PASSWORD         release key password
-
+# Required for private source checkout:
+#   DEADZONE_PRIVATE_READ_TOKEN: Contents:read on DeadZone-Toolbox-App
+# Optional for a V1/V2/V3 signed release (debug APK always uploaded):
+#   TOOLBOX_KEYSTORE_BASE64, TOOLBOX_STORE_PASSWORD,
+#   TOOLBOX_KEY_ALIAS, TOOLBOX_KEY_PASSWORD
 name: DeadZone Toolbox APK
 
-run-name: "DeadZone Toolbox · signed V1/V2/V3 · main"
+run-name: "DeadZone Toolbox · debug + signed release · main"
 
 on:
   workflow_dispatch:
@@ -27,199 +22,56 @@ permissions:
   contents: read
 
 concurrency:
-  group: deadzone-toolbox-apk-${{ github.ref }}
+  group: deadzone-toolbox-apk-${ github.ref }}
   cancel-in-progress: false
-
-env:
-  # The registry of the keys of the settings is the contract between the
-  # toolbox and the hook layer of the platform. The hook layer lives in
-  # its own repository, so the build has to be told where to find it.
-  # The environment variable makes the lookup deterministic and does not
-  # depend on the layout of the checkout.
-  # The Toolbox still uses the pinned legacy registry to check its generated
-  # SettingKeys mirror. The current Framework uses DeadZoneKeys.java instead.
-  # Validate BOTH against one another in the live contract check below.
-  DEADZONE_FRAMEWORK_REGISTRY: ${{ github.workspace }}/toolbox/ci/framework/tools/DeadZoneStringRegistry.java
-  DEADZONE_FRAMEWORK_HOME: ${{ github.workspace }}/framework
 
 jobs:
   build-toolbox:
-    name: "Build and verify signed APK"
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    name: "Build reconstructed Toolbox APK"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      NDK_VERSION: '27.0.12077973'
+      GRADLE_OPTS: '-Dorg.gradle.workers.max=2 -Dorg.gradle.parallel=false'
     steps:
-      - name: Validate private checkout credential
+      - name: Verify private source credential
         shell: bash
         env:
-          REPO_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          READ_TOKEN: ${ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
         run: |
           set -euo pipefail
-          if [[ -z "$REPO_READ_TOKEN" ]]; then
-            echo "::error::Missing DEADZONE_PRIVATE_READ_TOKEN (Contents: read on private DeadZone-Toolbox-App and DeadZone-Framework-Hooks)." >&2
+          if [[ -z "$READ_TOKEN" ]]; then
+            echo "::error::Set DEADZONE_PRIVATE_READ_TOKEN with Contents:read on DeadZone-Toolbox-App."
             exit 1
           fi
 
-          # The token has to reach both private repositories. The check
-          # happens here, before the expensive build.
-          #
-          # The token is never placed in a URL and never printed. The
-          # helper that answers the credential request reads it from the
-          # environment, so it never reaches the command line, the
-          # process list or the log.
-          ASKPASS="$(mktemp)"
-          trap 'rm -f "$ASKPASS"' EXIT
-          cat > "$ASKPASS" <<'ASKPASS_EOF'
-          #!/bin/sh
-          case "$1" in
-            *Username*) printf '%s' 'x-access-token' ;;
-            *Password*) printf '%s' "$DEADZONE_READ_TOKEN" ;;
-          esac
-          ASKPASS_EOF
-          chmod 700 "$ASKPASS"
-          export DEADZONE_READ_TOKEN="$REPO_READ_TOKEN"
-          export GIT_ASKPASS="$ASKPASS"
-          export GIT_TERMINAL_PROMPT=0
-
-          for repo in DeadZone-Offical/DeadZone-Toolbox-App DeadZone-Offical/DeadZone-Framework-Hooks; do
-            if ! git ls-remote --exit-code -h "https://github.com/${repo}.git" > /dev/null 2>&1; then
-              echo "::error::DEADZONE_PRIVATE_READ_TOKEN cannot read ${repo}. Grant the token Contents: read on that repository." >&2
-              exit 1
-            fi
-            echo "[+] the credential reads ${repo}"
-          done
-          unset DEADZONE_READ_TOKEN
-
-      - name: Checkout DeadZone Toolbox App main (private)
+      - name: Checkout reconstructed Toolbox main
         uses: actions/checkout@v4
         with:
           repository: DeadZone-Offical/DeadZone-Toolbox-App
           ref: main
-          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          token: ${ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           path: toolbox
           fetch-depth: 1
-          lfs: true
           persist-credentials: false
 
-      - name: Checkout DeadZone Framework Hooks main (private)
-        uses: actions/checkout@v4
-        with:
-          repository: DeadZone-Offical/DeadZone-Framework-Hooks
-          ref: main
-          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
-          path: framework
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Report source revision
+      - name: Verify reconstructed source layout
         working-directory: toolbox
         shell: bash
         run: |
           set -euo pipefail
-          git rev-parse HEAD
+          echo "Toolbox source revision: $(git rev-parse HEAD)"
+          test -s gradle/wrapper/gradle-wrapper.jar
+          unzip -tq gradle/wrapper/gradle-wrapper.jar > /dev/null
+          test -s DeadZone-Native-Core/Cargo.toml
+          test -s DeadZone-Native-Core/Cargo.lock
+          test -s DeadZone-Native-Core/scripts/build_android.sh
+          test -s scripts/verify_reconstruction.py
+          test -s app/build.gradle.kts
+          echo "Native Rust libraries are generated by Gradle/Cargo, not checked out."
           git status --short
-          test -f gradle/wrapper/gradle-wrapper.jar
-          unzip -tq gradle/wrapper/gradle-wrapper.jar >/dev/null
-          if ! find DeadZone-Native-Core/dist/lib -type f -name '*.so' -print -quit | grep -q .; then
-            echo "::error::The native core libraries were not checked out." >&2
-            exit 1
-          fi
-
-      - name: Verify pinned Toolbox contract and live Framework keys
-        shell: bash
-        run: |
-          set -euo pipefail
-          # New Framework main was rebuilt from DEX and no longer contains
-          # tools/DeadZoneStringRegistry.java. The legacy Toolbox mirror is
-          # checked against its original pinned source, NOT falsely attributed
-          # to the newer Framework. Check live key overlap separately.
-          python3 - <<'PY'
-          from pathlib import Path
-          import os
-          import re
-
-          root = Path(os.environ["GITHUB_WORKSPACE"])
-          pinned_path = Path(os.environ["DEADZONE_FRAMEWORK_REGISTRY"])
-          toolbox_path = root / "toolbox/app/src/main/java/com/deadzone/toolbox/data/SettingKeys.kt"
-          live_path = root / "framework/src/main/java/com/deadzone/DeadZoneKeys.java"
-          for path in (pinned_path, toolbox_path, live_path):
-              if not path.is_file() or not path.stat().st_size:
-                  raise SystemExit(f"::error::Missing expected key registry: {path}")
-
-          pinned = dict(re.findall(
-              r'm\.put\("DZ_KEY_([A-Z_]+)",\s*"([^"]+)"\);',
-              pinned_path.read_text(encoding="utf-8"),
-          ))
-          toolbox = dict(re.findall(
-              r'const val\s+([A-Z_]+)\s*=\s*"([^"]+)"',
-              toolbox_path.read_text(encoding="utf-8"),
-          ))
-          live = dict(re.findall(
-              r'public static final String\s+([A-Z_]+)\s*=\s*"(deadzone_[a-z0-9_]+)"',
-              live_path.read_text(encoding="utf-8"),
-          ))
-          if len(pinned) < 20 or len(toolbox) < 20 or len(live) < 20:
-              raise SystemExit("::error::Registry parser found too few keys; refusing an unverified build")
-          if pinned != toolbox:
-              mismatch = {
-                  key: (value, toolbox.get(key))
-                  for key, value in pinned.items() if toolbox.get(key) != value
-              }
-              extra = sorted(set(toolbox) - set(pinned))
-              raise SystemExit(
-                  "::error::Toolbox SettingKeys differ from the pinned legacy registry: "
-                  + str(mismatch) + ", extra=" + str(extra)
-              )
-
-          live_values = set(live.values())
-          owned = {name for name in toolbox.values() if name.startswith("deadzone_")}
-          common = owned & live_values
-          missing = sorted(owned - live_values)
-          # These are names the rebuilt Framework actually declares.
-          # This checks the key registry, not runtime hook implementation.
-          required = {
-              "deadzone_target_txt", "deadzone_pif_json", "deadzone_keybox_xml",
-              "deadzone_keybox_enabled", "deadzone_keybox_apply_all",
-              "deadzone_keybox_apply_all_mode", "deadzone_gameprops_json",
-              "deadzone_spoof_gms", "deadzone_spoof_vending",
-              "deadzone_spoof_photos", "deadzone_spoof_gameprops",
-          }
-          absent_required = sorted(required - live_values)
-          if absent_required:
-              raise SystemExit(
-                  "::error::Current Framework lost required base keys: "
-                  + ", ".join(absent_required)
-              )
-
-          report = [
-              "DeadZone Toolbox / Framework source key compatibility",
-              f"Pinned legacy registry: {pinned_path.relative_to(root)}",
-              f"Live Framework registry: {live_path.relative_to(root)}",
-              f"Legacy Toolbox keys: {len(toolbox)}",
-              f"Live Framework deadzone keys: {len(live)}",
-              f"Shared deadzone keys: {len(common)}",
-              f"Toolbox deadzone keys with no live registry entry: {len(missing)}",
-              "IMPORTANT: A shared key name does not prove a running Android hook.",
-              "Missing Toolbox keys in live Framework:",
-              *(f"  - {key}" for key in missing),
-          ]
-          out = root / "dist/framework-contract-report.txt"
-          out.parent.mkdir(parents=True, exist_ok=True)
-          out.write_text("\n".join(report) + "\n", encoding="utf-8")
-          print("\n".join(report))
-          if missing:
-              print(
-                  "::warning::Current Framework is missing "
-                  + str(len(missing))
-                  + " legacy Toolbox keys. See framework-contract-report.txt. "
-                    "Building APK is permitted; runtime feature parity is NOT certified."
-              )
-          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
-              summary.write("### Toolbox / live Framework key check\n")
-              summary.write(f"- Live shared keys: **{len(common)}**\n")
-              summary.write(f"- Legacy Toolbox keys absent in Framework: **{len(missing)}**\n")
-              summary.write("- [Build != runtime spoof verification]\n")
-          PY
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -230,261 +82,173 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
-          # The obsolete 'tools' SDK package is no longer distributed.
-          # Only platform-tools is required; cmdline-tools comes from the action.
           packages: 'platform-tools'
           log-accepted-android-sdk-licenses: 'false'
 
-      - name: Install Android 17 SDK and signing tools
+      - name: Install Android 17 SDK, build tools, and matching NDK
         shell: bash
         run: |
           set -euo pipefail
-          # Android 17 (API 37.0) is published on the preview channel.
-          # The SDK package ID includes ".0"; "android-37" is not listed.
-          sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0" --channel=3
-          test -f "$ANDROID_HOME/platforms/android-37.0/android.jar"
+          sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0" "ndk;$NDK_VERSION" --channel=3
+          test -s "$ANDROID_HOME/platforms/android-37.0/android.jar"
           test -x "$ANDROID_HOME/build-tools/37.0.0/apksigner"
+          test -x "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
 
-      - name: Run DeadZone native host regression tests
-        working-directory: toolbox
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash DeadZone-Native-Core/scripts/run_host_tests.sh
-
-      - name: Build DeadZone ARM64 native core from main source
-        working-directory: toolbox
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdkmanager --install "ndk;27.2.12479018"
-          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
-          export DEADZONE_ABIS="arm64-v8a"
-          bash DeadZone-Native-Core/scripts/build_ndk.sh
-          test -s DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so
-
-      - name: Validate bundled ARM64 native core
-        working-directory: toolbox
-        shell: bash
-        run: |
-          set -euo pipefail
-          CORE="DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so"
-          test -s "$CORE"
-          HEADER="$(readelf -h "$CORE")"
-          DYNAMIC="$(readelf -dW "$CORE")"
-          PROGRAMS="$(readelf -lW "$CORE")"
-          SYMBOLS="$(readelf -Ws "$CORE")"
-          grep -Fq "AArch64" <<< "$HEADER"
-          grep -Eq 'BIND_NOW|Flags: NOW' <<< "$DYNAMIC"
-          grep -Fq "GNU_RELRO" <<< "$PROGRAMS"
-          grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +JNI_OnLoad($|@)' <<< "$SYMBOLS"
-          if grep -Eq 'FUNC +GLOBAL +DEFAULT +[0-9]+ +Java_' <<< "$SYMBOLS"; then
-            echo "::error::Native core exposes Java-facing symbols." >&2
-            exit 1
-          fi
-          if grep -Eq 'NEEDED.*libstd[.]dylib[.]so' <<< "$DYNAMIC"; then
-            echo "::error::Native core depends on an unsupported system library." >&2
-            exit 1
-          fi
+      - name: Set up Rust and Android targets
+        uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Restore stable release signing key
+      - name: Verify current JNI, settings and naming contracts
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_reconstruction.py
+
+      - name: Run Rust native regression tests
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path DeadZone-Native-Core/Cargo.toml
+
+      - name: Build and test Debug APK (native libraries built from Rust)
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --max-workers=2 :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Validate Debug APK and all four Rust ABIs
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -tq "$APK" > /dev/null
+          mkdir -p "$GITHUB_WORKSPACE/dist-debug"
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            SO="DeadZone-Native-Core/src/main/jniLibs/$abi/libdeadzone_core.so"
+            ENTRY="lib/$abi/libdeadzone_core.so"
+            test -s "$SO"
+            unzip -Z -1 "$APK" | grep -Fxq "$ENTRY"
+            expected="$(sha256sum "$SO" | cut -d' ' -f1)"
+            actual="$(unzip -p "$APK" "$ENTRY" | sha256sum | cut -d' ' -f1)"
+            if [[ "$expected" != "$actual" ]]; then
+              echo "::error::Native library mismatch for $abi"
+              exit 1
+            fi
+            printf '%s  %s\n' "$actual" "$ENTRY" >> "$GITHUB_WORKSPACE/dist-debug/native-sha256.txt"
+          done
+          cp "$APK" "$GITHUB_WORKSPACE/dist-debug/DeadZone-Toolbox-debug.apk"
+          ( cd "$GITHUB_WORKSPACE/dist-debug" && sha256sum DeadZone-Toolbox-debug.apk > SHA256SUMS.txt )
+          echo "### Debug APK ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "4 Rust ABIs packaged and checksum-verified. Debug package suffix: .debug" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload installable Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZone-Toolbox-debug-APK
+          path: dist-debug/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Prepare optional stable release signing
+        id: signing
         working-directory: toolbox
         shell: bash
         env:
-          KEYSTORE_BASE64: ${{ secrets.TOOLBOX_KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${{ secrets.TOOLBOX_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.TOOLBOX_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.TOOLBOX_KEY_PASSWORD }}
+          KEYSTORE_BASE64: ${ secrets.TOOLBOX_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${ secrets.TOOLBOX_STORE_PASSWORD }}
+          KEY_ALIAS: ${ secrets.TOOLBOX_KEY_ALIAS }}
+          KEY_PASSWORD: ${ secrets.TOOLBOX_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           if [[ -z "$KEYSTORE_BASE64" || -z "$STORE_PASSWORD" || -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
-            echo "::error::Missing TOOLBOX signing secrets. Configure the stable release keystore and its three credentials." >&2
-            exit 1
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Release signing secrets not all configured; Debug APK is available for testing."
+            exit 0
           fi
           umask 077
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > ci-release.jks
           test -s ci-release.jks
-
-          # Fail before the expensive Gradle build when the keystore and
-          # the configured Actions secrets do not belong together.
-          # Never print the password, private key or the CSR.
-          if ! keytool -list -keystore ci-release.jks -storepass "$STORE_PASSWORD" > /dev/null 2>&1; then
-            echo "::error::The TOOLBOX_STORE_PASSWORD does not unlock TOOLBOX_KEYSTORE_BASE64. Upload the matching JKS/password pair." >&2
-            exit 1
-          fi
           if ! keytool -list -keystore ci-release.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null 2>&1; then
-            echo "::error::TOOLBOX_KEY_ALIAS is not present in the uploaded keystore." >&2
+            echo "::error::Release signing keystore, alias or store password is invalid."
             exit 1
           fi
-          if ! keytool -certreq -keystore ci-release.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" -keypass "$KEY_PASSWORD" -file "$RUNNER_TEMP/deadzone-signing-preflight.csr" > /dev/null 2>&1; then
-            echo "::error::TOOLBOX_KEY_PASSWORD cannot unlock the private signing key for TOOLBOX_KEY_ALIAS." >&2
+          if ! keytool -certreq -keystore ci-release.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" -keypass "$KEY_PASSWORD" -file "$RUNNER_TEMP/deadzone-test.csr" > /dev/null 2>&1; then
+            echo "::error::The release private-key password is invalid."
             exit 1
           fi
-          rm -f "$RUNNER_TEMP/deadzone-signing-preflight.csr"
-
-          # Ignore the example credentials committed to the source repository.
-          # Gradle then reads the actual credentials from ORG_GRADLE_PROJECT_*.
+          rm -f "$RUNNER_TEMP/deadzone-test.csr"
+          # Remove example credentials from runner checkout. The true secrets
+          # are provided exclusively by ORG_GRADLE_PROJECT_* in the next step.
           sed -i -E '/^(keystoreFile|keystorePassword|keyAlias|keyPassword)=/d' gradle.properties
-          chmod 600 ci-release.jks
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify Integrity and Keybox source contracts
-        working-directory: toolbox
-        shell: bash
-        run: |
-          set -euo pipefail
-          PIF="app/src/main/java/com/deadzone/toolbox/ui/utilities/SpoofMaterialsScreens.kt"
-          SETTINGS="app/src/main/java/com/deadzone/toolbox/data/SettingsRepository.kt"
-          CORE="app/src/main/java/com/deadzone/toolbox/ui/core/CoreViewModel.kt"
-          grep -Fq 'checked = core.gmsSpoof' "$PIF"
-          grep -Fq 'fun isWellFormedPif(document: String)' "$SETTINGS"
-          grep -Fq 'fun inspectKeybox(document: String)' "$SETTINGS"
-          grep -Fq 'if (!inspectKeybox(xml).valid) return false' "$SETTINGS"
-          grep -Fq 'repository.inspectKeybox(xml)' "$CORE"
-          grep -Fq 'enabled = keybox.valid' "$PIF"
-          grep -Fq 'repository.normalizePifDocument(document)' "$PIF"
-          grep -Fq 'fun normalizePifDocument(document: String)' "$SETTINGS"
-          grep -Fq 'fun integrityIntegrationDiagnostics()' "$SETTINGS"
-          grep -Fq 'fun keyboxNeedsRepublish(): Boolean' "$SETTINGS"
-          grep -Fq 'fun restoreNativeKeyboxFromPublished(): Boolean' "$SETTINGS"
-          grep -Fq 'certificateBase64.filterNot { it.isWhitespace() }' "$SETTINGS"
-          grep -Fq 'Keybox rejected by XML/X.509 preflight' "$CORE" || \
-            grep -Fq 'Saved keybox rejected by XML/X.509 preflight' "$CORE"
-          grep -Fq 'repository.restoreNativeKeyboxFromPublished()' "$CORE"
-          grep -Fq 'fun republishSavedKeybox()' "$CORE"
-          grep -Fq 'viewModel.keyboxNeedsRepublish()' "$PIF"
-          grep -Fq 'repository.inspectKeybox(xml)' "$CORE"
-          grep -Fq 'fun publishKeybox(context: Context, xml: String)' \
-            app/src/main/java/com/deadzone/toolbox/core/HookBridge.kt
-          ROOT_TOOLS="app/src/main/java/com/deadzone/toolbox/module/root/RootTools.kt"
-          ROOT_VM="app/src/main/java/com/deadzone/toolbox/ui/root/RootViewModel.kt"
-          grep -Fq 'suspend fun deadZoneRomStatus()' "$ROOT_TOOLS"
-          grep -Fq '"deadzone_rom_status" -> rootTools.deadZoneRomStatus()' "$ROOT_VM"
-          if grep -Eq 'deadzone_zygisk_status|deadZoneZygiskStatus' "$ROOT_TOOLS" "$ROOT_VM"; then
-            echo "::error::DeadZone ROM toolbox must not use standalone Zygisk status"
-            exit 1
-          fi
-          grep -Fq 'DeadZoneRomPolicy.switch(core.enabled, requested)' "$SETTINGS"
-          grep -Fq 'DeadZoneRomPublisher.publish(' "$SETTINGS"
-          grep -Fq 'stagedDisabledState = encode(disabledJson)' "$SETTINGS"
-          grep -Fq 'DeadZoneRomPolicy.switch(settings.enabled, settings.hideAppList)' "$SETTINGS"
-          python3 -m py_compile tools/build_flashable.py
-          grep -Fq 'if "AndroidManifest.xml" not in application.namelist()' tools/build_flashable.py
-          if grep -Fq 'ro.control_privapp_permissions=' tools/build_flashable.py; then
-            echo "::error::Do not disable Android privileged permission enforcement"
-            exit 1
-          fi
-          echo "Integrity PIF/Keybox normalization, real publication checks and safe packaging: present"
-
-      - name: Verify reference-video features and DeadZone Spoof source
-        working-directory: toolbox
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/verify_video_reference.py
-          python3 scripts/verify_spoof_sources.py
-          echo "[+] Video routes, key mapping, official attestation diagnostics and native ABI references verified"
-
-      - name: Run the contract of the keys against the framework registry
-        working-directory: toolbox
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The contract between the toolbox and the hook layer is
-          # enforced by the tool that writes the mirror of the keys. The
-          # check is read-only, so it can never change the mirror, and it
-          # reports every key that is missing, unknown or wrong.
-          python3 tools/sync_setting_keys.py --check
-          echo "[+] the mirror of the keys matches the framework registry"
-
-      - name: Run DeadZone application unit tests
+      - name: Build V1/V2/V3 signed Release APK
+        if: steps.signing.outputs.enabled == 'true'
         working-directory: toolbox
         shell: bash
         env:
           ORG_GRADLE_PROJECT_keystoreFile: ci-release.jks
+          ORG_GRADLE_PROJECT_keystorePassword: ${ secrets.TOOLBOX_STORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_keyAlias: ${ secrets.TOOLBOX_KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_keyPassword: ${ secrets.TOOLBOX_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          chmod +x ./gradlew
-          ./gradlew --no-daemon :app:testDebugUnitTest
-
-      - name: Build release APK (V1 + V2 + V3)
-        working-directory: toolbox
-        shell: bash
-        env:
-          ORG_GRADLE_PROJECT_keystoreFile: ci-release.jks
-          ORG_GRADLE_PROJECT_keystorePassword: ${{ secrets.TOOLBOX_STORE_PASSWORD }}
-          ORG_GRADLE_PROJECT_keyAlias: ${{ secrets.TOOLBOX_KEY_ALIAS }}
-          ORG_GRADLE_PROJECT_keyPassword: ${{ secrets.TOOLBOX_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          chmod +x ./gradlew
-          ./gradlew --no-daemon :app:assembleRelease
+          ./gradlew --no-daemon --max-workers=2 :app:assembleRelease
           test -s app/build/outputs/apk/release/app-release.apk
 
-      - name: Verify all three APK signature schemes
+      - name: Verify V1/V2/V3 signatures and Release native libraries
+        if: steps.signing.outputs.enabled == 'true'
         working-directory: toolbox
         shell: bash
         run: |
           set -euo pipefail
           APK="app/build/outputs/apk/release/app-release.apk"
-          NATIVE="DeadZone-Native-Core/dist/lib/arm64-v8a/libdeadzone_core.so"
-          SOURCE_SHA="$(sha256sum "$NATIVE" | cut -d' ' -f1)"
-          APK_SHA="$(unzip -p "$APK" lib/arm64-v8a/libdeadzone_core.so | sha256sum | cut -d' ' -f1)"
-          if [[ "$SOURCE_SHA" != "$APK_SHA" ]]; then
-            echo "::error::DeadZone APK native library does not match the freshly compiled source."
-            exit 1
-          fi
-          APKSIGNER="$ANDROID_HOME/build-tools/37.0.0/apksigner"
-          "$APKSIGNER" verify --verbose --print-certs --min-sdk-version 23 "$APK" | tee "$RUNNER_TEMP/toolbox-signature-report.txt"
-          for version in v1 v2 v3; do
-            if ! grep -Eq "^Verified using $version scheme .*: true$" "$RUNNER_TEMP/toolbox-signature-report.txt"; then
-              echo "::error::APK $version signing verification failed." >&2
+          mkdir -p "$GITHUB_WORKSPACE/dist-release"
+          REPORT="$GITHUB_WORKSPACE/dist-release/signature-report.txt"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose --print-certs --min-sdk-version 23 "$APK" > "$REPORT"
+          for scheme in v1 v2 v3; do
+            grep -Eq "^Verified using $scheme scheme .*: true$" "$REPORT" || {
+              echo "::error::Missing verified $scheme APK signature"
               exit 1
-            fi
+            }
           done
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-          printf '%s  %s\n' "$SOURCE_SHA" "lib/arm64-v8a/libdeadzone_core.so" > "$GITHUB_WORKSPACE/dist/native-core-SHA256.txt"
-          cp "$APK" "$GITHUB_WORKSPACE/dist/DeadZone-Toolbox-App-V1-V2-V3.apk"
-          # The name of the file is relative, so the sums can be checked
-          # again after the artifact was downloaded, wherever it lands.
-          ( cd "$GITHUB_WORKSPACE/dist" && sha256sum DeadZone-Toolbox-App-V1-V2-V3.apk > SHA256SUMS.txt )
-          cp "$RUNNER_TEMP/toolbox-signature-report.txt" "$GITHUB_WORKSPACE/dist/signature-report.txt"
-
-      - name: Verify the release artifacts are complete
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The artifact has to carry the signed APK and every report that
-          # proves it. A missing file fails here, before the upload, so
-          # the run never publishes a half filled artifact.
-          DIST="$GITHUB_WORKSPACE/dist"
-          for name in \
-            DeadZone-Toolbox-App-V1-V2-V3.apk \
-            SHA256SUMS.txt \
-            native-core-SHA256.txt \
-            signature-report.txt \
-            framework-contract-report.txt; do
-            if [[ ! -s "$DIST/$name" ]]; then
-              echo "::error::The release artifact is incomplete: $name is missing." >&2
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            SO="DeadZone-Native-Core/src/main/jniLibs/$abi/libdeadzone_core.so"
+            ENTRY="lib/$abi/libdeadzone_core.so"
+            test -s "$SO"
+            expected="$(sha256sum "$SO" | cut -d' ' -f1)"
+            actual="$(unzip -p "$APK" "$ENTRY" | sha256sum | cut -d' ' -f1)"
+            test "$expected" = "$actual" || {
+              echo "::error::Release APK native library mismatch: $abi"
               exit 1
-            fi
+            }
           done
-          ( cd "$DIST" && sha256sum --check SHA256SUMS.txt )
-          echo "[+] the release artifact carries the signed APK and its reports"
+          cp "$APK" "$GITHUB_WORKSPACE/dist-release/DeadZone-Toolbox-signed-V1-V2-V3.apk"
+          ( cd "$GITHUB_WORKSPACE/dist-release" && sha256sum DeadZone-Toolbox-signed-V1-V2-V3.apk > SHA256SUMS.txt )
+          echo "### Signed release ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "V1/V2/V3 signatures and 4 Rust ABIs verified." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Remove temporary keystore
+      - name: Upload signed Release APK
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeadZone-Toolbox-signed-V1-V2-V3
+          path: dist-release/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove temporary signing key
         if: always()
         shell: bash
         run: |
           rm -f "$GITHUB_WORKSPACE/toolbox/ci-release.jks"
-
-      - name: Upload signed APK and verification reports
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: DeadZone-Toolbox-App-signed-V1-V2-V3
-          path: dist/
-          if-no-files-found: error
-          retention-days: 14
