@@ -105,7 +105,9 @@ jobs:
           test -s scripts/check_runtime_profile_loading.py
           grep -Fq 'catch (IllegalArgumentException invalidBase64)' src/main/java/com/deadzone/framework/internal/DZapk.java
           grep -Fq 'Skipping optional signature overlay: embedded Base64 is invalid' src/main/java/com/deadzone/framework/internal/DZapk.java
-          echo "Confirmed: GMS initialization Base64 failure is handled safely."
+          grep -Fq 'DeadZone observation not published: process=' src/main/java/com/deadzone/framework/DeadZoneHook.java
+          grep -Fq 'DeadZone software key fallback unavailable: private mSpec inaccessible' src/main/java/com/deadzone/framework/DeadZoneHook.java
+          echo "Confirmed: GMS Base64 fix, observation diagnostics, and non-invasive Keystore fallback are present."
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
