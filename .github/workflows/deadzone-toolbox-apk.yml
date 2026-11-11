@@ -78,6 +78,16 @@ jobs:
         run: |
           set -euo pipefail
           echo "Toolbox source revision: $(git rev-parse HEAD)"
+          echo "### Private Toolbox source" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          # The private repo must not spend Actions minutes on each push.
+          for workflow in .github/workflows/deadzone-integrity-lab.yml .github/workflows/deadzone-spoof-source-verification.yml; do
+            test -s "$workflow"
+            if grep -Eq '^  push:' "$workflow"; then
+              echo "::error::Private workflow still has automatic push builds: $workflow"
+              exit 1
+            fi
+          done
           test -s gradle/wrapper/gradle-wrapper.jar
           unzip -tq gradle/wrapper/gradle-wrapper.jar > /dev/null
           test -s DeadZone-Native-Core/Cargo.toml
