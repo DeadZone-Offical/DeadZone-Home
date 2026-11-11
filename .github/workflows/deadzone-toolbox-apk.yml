@@ -137,6 +137,30 @@ jobs:
           set -euo pipefail
           python3 scripts/verify_reconstruction.py
 
+      - name: Verify the latest strict settings-write contract
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          framework = Path("app/src/main/java/com/deadzone/framework/DeadZoneFramework.java").read_text()
+          router = Path("app/src/main/java/com/deadzone/toolbox/core/SettingsRouter.kt").read_text()
+          global_store = Path("app/src/main/java/com/deadzone/toolbox/core/GlobalSettingsRepository.kt").read_text()
+          checks = {
+              "global provider readback": "Settings.Global.getString(resolver, key)" in framework,
+              "secure provider readback": "Settings.Secure.getString(resolver, key)" in framework,
+              "system provider readback": "Settings.System.getString(resolver, key)" in framework,
+              "epoch publication verified": framework.count("if (!updateDeadZoneTime(resolver))") == 3,
+              "router avoids duplicate publication": "return outcome(context, key, value)" in router,
+              "profile writer reports the real outcome": "DeadZoneFramework.putGlobalStringOutcome(" in global_store,
+          }
+          for label, ok in checks.items():
+              print(("PASS" if ok else "FAIL") + ": " + label)
+          if not all(checks.values()):
+              raise SystemExit("Refusing to ship a Toolbox APK with unverified writes")
+          PY
+
       - name: Validate Spoof and reference routes (private source, public runner)
         working-directory: toolbox
         shell: bash
