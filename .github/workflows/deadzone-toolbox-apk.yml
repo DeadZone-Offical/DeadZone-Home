@@ -135,6 +135,37 @@ jobs:
           python3 scripts/verify_spoof_sources.py
           python3 scripts/verify_video_reference.py
 
+      - name: Verify the interactive Home and weather contract
+        working-directory: toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path("app/src/main")
+          manifest = (root / "AndroidManifest.xml").read_text()
+          weather = (root / "java/com/deadzone/toolbox/core/HomeWeatherRepository.kt").read_text()
+          home = (root / "java/com/deadzone/toolbox/ui/home/HomeScreen.kt").read_text()
+          chrome = (root / "java/com/deadzone/toolbox/ui/home/HomeChrome.kt").read_text()
+          nav = (root / "java/com/deadzone/toolbox/ui/toolbox/DeadZoneLiquidNavigation.kt").read_text()
+          required = {
+              "weather package #1": "com.miui.weather2" in manifest,
+              "weather package #2": "com.miui.weather" in manifest,
+              "Xiaomi local weather provider": "content://weather/actualWeatherData/2" in weather,
+              "Xiaomi refresh weather provider": "content://weather/actualWeatherData/1" in weather,
+              "DeadZone channel": "https://t.me/xDeadZone" in chrome,
+              "DeadZone discussion": "https://t.me/DeadZoneDiscussion" in chrome,
+              "GitHub account": "https://github.com/DeadZone-Offical" in chrome,
+              "database sync": "DatabaseSyncRepository" in home,
+              "privileged reboot action": "HomeInspectionRepository.reboot" in home,
+              "one spring indicator": "liquidTabPosition" in nav,
+          }
+          for name, passed in required.items():
+              print(("PASS" if passed else "FAIL") + ": " + name)
+          if not all(required.values()):
+              raise SystemExit(1)
+          PY
+
       - name: Build C++ Core and validate its JNI symbols
         working-directory: toolbox
         shell: bash
