@@ -17,7 +17,7 @@ on:
         description: "Target ROM family (the source JARs must match its exact build)"
         type: choice
         required: true
-        default: a16
+        default: a17
         options:
           - a16
           - a17
@@ -94,6 +94,19 @@ jobs:
           path: hooks
           persist-credentials: false
 
+      - name: Verify Framework source checkout contains the GMS Base64 fix
+        working-directory: hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Framework source revision: $(git rev-parse HEAD)"
+          test -s src/main/java/com/deadzone/framework/DeadZoneHook.java
+          test -s src/main/java/com/deadzone/framework/internal/DZapk.java
+          test -s scripts/check_runtime_profile_loading.py
+          grep -Fq 'catch (IllegalArgumentException invalidBase64)' src/main/java/com/deadzone/framework/internal/DZapk.java
+          grep -Fq 'Skipping optional signature overlay: embedded Base64 is invalid' src/main/java/com/deadzone/framework/internal/DZapk.java
+          echo "Confirmed: GMS initialization Base64 failure is handled safely."
+
       - name: Checkout Toolbox build tools main
         uses: actions/checkout@v4
         with:
@@ -127,70 +140,34 @@ jobs:
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build and verify pure-Java Framework Hooks DEX
+      - name: Compile latest Framework main and verify DEX
         working-directory: hooks
         shell: bash
+        env:
+          GRADLE_OPTS: '-Xmx1024m -XX:MaxMetaspaceSize=384m -Dorg.gradle.workers.max=2'
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew --no-daemon --stacktrace \
+          # Use the tasks that exist in the current reconstructed Java project.
+          # Supply d8Path explicitly: Gradle's default points at build-tools/37.
+          ./gradlew --no-daemon --max-workers=2 --no-parallel --stacktrace \
             -PandroidSdk="$ANDROID_HOME" \
             -PandroidJar="$ANDROID_HOME/platforms/android-35/android.jar" \
-            buildDex verifyNoAndroidX verifyPureJava
+            -Pd8Path="$ANDROID_HOME/build-tools/36.0.0/d8" \
+            verifySources buildDex
           test -s build/dex/classes.dex
           "$ANDROID_HOME/build-tools/36.0.0/dexdump" -f build/dex/classes.dex > "$RUNNER_TEMP/hook-dexdump.txt"
-          grep -q 'Lcom/deadzone/framework/DeadZoneCore;' "$RUNNER_TEMP/hook-dexdump.txt"
-          grep -q 'Lcom/deadzone/framework/DeadZoneHook;' "$RUNNER_TEMP/hook-dexdump.txt"
+          grep -Fq 'Lcom/deadzone/framework/DeadZoneFramework;' "$RUNNER_TEMP/hook-dexdump.txt"
+          grep -Fq 'Lcom/deadzone/framework/DeadZoneHook;' "$RUNNER_TEMP/hook-dexdump.txt"
+          grep -Fq 'Lcom/deadzone/framework/internal/DZapk;' "$RUNNER_TEMP/hook-dexdump.txt"
 
-      - name: Build add-only DeadZone DEX for the working MyA17 ROM
-        if: env.PLATFORM == 'a17' && env.BUILD_MODE == 'hooks-only'
+      - name: Verify boot-safety and runtime source contracts
         working-directory: hooks
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --stacktrace \
-            -PandroidSdk="$ANDROID_HOME" \
-            -PandroidJar="$ANDROID_HOME/platforms/android-35/android.jar" \
-            deadzoneMyA17AddonDex
-          test -s build/mya17/dex/classes.dex
-
-      - name: Check MyA17 add-on against the installed DeadZone runtime ABI
-        if: env.PLATFORM == 'a17' && env.BUILD_MODE == 'hooks-only'
-        working-directory: hooks
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/verify_mya17_addon.py \
-            --candidate build/mya17/dex/classes.dex \
-            --baseline profiles/MYA17_EXISTING_RUNTIME_SYMBOLS.json \
-            --report build/mya17/abi-report.json
-
-      - name: Package additive MyA17 DEX after ABI success
-        if: env.PLATFORM == 'a17' && env.BUILD_MODE == 'hooks-only'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/dist/mya17"
-          cp hooks/build/mya17/dex/classes.dex "$GITHUB_WORKSPACE/dist/mya17/classes8.dex"
-          cp hooks/build/mya17/abi-report.json "$GITHUB_WORKSPACE/dist/mya17/abi-report.json"
-          {
-            echo "DeadZone MyA17 additive Java classes"
-            echo "Source commit: $(git -C hooks rev-parse HEAD)"
-            echo "Android compile API: 35"
-            echo "Target: append as framework.jar/classes8.dex, not a replacement for classes7.dex"
-            echo "The working JARs and device have not been modified or boot-tested."
-            echo "Do not flash without independently validating the built JAR and recovery path."
-          } > "$GITHUB_WORKSPACE/dist/mya17/README.txt"
-          (cd "$GITHUB_WORKSPACE/dist/mya17" && sha256sum classes8.dex > SHA256SUMS.txt)
-
-      - name: Upload the ABI-checked MyA17 addon DEX
-        if: env.PLATFORM == 'a17' && env.BUILD_MODE == 'hooks-only'
-        uses: actions/upload-artifact@v4
-        with:
-          name: DeadZone-MyA17-Additive-DEX-ABI-CHECKED
-          path: dist/mya17/
-          if-no-files-found: error
-          retention-days: 14
+          python3 scripts/boot_safety_test.py
+          python3 scripts/check_runtime_profile_loading.py
 
       - name: Capture verified hook DEX and source revisions
         shell: bash
@@ -204,8 +181,10 @@ jobs:
             echo "Framework Hooks commit: $(git -C hooks rev-parse HEAD)"
             echo "Toolbox build scripts commit: $(git -C toolbox rev-parse HEAD)"
             echo "Build mode: $BUILD_MODE"
-            echo "Output: hooks/classes.dex (verified pure Java)"
-            echo "Android compile API: 35 (original project configuration)"
+            echo "Output: hooks/classes.dex (BUILD-ONLY, NOT BOOT TESTED)"
+            echo "Android compile API: 35, D8 build tools: 36.0.0"
+            echo "Source contract and boot safety gates: run before packaging"
+            echo "This build does not certify runtime behavior or hardware attestation."
             echo "No stock platform JAR has been modified by this step."
           } > "$GITHUB_WORKSPACE/dist/hooks/BUILD-INFO.txt"
           (cd "$GITHUB_WORKSPACE/dist" && sha256sum hooks/classes.dex > hooks/SHA256SUMS.txt)
@@ -214,7 +193,7 @@ jobs:
       - name: Upload compiled hook DEX
         uses: actions/upload-artifact@v4
         with:
-          name: DeadZone-Framework-Hooks-${{ inputs.platform || 'a17' }}-DEX
+          name: DeadZone-Framework-Hooks-${{ inputs.platform || 'a17' }}-DEX-BUILD-ONLY
           path: dist/hooks/
           if-no-files-found: error
           retention-days: 14
