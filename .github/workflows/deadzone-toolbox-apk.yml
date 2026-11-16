@@ -15,6 +15,12 @@ run-name: "DeadZone Toolbox · debug + signed release · main"
 
 on:
   workflow_dispatch:
+    inputs:
+      toolbox_ref:
+        description: "Toolbox source branch, tag, or commit to build"
+        type: string
+        required: false
+        default: main
   push:
     branches: [main]
     paths:
@@ -51,11 +57,12 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout reconstructed Toolbox main
+      - name: Checkout DeadZone Toolbox source
         uses: actions/checkout@v4
         with:
           repository: DeadZone-Offical/DeadZone-Toolbox-App
-          ref: main
+          # Push events build current main. Manual runs can reproduce a specific source commit.
+          ref: ${{ inputs.toolbox_ref || 'main' }}
           token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
           path: toolbox
           fetch-depth: 1
