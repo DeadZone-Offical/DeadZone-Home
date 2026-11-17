@@ -56,16 +56,16 @@ jobs:
 
           # Require the specific folder created in the NEW Google account.
           # An old-account token must not be mistaken for a successful migration.
-          rclone --config "$config_file" lsjson --stat "$remote_dir" > "$temp_dir/folder.json"
-          python3 - "$temp_dir/folder.json" <<'PY'
+          rclone --config "$config_file" lsjson --dirs-only "DeadZoneDrive:" > "$temp_dir/folders.json"
+          python3 - "$temp_dir/folders.json" <<'PY'
           import json
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as handle:
-              folder = json.load(handle)
+              folders = json.load(handle)
           expected = "10JPnmpweh7qDNMYRbijnG-uENb3EhQ4r"
-          actual = folder.get("ID")
-          if not folder.get("IsDir") or actual != expected:
+          matched = [f for f in folders if f.get("Name") == "DeadZone" and f.get("IsDir") and f.get("ID") == expected]
+          if not matched:
               print("::error::Drive target does not match the verified new DeadZone folder")
               sys.exit(1)
           print("New Google Drive folder identity verified")
