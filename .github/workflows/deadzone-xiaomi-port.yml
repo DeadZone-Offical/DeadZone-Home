@@ -127,6 +127,8 @@ jobs:
         shell: bash
         env:
           DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          # Replaces the legacy central rclone.conf only when explicitly configured.
+          DEADZONE_RCLONE_CONFIG_BASE64: ${{ secrets.DEADZONE_RCLONE_CONFIG_BASE64 }}
         run: bash runtime/load-build.sh port_xiaomi
 
       - name: "🛡️ Validate Port engine runtime"
