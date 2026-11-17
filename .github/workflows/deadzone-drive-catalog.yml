@@ -1,0 +1,93 @@
+name: DeadZone Drive ROM Catalog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_run:
+    workflows:
+      - Deadzone-Lite
+      - "🥷 DeadZone Ninja"
+      - DeadZone-Xiaomi-Port
+      - Deadzone-Stable
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deadzone-drive-catalog-main
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish verified Google Drive ROM index
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+
+      - name: Install rclone
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get -qq update > /dev/null
+          sudo apt-get install -qq -y rclone > /dev/null
+
+      - name: Read the NEW Google Drive account and build catalog
+        shell: bash
+        env:
+          DEADZONE_RCLONE_CONFIG_BASE64: ${{ secrets.DEADZONE_RCLONE_CONFIG_BASE64 }}
+        run: |
+          set -Eeuo pipefail
+          [[ -n "${DEADZONE_RCLONE_CONFIG_BASE64:-}" ]] || {
+            echo "::error::GitHub Actions secret DEADZONE_RCLONE_CONFIG_BASE64 is required"
+            exit 1
+          }
+          umask 077
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          config="$tmp/rclone.conf"
+          if ! printf '%s' "$DEADZONE_RCLONE_CONFIG_BASE64" | base64 --decode > "$config"; then
+            echo "::error::Invalid Google Drive secret"
+            exit 1
+          fi
+          chmod 600 "$config"
+
+          # The source folder ID belongs to the verified NEW Google account.
+          rclone --config "$config" lsjson --dirs-only "DeadZoneDrive:" > "$tmp/folders.json"
+          python3 - "$tmp/folders.json" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              folders = json.load(stream)
+          expected = "10JPnmpweh7qDNMYRbijnG-uENb3EhQ4r"
+          if not any(f.get("IsDir") and f.get("Name") == "DeadZone" and f.get("ID") == expected for f in folders):
+              print("::error::Google Drive destination is not the NEW verified DeadZone folder")
+              sys.exit(1)
+          print("Verified NEW Google Drive folder ID")
+          PY
+
+          rclone --config "$config" lsjson --recursive --files-only "DeadZoneDrive:DeadZone" > "$tmp/inventory.json"
+          python3 scripts/drive_catalog.py "$tmp/inventory.json" data/drive-catalog.json "$config"
+
+      - name: Publish public metadata only
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git add data/drive-catalog.json
+          if git diff --cached --quiet; then
+            echo "No ROM changes; existing published catalog is already current"
+            exit 0
+          fi
+          git -c user.name="MEZO" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "data(dz): sync available ROMs from the new Google Drive"
+          git pull --rebase origin main
+          git push origin HEAD:main
+          echo "ROM catalog published (no credentials or ROM bytes committed)"
