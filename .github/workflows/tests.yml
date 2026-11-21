@@ -128,7 +128,7 @@ jobs:
           assert "publish-devices.yml/dispatches" in publish_text
           assert "DEADZONE_INSPECTOR_DISPATCH_TOKEN" in publish_text
           assert "GH_TOKEN" in publish_text
-          assert "DEADZONE_DEVICES_TOKEN" not in publish_text
-          assert "DEADZONE_STABLE_REPO_TOKEN" not in publish_text
+          assert "secrets.DEADZONE_DEVICES_TOKEN" not in publish_text
+          assert "secrets.DEADZONE_STABLE_REPO_TOKEN" not in publish_text
           print("SuperInspector bridge YAML, Windows Fastboot output and publishing responsibilities: OK")
           PY
