@@ -629,71 +629,78 @@ jobs:
           echo "codename: ${codename:-unknown}"
           echo "profile_dir: $(dirname "$device_json" 2>/dev/null || echo unknown)"
 
-      - name: "🚀 Publish flash manifest to DeadZone-Xiaomi-Stable"
+      # Only the obsolete flash-manifest publication is replaced.
+      # Windows packaging, ROM Repository publishing, central metadata,
+      # Telegram callbacks and user-facing workflow inputs are untouched.
+      # The verified multi-repository publisher owns its two write tokens
+      # inside DeadZone-SuperInspector, NOT in this public workflow.
+      - name: "🚀 Queue verified Stock publisher in SuperInspector"
         id: flash_manifest
-        if: steps.publish_creds.outputs.publish_token_present == 'true' && steps.publish_creds.outputs.rom_present == 'true'
+        if: steps.publish_creds.outputs.rom_present == 'true'
         shell: bash
         env:
-          ROM_PATH: ${{ steps.publish_creds.outputs.rom_path_posix }}
-          DEADZONE_STABLE_REPO_TOKEN: ${{ secrets.DEADZONE_STABLE_REPO_TOKEN }}
-          DEADZONE_ROM_REPO_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.DEADZONE_ROM_REPO_TOKEN || '' }}
-          GH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.GH_TOKEN || '' }}
-          DEADZONE_STABLE_REPO_AUTHOR_NAME: 'deadzone-bot'
-          DEADZONE_STABLE_REPO_AUTHOR_EMAIL: 'bot@deadzone.offical'
+          ROM_URL: ${{ inputs.input_url }}
+          INSPECTOR_DISPATCH_TOKEN: ${{ secrets.DEADZONE_INSPECTOR_DISPATCH_TOKEN || secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
-          # The builder learns HOW the device flashes from the manifest.
-          # The manifest is written to
-          #   DeadZone-Xiaomi-Stable:bin/device_flash/<codename>/flash-manifest.json
-          # and carries only the flashing and formatting methods, never a
-          # partition list.
-          #
-          # DEADZONE_STABLE_REPO_TOKEN is the canonical credential.
-          #
-          # GH_TOKEN is preferred over DEADZONE_ROM_REPO_TOKEN as the
-          # fallback: the ROM-repo token is scoped to DeadZone-ROM-Repository
-          # and may have no write access to DeadZone-Xiaomi-Stable, while
-          # GH_TOKEN is the org-admin PAT the other publish steps use.
-          if [[ -z "${DEADZONE_STABLE_REPO_TOKEN:-}" ]]; then
-            if [[ -n "${GH_TOKEN:-}" ]]; then
-              echo '::warning::DEADZONE_STABLE_REPO_TOKEN is unset; falling back to GH_TOKEN.'
-              export DEADZONE_STABLE_REPO_TOKEN="$GH_TOKEN"
-            elif [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
-              echo '::warning::DEADZONE_STABLE_REPO_TOKEN is unset; falling back to DEADZONE_ROM_REPO_TOKEN.'
-              export DEADZONE_STABLE_REPO_TOKEN="$DEADZONE_ROM_REPO_TOKEN"
-            fi
+          # The verified publisher only accepts official Xiaomi Fastboot
+          # archives from *.miui.com. Other supported Fastboot inspection
+          # URLs still use the existing Windows/ROM-Repository pipeline.
+          if ! python3 - <<'PY'
+          import os
+          from pathlib import PurePosixPath
+          from urllib.parse import unquote, urlsplit
+          u = urlsplit(os.environ["ROM_URL"])
+          host = (u.hostname or "").lower()
+          name = PurePosixPath(unquote(u.path)).name.lower()
+          if (u.scheme != "https" or not host.endswith(".miui.com")
+                  or host == ".miui.com" or u.username or u.password
+                  or not name.endswith((".tgz", ".tar.gz", ".tar", ".zip"))):
+              raise SystemExit(1)
+          PY
+          then
+            echo "::notice::Non-Xiaomi-source ROM: skipping optional verified device publication; continuing existing Fastboot workflow."
+            echo 'status=skipped_non_official' >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          codename="${{ steps.analyze.outputs.codename }}"
-          echo "::group::Publishing flash manifest"
-          echo "rom_path  : $ROM_PATH"
-          echo "codename  : ${codename:-unknown}"
-          set +e
-          python3 -m deadzone_superinspector publish-flash-manifest "$ROM_PATH" \
-            --codename "$codename" \
-            --branch main \
-            --json 2> ./fastboot-profile/flash_manifest.stderr \
-            >  ./fastboot-profile/flash_manifest.json
-          rc=$?
-          set -e
-          echo "::endgroup::"
-          if [[ $rc -ne 0 ]]; then
-            echo '::error::publish-flash-manifest exited with a non-zero status.'
-            if [[ -s ./fastboot-profile/flash_manifest.stderr ]]; then
-              head -50 ./fastboot-profile/flash_manifest.stderr >&2
-            else
-              echo '(stderr was empty)' >&2
-            fi
-            exit $rc
+          if [[ -z "${INSPECTOR_DISPATCH_TOKEN:-}" ]]; then
+            echo "::warning::Verified publication not queued: set DEADZONE_INSPECTOR_DISPATCH_TOKEN (Actions: write on SuperInspector) in Home, or use a suitable GH_TOKEN. Existing Fastboot outputs continue."
+            echo 'status=skipped_no_token' >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          manifest_commit="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/flash_manifest.json')); print(d.get('commit_sha',''))" 2>/dev/null || true)"
-          manifest_dest="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/flash_manifest.json')); print(d.get('destination_path',''))" 2>/dev/null || true)"
-          manifest_no_op="$(python3 -c "import json,sys; d=json.load(open('./fastboot-profile/flash_manifest.json')); print(str(bool(d.get('no_op'))).lower())" 2>/dev/null || echo true)"
-          printf 'commit_sha=%s\n' "$manifest_commit" >> "$GITHUB_OUTPUT"
-          printf 'destination_path=%s\n' "$manifest_dest" >> "$GITHUB_OUTPUT"
-          printf 'no_op=%s\n' "$manifest_no_op" >> "$GITHUB_OUTPUT"
-          echo "commit_sha   : ${manifest_commit:-none}"
-          echo "destination  : ${manifest_dest:-none}"
-          echo "no_op        : ${manifest_no_op}"
+          payload="$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+            "ref": "main",
+            "inputs": {
+              "rom_url": os.environ["ROM_URL"],
+              "os_version": "auto",
+              "build_id": "",
+              "dry_run": "false",
+              "sync_stable": "true"
+            }
+          }))
+          PY
+          )"
+          # A 204 response confirms only successful QUEUING; Inspector's
+          # independent workflow must still validate and publish the stock.
+          http_status="$(curl --silent --show-error --location \
+            --max-time 35 --output "$RUNNER_TEMP/deadzone-inspector-dispatch.json" \
+            --write-out '%{http_code}' \
+            --request POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -H "Authorization: Bearer $INSPECTOR_DISPATCH_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data "$payload" \
+            'https://api.github.com/repos/DeadZone-Offical/DeadZone-SuperInspector/actions/workflows/publish-devices.yml/dispatches')" || http_status="000"
+          if [[ "$http_status" == "204" ]]; then
+            echo "::notice::Queued official Stock verification and four-file DeadZone-Devices publication in SuperInspector/main."
+            echo 'status=queued' >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Verified stock publisher dispatch returned HTTP $http_status. Check Home dispatch token (Actions: write on SuperInspector). Existing Fastboot pipeline continues."
+            echo 'status=dispatch_failed' >> "$GITHUB_OUTPUT"
+          fi
 
       - name: "📤 Publish per-build tree to DeadZone-ROM-Repository"
         if: steps.publish_creds.outputs.publish_token_present == 'true' && steps.publish_creds.outputs.rom_present == 'true'
