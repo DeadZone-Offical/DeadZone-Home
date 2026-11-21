@@ -95,3 +95,40 @@ jobs:
               exit 1
           fi
           echo "No dispatch gate step: OK"
+
+      - name: "🩺 Verify SuperInspector bridge and legacy Fastboot remain compatible"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import yaml
+
+          base = pathlib.Path(".github/workflows")
+          fastboot_text = (base / "deadzone-fastboot.yml").read_text(encoding="utf-8")
+          publish_text = (base / "deadzone-superinspector-publish.yml").read_text(encoding="utf-8")
+          fastboot = yaml.safe_load(fastboot_text)
+          publish = yaml.safe_load(publish_text)
+          job = fastboot["jobs"]["build-fastboot-inspector"]
+          assert job["runs-on"] == "windows-latest", "Windows Fastboot runner changed"
+          steps = job["steps"]
+          names = [step.get("name", "") for step in steps]
+          assert "🚀 Queue verified Stock publisher in SuperInspector" in names
+          assert "📤 Publish per-build tree to DeadZone-ROM-Repository" in names
+          assert "📚 Publish central metadata registry entry" in names
+          assert "🗜️ Package artifact" in names
+          assert "⬆️ Upload Windows artifact" in names
+          assert "📣 Report publish results to bot" in names
+          assert "publish-flash-manifest" not in fastboot_text, "Obsolete publisher restored"
+          assert "publish-devices.yml/dispatches" in fastboot_text
+          assert "super-inspector" in fastboot_text and "ref: main" in fastboot_text
+          pub_job = publish["jobs"]["dispatch"]
+          assert pub_job["runs-on"] == "ubuntu-latest"
+          assert "workflow_dispatch" in publish_text
+          assert "publish-devices.yml/dispatches" in publish_text
+          assert "DEADZONE_INSPECTOR_DISPATCH_TOKEN" in publish_text
+          assert "GH_TOKEN" in publish_text
+          assert "DEADZONE_DEVICES_TOKEN" not in publish_text
+          assert "DEADZONE_STABLE_REPO_TOKEN" not in publish_text
+          print("SuperInspector bridge YAML, Windows Fastboot output and publishing responsibilities: OK")
+          PY
