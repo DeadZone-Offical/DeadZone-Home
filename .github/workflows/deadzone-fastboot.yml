@@ -505,91 +505,35 @@ jobs:
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Inspector build finished" || true
 
-      - name: "🔍 Resolve publish credentials"
+      - name: "🔍 Resolve local Fastboot ROM path"
         id: publish_creds
         shell: bash
-        env:
-          DEADZONE_ROM_REPO_TOKEN: ${{ secrets.DEADZONE_ROM_REPO_TOKEN }}
-          ROM_REPO_PUSH_TOKEN: ${{ secrets.ROM_REPO_PUSH_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          DEADZONE_PRIVATE_READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
         run: |
           set -euo pipefail
-          # Canonical: DEADZONE_ROM_REPO_TOKEN.
-          # Deprecated fallback: ROM_REPO_PUSH_TOKEN (legacy alias).
-          # Last-resort fallback: GH_TOKEN (the existing PAT).
-          if [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
-            printf '::notice::Using canonical DEADZONE_ROM_REPO_TOKEN for central push.\n'
-            export DEADZONE_ROM_REPO_TOKEN
-            printf 'publish_token_source=DEADZONE_ROM_REPO_TOKEN\n' >> "$GITHUB_OUTPUT"
-          elif [[ -n "${ROM_REPO_PUSH_TOKEN:-}" ]]; then
-            echo '::warning::Using deprecated ROM_REPO_PUSH_TOKEN; please migrate to DEADZONE_ROM_REPO_TOKEN.'
-            export ROM_REPO_PUSH_TOKEN
-            printf 'publish_token_source=ROM_REPO_PUSH_TOKEN (deprecated)\n' >> "$GITHUB_OUTPUT"
-          elif [[ -n "${GH_TOKEN:-}" ]]; then
-            echo '::warning::Using GH_TOKEN as a last-resort fallback for the central push; provision DEADZONE_ROM_REPO_TOKEN to silence this warning.'
-            export DEADZONE_ROM_REPO_TOKEN="$GH_TOKEN"
-            printf 'publish_token_source=GH_TOKEN (fallback)\n' >> "$GITHUB_OUTPUT"
-          else
-            echo '::notice::No publish token is configured. The publish steps will run in --dry-run mode.'
-            printf 'publish_token_source=none\n' >> "$GITHUB_OUTPUT"
-          fi
-          if [[ -z "${DEADZONE_PRIVATE_READ_TOKEN:-}" ]]; then
-            echo '::warning::DEADZONE_PRIVATE_READ_TOKEN is unset; downstream publish will fail unless the engine checkout uses an unauthenticated path.'
-          fi
-          # Normalize the ROM path to a POSIX form so python on Windows
-          # (which accepts both styles) gets a clean argument. MSYS path
-          # translation is disabled so the value matches the on-disk path.
+          # Local analysis must not depend on any central-publish token.
           ROM_PATH_POSIX="${ROM_PATH:-}"
           if [[ -n "$ROM_PATH_POSIX" && "$ROM_PATH_POSIX" != /* ]]; then
             ROM_PATH_POSIX="$(cygpath -u "$ROM_PATH_POSIX" 2>/dev/null || echo "$ROM_PATH_POSIX")"
           fi
           printf 'rom_path_posix=%s\n' "$ROM_PATH_POSIX" >> "$GITHUB_OUTPUT"
-          printf 'publish_token_present=%s\n' "$([[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          if [[ ! -e "$ROM_PATH_POSIX" ]]; then
-            echo "::warning::ROM is not present at ${ROM_PATH_POSIX}. The publish steps will run in --dry-run mode."
-            printf 'rom_present=false\n' >> "$GITHUB_OUTPUT"
-          else
-            printf 'rom_present=true\n' >> "$GITHUB_OUTPUT"
-            printf 'rom_size_bytes=%s\n' "$(stat -c%s "$ROM_PATH_POSIX" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
+          if [[ ! -f "$ROM_PATH_POSIX" ]]; then
+            echo "::error::Downloaded ROM not found at $ROM_PATH_POSIX"
+            exit 2
           fi
+          echo 'rom_present=true' >> "$GITHUB_OUTPUT"
+          printf 'rom_size_bytes=%s\n' "$(stat -c%s "$ROM_PATH_POSIX" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
 
       - name: "📊 Analyze ROM and emit device profile"
         id: analyze
         shell: bash
         env:
           ROM_PATH: ${{ steps.publish_creds.outputs.rom_path_posix }}
-          DEADZONE_ROM_REPO_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.DEADZONE_ROM_REPO_TOKEN || '' }}
-          ROM_REPO_PUSH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.ROM_REPO_PUSH_TOKEN || '' }}
-          GH_TOKEN: ${{ steps.publish_creds.outputs.publish_token_present == 'true' && secrets.GH_TOKEN || '' }}
-          # If no token, fall back to GH_TOKEN (works because the workflow's
-          # GH_TOKEN has admin on the org).
           DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
           DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
-          DEADZONE_ROM_REPO_AUTHOR_NAME: 'deadzone-bot'
-          DEADZONE_ROM_REPO_AUTHOR_EMAIL: 'bot@deadzone.offical'
         run: |
           set -euo pipefail
-          # Normalize token name into the canonical env var the engine reads.
-          if [[ -n "${DEADZONE_ROM_REPO_TOKEN:-}" ]]; then
-            : # canonical already set
-          elif [[ -n "${ROM_REPO_PUSH_TOKEN:-}" ]]; then
-            export DEADZONE_ROM_REPO_TOKEN="$ROM_REPO_PUSH_TOKEN"
-          elif [[ -n "${GH_TOKEN:-}" ]]; then
-            export DEADZONE_ROM_REPO_TOKEN="$GH_TOKEN"
-          fi
-          ROM_PRESENT="${{ steps.publish_creds.outputs.rom_present }}"
-          TOKEN_PRESENT="${{ steps.publish_creds.outputs.publish_token_present }}"
-          if [[ "$ROM_PRESENT" != "true" || "$TOKEN_PRESENT" != "true" ]]; then
-            echo "::notice::Skipping ROM analysis: rom_present=${ROM_PRESENT}, token_present=${TOKEN_PRESENT}. Run in dry-run mode."
-            mkdir -p fastboot-profile
-            printf 'fastboot-profile/DRY_RUN.txt' > fastboot-profile/DRY_RUN.txt
-            printf 'no ROM or token; nothing analyzed\n' > fastboot-profile/DRY_RUN.txt
-            printf 'codename=\n' >> "$GITHUB_OUTPUT"
-            printf 'profile_dir=\n' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # Analysis is local/read-only. Stable publication is separately queued.
           mkdir -p fastboot-profile
           echo "::group::ROM analysis"
           echo "rom_path: $ROM_PATH"
