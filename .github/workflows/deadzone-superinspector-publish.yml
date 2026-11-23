@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: "Official Xiaomi stock Fastboot ROM HTTPS URL (.tgz/.tar.gz/.tar/.zip)"
+        description: "Fastboot HTTPS archive URL from Xiaomi or direct mirror"
         required: true
         type: string
       os_version:
@@ -53,7 +53,7 @@ jobs:
       DRY_RUN: ${{ inputs.dry_run }}
       INSPECTOR_DISPATCH_TOKEN: ${{ secrets.DEADZONE_INSPECTOR_DISPATCH_TOKEN || secrets.GH_TOKEN }}
     steps:
-      - name: Validate official ROM URL and Inspector dispatch credentials
+      - name: Validate public HTTPS Fastboot source and Inspector dispatch credentials
         shell: bash
         run: |
           set -euo pipefail
@@ -63,23 +63,37 @@ jobs:
           }
           python3 - <<'PY'
           import os
+          import ipaddress
+          import re
           from pathlib import PurePosixPath
           from urllib.parse import unquote, urlsplit
           u = urlsplit(os.environ["ROM_URL"])
-          host = (u.hostname or "").lower()
-          name = PurePosixPath(unquote(u.path)).name.lower()
-          if (u.scheme != "https" or not host.endswith(".miui.com")
-                  or host == ".miui.com" or u.username or u.password
-                  or not name.endswith((".tgz", ".tar.gz", ".tar", ".zip"))
-                  or name.startswith(".")):
-              raise SystemExit("Only an official Xiaomi HTTPS Fastboot archive (*.miui.com) is supported")
+          host = (u.hostname or "").lower().rstrip(".")
+          name = PurePosixPath(unquote(u.path)).name
+          forbidden = (".local", ".localhost", ".lan", ".internal", ".onion", ".invalid", ".test", ".example")
+          if (u.scheme != "https" or not host or u.username or u.password or u.fragment
+                  or u.port not in (None, 443)
+                  or "." not in host or host == "localhost"
+                  or any(host.endswith(x) for x in forbidden)
+                  or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", x)
+                             for x in host.split("."))
+                  or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name)
+                  or not name.lower().endswith((".tgz", ".tar.gz", ".tar", ".zip"))):
+              raise SystemExit("Expected direct public HTTPS Fastboot archive URL")
+          try:
+              ip = ipaddress.ip_address(host)
+          except ValueError:
+              pass
+          else:
+              if not ip.is_global:
+                  raise SystemExit("Private/reserved download IP forbidden")
           PY
 
       - name: Dispatch the existing verified SuperInspector publisher on main
         shell: bash
         run: |
           set -euo pipefail
-          # Only dispatch. The PRIVATE workflow itself checks Stock signatures,
+          # Only dispatch. The PRIVATE workflow independently checks archive metadata,
           # Fastboot targets, format, physical LP Super size and repository rights.
           payload="$(python3 - <<'PY'
           import json, os
