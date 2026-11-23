@@ -1,6 +1,6 @@
 # Public DeadZone-Home launcher; no Stock images or write tokens are stored
 # here. The PRIVATE Inspector workflow performs all verified publication
-# using its own DEADZONE_DEVICES_TOKEN + DEADZONE_STABLE_REPO_TOKEN.
+# using only DEADZONE_STABLE_REPO_TOKEN to publish to Stable.
 # This is additive; the existing Windows Fastboot bot workflow is preserved.
 name: DeadZone-SuperInspector · Verified Device Publisher
 run-name: "🧩 Inspect Stock · ${{ inputs.os_version }} · ${{ github.actor }}"
@@ -29,12 +29,7 @@ on:
         type: string
         default: ""
       dry_run:
-        description: "Validate only (never modify either private repo)"
-        required: true
-        type: boolean
-        default: true
-      sync_stable:
-        description: "Also publish four-file OS profile to Stable/main"
+        description: "Validate only; no Stable write"
         required: true
         type: boolean
         default: true
@@ -56,7 +51,6 @@ jobs:
       OS_VERSION: ${{ inputs.os_version }}
       BUILD_ID: ${{ inputs.build_id }}
       DRY_RUN: ${{ inputs.dry_run }}
-      SYNC_STABLE: ${{ inputs.sync_stable }}
       INSPECTOR_DISPATCH_TOKEN: ${{ secrets.DEADZONE_INSPECTOR_DISPATCH_TOKEN || secrets.GH_TOKEN }}
     steps:
       - name: Validate official ROM URL and Inspector dispatch credentials
@@ -95,8 +89,7 @@ jobs:
               "rom_url": os.environ["ROM_URL"],
               "os_version": os.environ["OS_VERSION"],
               "build_id": os.environ["BUILD_ID"],
-              "dry_run": os.environ["DRY_RUN"].lower(),
-              "sync_stable": os.environ["SYNC_STABLE"].lower()
+              "dry_run": os.environ["DRY_RUN"].lower()
             }
           }))
           PY
@@ -122,7 +115,6 @@ jobs:
             echo '- Private worker: DeadZone-Offical/DeadZone-SuperInspector'
             echo '- Workflow: publish-devices.yml on main'
             echo "- Dry run: $DRY_RUN"
-            echo "- Sync Stable: $SYNC_STABLE"
             echo '- 204 only means queued, **not** that validation/publication has succeeded.'
             echo '- View results: https://github.com/DeadZone-Offical/DeadZone-SuperInspector/actions/workflows/publish-devices.yml'
           } >> "$GITHUB_STEP_SUMMARY"
