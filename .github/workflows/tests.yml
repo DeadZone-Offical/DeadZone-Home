@@ -114,6 +114,7 @@ jobs:
           steps = job["steps"]
           names = [step.get("name", "") for step in steps]
           assert "🚀 Queue verified Stock publisher in SuperInspector" in names
+          assert "🔐 Confirm verified Stable publication" in names
           assert "📤 Publish per-build tree to DeadZone-ROM-Repository" not in names
           assert "📚 Publish central metadata registry entry" not in names
           assert "🗜️ Package artifact" in names
@@ -121,6 +122,11 @@ jobs:
           assert "📣 Report verified Stable publisher queue to bot" in names
           assert "publish-flash-manifest" not in fastboot_text, "Obsolete publisher restored"
           assert "publish-devices.yml/dispatches" in fastboot_text
+          assert '"request_id": os.environ["DEADZONE_REQUEST_ID"]' in fastboot_text
+          assert "status=dispatch_failed" in fastboot_text
+          assert "Token needs private repo Actions: read/write" in fastboot_text
+          assert "steps.stable_published.outputs.status" in fastboot_text
+          assert "if [[ \"$conclusion\" == success ]]" in fastboot_text
           assert '"sync_stable"' not in fastboot_text
           assert "publish-central" not in fastboot_text
           assert "publish-rom-repo" not in fastboot_text
