@@ -70,7 +70,7 @@ jobs:
   build-fastboot-inspector:
     name: "🛠️ Build Fastboot Inspector"
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 80
     env:
       DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
       DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
@@ -766,6 +766,85 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      - name: "🔐 Confirm verified Stable publication"
+        if: success()
+        id: stable_published
+        shell: bash
+        env:
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          QUEUE_STATUS: ${{ steps.flash_manifest.outputs.status }}
+          DISPATCH_TOKEN_SOURCE: ${{ steps.flash_manifest.outputs.token_source }}
+          INSPECTOR_TOKEN_DEDICATED: ${{ secrets.DEADZONE_INSPECTOR_DISPATCH_TOKEN }}
+          INSPECTOR_TOKEN_PRIVATE: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          INSPECTOR_TOKEN_LEGACY: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "$QUEUE_STATUS" != queued ]]; then
+            echo "::error::Fastboot Inspector was packaged, but Stable publication was not dispatched (status: ${QUEUE_STATUS:-unknown})."
+            echo "### Stable profile NOT published" >> "$GITHUB_STEP_SUMMARY"
+            echo "Dispatch status: ${QUEUE_STATUS:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+            echo "HTTP 404 means the private Inspector is inaccessible or its workflow is unavailable to the supplied token. Give DEADZONE_INSPECTOR_DISPATCH_TOKEN Actions: read/write on SuperInspector." >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          case "$DISPATCH_TOKEN_SOURCE" in
+            dedicated) token="$INSPECTOR_TOKEN_DEDICATED" ;;
+            private_read) token="$INSPECTOR_TOKEN_PRIVATE" ;;
+            legacy) token="$INSPECTOR_TOKEN_LEGACY" ;;
+            *) echo "::error::Missing dispatch token source"; exit 2 ;;
+          esac
+          endpoint='https://api.github.com/repos/DeadZone-Offical/DeadZone-SuperInspector/actions/workflows/publish-devices.yml/runs?event=workflow_dispatch&per_page=50'
+          # Unique request_id is in Inspector's run-name, so an unrelated
+          # successful workflow is NEVER treated as our publication.
+          for attempt in $(seq 1 100); do
+            status="$(curl --silent --show-error --max-time 30 \
+              --output "$RUNNER_TEMP/inspector-runs.json" --write-out '%{http_code}' \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              -H "Authorization: Bearer $token" "$endpoint")" || status=000
+            if [[ "$status" != 200 ]]; then
+              echo "::error::Cannot read Inspector publication runs (HTTP $status). Token needs private repo Actions: read/write."
+              exit 2
+            fi
+            worker="$(python3 - <<'PY'
+          import json, os
+          path = os.path.join(os.environ["RUNNER_TEMP"], "inspector-runs.json")
+          data = json.load(open(path, encoding="utf-8"))
+          request_id = os.environ["DEADZONE_REQUEST_ID"]
+          runs = [r for r in data.get("workflow_runs", [])
+                  if request_id in str(r.get("display_title", ""))
+                  and r.get("event") == "workflow_dispatch"]
+          if runs:
+              r = max(runs, key=lambda item: item["id"])
+              print("|".join((str(r["id"]), r.get("status") or "",
+                              r.get("conclusion") or "", r.get("html_url") or "")))
+          PY
+            )"
+            if [[ -n "$worker" ]]; then
+              IFS='|' read -r worker_id state conclusion worker_url <<< "$worker"
+              if [[ "$state" == completed ]]; then
+                echo "### Verified Stable publication" >> "$GITHUB_STEP_SUMMARY"
+                echo "- Worker: $worker_url" >> "$GITHUB_STEP_SUMMARY"
+                echo "- Result: $conclusion" >> "$GITHUB_STEP_SUMMARY"
+                if [[ "$conclusion" == success ]]; then
+                  echo "::notice::Stable metadata publication confirmed by SuperInspector: $worker_url"
+                  echo 'status=published' >> "$GITHUB_OUTPUT"
+                  echo "run_url=$worker_url" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+                echo "::error::SuperInspector publication failed ($conclusion): $worker_url"
+                exit 2
+              fi
+              if (( attempt % 10 == 0 )); then
+                echo "::notice::SuperInspector worker $worker_id remains $state; publication not confirmed."
+              fi
+            elif (( attempt % 10 == 0 )); then
+              echo "::notice::Waiting for matching Inspector publication run: $DEADZONE_REQUEST_ID"
+            fi
+            sleep 30
+          done
+          echo "::error::Stable publication was not confirmed before timeout; inspect the private Inspector workflow."
+          exit 2
+
       - name: "✅ Report successful Fastboot build"
         if: success()
         shell: bash
@@ -797,7 +876,7 @@ jobs:
             --message "Artifact upload complete" || true
           python3 runtime/report_build_event.py succeeded \
             --project fastboot \
-            --message "DeadZone Fastboot Inspector build complete." || true
+            --message "Fastboot Inspector built and Stable device profile publication confirmed." || true
 
       - name: "❌ Report failed Fastboot build"
         if: failure()
@@ -848,6 +927,8 @@ jobs:
           ROM_URL: ${{ env.ROM_URL }}
           PUBLISH_CODENAME: ${{ steps.analyze.outputs.codename }}
           STABLE_PUBLISH_STATUS: ${{ steps.flash_manifest.outputs.status }}
+          CONFIRMED_PUBLISH_STATUS: ${{ steps.stable_published.outputs.status }}
+          PUBLISH_RUN_URL: ${{ steps.stable_published.outputs.run_url }}
         run: |
           {
             echo "## 🩺 DeadZone-Fastboot build"
@@ -861,5 +942,9 @@ jobs:
             fi
             echo "- Stable target: bin/DeadZone-Devices/<codename>/<OS>/"
             echo "- Verified publisher queue: ${STABLE_PUBLISH_STATUS:-not_queued} (queued is not published)"
+            echo "- Verified Stable publication: ${CONFIRMED_PUBLISH_STATUS:-not_confirmed}"
+            if [[ -n "${PUBLISH_RUN_URL:-}" ]]; then
+              echo "- Publisher worker: ${PUBLISH_RUN_URL}"
+            fi
             echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } >> "$GITHUB_STEP_SUMMARY"
