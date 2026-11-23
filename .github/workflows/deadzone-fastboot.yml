@@ -581,12 +581,14 @@ jobs:
         shell: bash
         env:
           ROM_URL: ${{ inputs.input_url }}
-          INSPECTOR_DISPATCH_TOKEN: ${{ secrets.DEADZONE_INSPECTOR_DISPATCH_TOKEN || secrets.GH_TOKEN }}
+          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
+          INSPECTOR_TOKEN_DEDICATED: ${{ secrets.DEADZONE_INSPECTOR_DISPATCH_TOKEN }}
+          INSPECTOR_TOKEN_PRIVATE: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          INSPECTOR_TOKEN_LEGACY: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
-          # Direct HTTPS Fastboot archives from Xiaomi or external mirrors
-          # are eligible. The Inspector still validates archive contents and
-          # all partition / LP evidence before any Stable write.
+          # The private publisher validates actual flash metadata and LP size.
+          # A third-party HTTPS mirror is not proof of Xiaomi authenticity.
           if ! python3 - <<'PY'
           import os
           import sys
@@ -596,46 +598,56 @@ jobs:
           print("Fastboot source type:", origin)
           PY
           then
-            echo "::warning::Invalid/insecure HTTPS Fastboot source; skipping publication."
-            echo 'status=skipped_invalid_source' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [[ -z "${INSPECTOR_DISPATCH_TOKEN:-}" ]]; then
-            echo "::warning::Verified publication not queued: set DEADZONE_INSPECTOR_DISPATCH_TOKEN (Actions: write on SuperInspector) in Home, or use a suitable GH_TOKEN. Existing Fastboot outputs continue."
-            echo 'status=skipped_no_token' >> "$GITHUB_OUTPUT"
+            echo "::error::Invalid/insecure Fastboot archive URL"
+            echo "status=invalid_source" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           payload="$(python3 - <<'PY'
           import json, os
           print(json.dumps({
-            "ref": "main",
-            "inputs": {
-              "rom_url": os.environ["ROM_URL"],
-              "os_version": "auto",
-              "build_id": "",
-              "dry_run": "false"
-            }
+              "ref": "main",
+              "inputs": {
+                  "request_id": os.environ["DEADZONE_REQUEST_ID"],
+                  "rom_url": os.environ["ROM_URL"],
+                  "os_version": "auto",
+                  "build_id": "",
+                  "dry_run": "false"
+              }
           }))
           PY
           )"
-          # A 204 response confirms only successful QUEUING; Inspector's
-          # independent workflow must still validate and publish the stock.
-          http_status="$(curl --silent --show-error --location \
-            --max-time 35 --output "$RUNNER_TEMP/deadzone-inspector-dispatch.json" \
-            --write-out '%{http_code}' \
-            --request POST \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            -H "Authorization: Bearer $INSPECTOR_DISPATCH_TOKEN" \
-            -H 'Content-Type: application/json' \
-            --data "$payload" \
-            'https://api.github.com/repos/DeadZone-Offical/DeadZone-SuperInspector/actions/workflows/publish-devices.yml/dispatches')" || http_status="000"
-          if [[ "$http_status" == "204" ]]; then
-            echo "::notice::Queued verified Fastboot metadata inspection and Stable-only device publication in SuperInspector/main."
-            echo 'status=queued' >> "$GITHUB_OUTPUT"
+          attempts=0
+          for source in dedicated private_read legacy; do
+            case "$source" in
+              dedicated) token="${INSPECTOR_TOKEN_DEDICATED:-}" ;;
+              private_read) token="${INSPECTOR_TOKEN_PRIVATE:-}" ;;
+              legacy) token="${INSPECTOR_TOKEN_LEGACY:-}" ;;
+            esac
+            [[ -n "$token" ]] || continue
+            attempts=$((attempts + 1))
+            status="$(curl --silent --show-error --max-time 35 \
+              --request POST --output "$RUNNER_TEMP/inspector-dispatch-response.json" \
+              --write-out '%{http_code}' \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              -H "Authorization: Bearer $token" \
+              -H 'Content-Type: application/json' \
+              --data "$payload" \
+              'https://api.github.com/repos/DeadZone-Offical/DeadZone-SuperInspector/actions/workflows/publish-devices.yml/dispatches')" || status=000
+            if [[ "$status" == 204 ]]; then
+              echo "::notice::SuperInspector publication successfully queued with $source credential."
+              echo "status=queued" >> "$GITHUB_OUTPUT"
+              echo "token_source=$source" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::SuperInspector rejected the configured $source credential (HTTP $status)."
+          done
+          if (( attempts == 0 )); then
+            echo "::error::No Inspector dispatch credential is configured."
+            echo "status=skipped_no_token" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Verified stock publisher dispatch returned HTTP $http_status. Check Home dispatch token (Actions: write on SuperInspector). Existing Fastboot pipeline continues."
-            echo 'status=dispatch_failed' >> "$GITHUB_OUTPUT"
+            echo "::error::Cannot dispatch to private SuperInspector. Give DEADZONE_INSPECTOR_DISPATCH_TOKEN Actions: read/write on that repository."
+            echo "status=dispatch_failed" >> "$GITHUB_OUTPUT"
           fi
 
       - name: "📣 Report verified Stable publisher queue to bot"
