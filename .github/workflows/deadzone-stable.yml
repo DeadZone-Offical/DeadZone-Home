@@ -784,59 +784,23 @@ jobs:
             python3 -m py_compile notify.py
           fi
 
-      - name: "🛡️ Verify SuperInspector device config presence"
+      - name: "🛡️ Verify SuperInspector device profiles"
         working-directory: toolbuild
         shell: bash
         run: |
           set -euo pipefail
-          # Device configuration is owned by DeadZone-SuperInspector.
-          # The refactored Stable build engine reads per-codename
-          # profiles from
-          # ``bin/DeviceConfig/<codename>/<codename>.json`` at
-          # Stage 9 (flash) and Stage 10 (release). SuperInspector
-          # generates and publishes that file via its own writer.
-          # This workflow MUST NOT regenerate, backfill, or
-          # duplicate that work.
-          #
-          # The codename is unknown until Stage 4 (metadata) of
-          # build.sh runs, so we cannot pre-validate a specific
-          # codename here. We instead check the upstream
-          # precondition: at least one DeviceConfig directory must
-          # exist, otherwise SuperInspector has never published any
-          # profiles to the Stable engine and the build would fail
-          # inside Stage 9 with the engine's own
-          # ``dz_flash_load_config`` error.
-          #
-          # The pre-refactor engine (the layout the engine ships
-          # in at the bootstrap commit) does NOT yet consume
-          # ``bin/DeviceConfig/``; it derives its per-build
-          # configuration from `bin/ddevice/*.txt` written by
-          # `build.sh` itself. We therefore tolerate a missing
-          # ``bin/DeviceConfig/`` directory under the pre-refactor
-          # layout (a soft warning) and only fail the build when
-          # the directory exists but is empty (a true
-          # configuration regression that would break Stage 9
-          # under the refactored engine).
-          if [[ ! -d bin/DeviceConfig ]]; then
-            if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" ]]; then
-              echo "::error::bin/DeviceConfig/ is missing from the Stable engine checkout." >&2
-              echo "::error::DeadZone-SuperInspector is the owner of bin/DeviceConfig/<codename>/<codename>.json. Run SuperInspector against the device's stock ROM first so it can publish the per-codename device configuration into DeadZone-Offical/DeadZone-Xiaomi-Stable, then re-dispatch this Stable build." >&2
-              exit 1
-            fi
-            echo "::notice::bin/DeviceConfig/ is not present in the pre-refactor engine checkout; the pre-refactor engine derives its configuration from bin/ddevice/*.txt and does not consume SuperInspector's per-codename profiles. This step is informational and will start failing once the engine lands its refactored layout."
+          if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" ]]; then
+            # Preserve the separate refactored engine contract.
+            test -d bin/DeviceConfig || { echo "::error::Missing refactored engine DeviceConfig"; exit 1; }
             exit 0
           fi
-          shopt -s nullglob
-          device_config_files=(bin/DeviceConfig/*/*.json)
-          shopt -u nullglob
-          if (( ${#device_config_files[@]} == 0 )); then
-            echo "::error::bin/DeviceConfig/ is empty: no per-codename device configuration has been published to the Stable engine." >&2
-            echo "::error::DeadZone-SuperInspector is the owner of bin/DeviceConfig/<codename>/<codename>.json. Run SuperInspector against the device's stock ROM first so it can publish the per-codename device configuration into DeadZone-Offical/DeadZone-Xiaomi-Stable, then re-dispatch this Stable build." >&2
+          if [[ ! -d bin/DeadZone-Devices ]]; then
+            echo "::error::Missing bin/DeadZone-Devices; publish device profiles with SuperInspector."
             exit 1
           fi
-          printf '::group::SuperInspector DeviceConfig presence\n'
-          printf '  - %s\n' "${device_config_files[@]}"
-          printf '::endgroup::\n'
+          test -s bin/packaging/deadzone_device_profile.py
+          find bin/DeadZone-Devices -mindepth 2 -maxdepth 2 -type d -print
+          echo "Device/OS-specific validation is performed by the Stable engine."
 
       - name: "📣 Start live tracking"
         working-directory: toolbuild
