@@ -1091,7 +1091,7 @@ jobs:
           export PATH="$PWD/${DEADZONE_TOOLCHAIN_DIR:-bin/Linux/x86_64}:$PATH"
           log_path="$PWD/build_action.log"
           : > "$log_path"
-          sudo env "PATH=$PATH" stdbuf -oL -eL bash build.sh \
+          sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" stdbuf -oL -eL bash build.sh \
             "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" \
             > "$log_path" 2>&1 &
@@ -1144,7 +1144,7 @@ jobs:
           # early, which truncates `build_action.log` and hides
           # the real exit status.
           log_path="$PWD/build_action.log"
-          sudo env "PATH=$PATH" stdbuf -oL -eL bash packROM.sh > "$log_path" 2>&1 &
+          sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" stdbuf -oL -eL bash packROM.sh > "$log_path" 2>&1 &
           pack_pid=$!
           tail -n +1 -F --pid="$pack_pid" "$log_path" || true
           wait "$pack_pid"
@@ -1233,7 +1233,7 @@ jobs:
           fi
           log_path="$PWD/build_action.log"
           set +e
-          sudo env "PATH=$PATH" stdbuf -oL -eL bash uploadROM.sh > "$log_path" 2>&1 &
+          sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" stdbuf -oL -eL bash uploadROM.sh > "$log_path" 2>&1 &
           upload_pid=$!
           tail -n +1 -F --pid="$upload_pid" "$log_path" || true
           wait "$upload_pid"
