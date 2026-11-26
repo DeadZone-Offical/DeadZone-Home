@@ -29,9 +29,7 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: deadzone-toolbox-apk-${{ github.ref }}
-  cancel-in-progress: false
+# No concurrency group: preserve independent builds and queued requests.
 
 jobs:
   build-toolbox:
