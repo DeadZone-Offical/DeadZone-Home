@@ -41,9 +41,7 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: deadzone-framework-${{ github.ref }}-${{ inputs.platform }}
-  cancel-in-progress: false
+# No concurrency group: preserve independent builds and queued requests.
 
 jobs:
   build-framework:
