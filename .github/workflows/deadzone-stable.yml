@@ -493,6 +493,31 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      # The verified four-file stock profiles now live outside Stable.
+      # Pin the registry at checkout once per build; do not follow moving
+      # main during a long ROM build. No engine write privileges are used.
+      - name: "📥 Checkout private DeadZone-Devices (read-only)"
+        uses: actions/checkout@v5
+        with:
+          repository: DeadZone-Offical/DeadZone-Devices
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: device-registry
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "🧭 Pin verified external device profiles"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d device-registry
+          count=$(find device-registry -mindepth 3 -maxdepth 3 -type f -name 'flash.json' | wc -l)
+          (( count > 0 )) || { echo "::error::DeadZone-Devices checkout has no verified device profiles"; exit 2; }
+          sha=$(git -C device-registry rev-parse HEAD)
+          echo "DEADZONE_DEVICE_REGISTRY=$GITHUB_WORKSPACE/device-registry" >> "$GITHUB_ENV"
+          echo "DEADZONE_DEVICE_REGISTRY_SHA=$sha" >> "$GITHUB_ENV"
+          echo "Using read-only DeadZone-Devices registry: $sha ($count OS profiles)"
+
       - name: "🧭 Detect Stable engine layout"
         working-directory: toolbuild
         shell: bash
@@ -794,13 +819,13 @@ jobs:
             test -d bin/DeviceConfig || { echo "::error::Missing refactored engine DeviceConfig"; exit 1; }
             exit 0
           fi
-          if [[ ! -d bin/DeadZone-Devices ]]; then
-            echo "::error::Missing bin/DeadZone-Devices; publish device profiles with SuperInspector."
+          if [[ -z "${DEADZONE_DEVICE_REGISTRY:-}" || ! -d "$DEADZONE_DEVICE_REGISTRY" ]]; then
+            echo "::error::Missing checked-out DeadZone-Devices registry. Ensure DEADZONE_PRIVATE_READ_TOKEN has Contents: read on DeadZone-Devices."
             exit 1
           fi
           test -s bin/packaging/deadzone_device_profile.py
-          find bin/DeadZone-Devices -mindepth 2 -maxdepth 2 -type d -print
-          echo "Device/OS-specific validation is performed by the Stable engine."
+          find "$DEADZONE_DEVICE_REGISTRY" -mindepth 2 -maxdepth 2 -type d -print
+          echo "Registry source: $DEADZONE_DEVICE_REGISTRY_SHA (read-only); exact device/OS checked by Stable."
 
       - name: "📣 Start live tracking"
         working-directory: toolbuild
