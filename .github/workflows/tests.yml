@@ -29,7 +29,7 @@ jobs:
           python3 -c "import yaml; yaml.safe_load(open('.github/workflows/deadzone-stable.yml'))"
           echo "YAML parses OK"
 
-      - name: "🛡️ Every Stable build runs independently"
+      - name: "🛡️ Every DeadZone build runs independently"
         shell: bash
         run: |
           set -euo pipefail
@@ -37,19 +37,31 @@ jobs:
           from pathlib import Path
           import yaml
 
-          path = Path(".github/workflows/deadzone-stable.yml")
-          workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
-          assert isinstance(workflow, dict), "Stable workflow must be a mapping"
-          assert "concurrency" not in workflow, (
-              "Stable must not have a workflow-level concurrency group: it could cancel or replace other builds"
+          base = Path(".github/workflows")
+          build_workflows = (
+              "deadzone-stable.yml",
+              "deadzone-lite.yml",
+              "deadzone-ninja.yml",
+              "deadzone-fastboot.yml",
+              "deadzone-xiaomi-port.yml",
+              "deadzone-framework-build.yml",
+              "deadzone-toolbox-apk.yml",
+              "deadzone-superinspector-publish.yml",
           )
-          jobs = workflow.get("jobs", {})
-          assert isinstance(jobs, dict) and jobs, "Stable has no jobs"
-          for job_id, job in jobs.items():
-              assert isinstance(job, dict) and "concurrency" not in job, (
-                  f"Stable job {job_id} must not serialize or cancel other builds"
+          for name in build_workflows:
+              workflow = yaml.safe_load((base / name).read_text(encoding="utf-8"))
+              assert isinstance(workflow, dict), f"{name}: invalid workflow YAML"
+              assert "concurrency" not in workflow, (
+                  f"{name}: workflow concurrency could replace pending builds"
               )
-          print("Stable concurrency: independent runs; no workflow/job cancellation or serialization")
+              jobs = workflow.get("jobs", {})
+              assert isinstance(jobs, dict) and jobs, f"{name}: no jobs found"
+              for job_id, job in jobs.items():
+                  assert isinstance(job, dict) and "concurrency" not in job, (
+                      f"{name}/{job_id}: job concurrency can serialize or cancel builds"
+                  )
+              print(f"{name}: independent builds verified")
+          print(f"All {len(build_workflows)} build workflows keep queued and active runs independent.")
           PY
 
       - name: "🛡️ Only workflow_dispatch trigger"
