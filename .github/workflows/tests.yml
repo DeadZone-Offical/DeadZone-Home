@@ -156,7 +156,7 @@ jobs:
           job = yaml.safe_load(path.read_text())["jobs"]["build"]
           assert job["timeout-minutes"] == 360
           steps = job["steps"]
-          root = 'bash "$GITHUB_WORKSPACE/scripts/port-root-env.sh"'
+          root = 'bash "$RUNNER_TEMP/port-root-env.sh"'
           for command in ("bash build.sh", "bash packROM.sh", "bash bin/port/uploadROM.sh"):
               assert any(root + " " + command in step.get("run", "") for step in steps), command
           for step in steps:
@@ -167,13 +167,24 @@ jobs:
               if script and step.get("shell", "bash") != "python":
                   subprocess.run(["bash", "-n"], input=script, text=True, check=True)
           PY
-          bash -n scripts/port-root-env.sh
           temp_dir="$(mktemp -d)"
           trap 'rm -rf "$temp_dir"' EXIT
+          export RUNNER_TEMP="$temp_dir"
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+          import yaml
+          workflow = yaml.safe_load(pathlib.Path(".github/workflows/deadzone-xiaomi-port.yml").read_text())
+          steps = workflow["jobs"]["build"]["steps"]
+          setup = [step["run"] for step in steps if step.get("name") == "Prepare privileged Port runtime"]
+          assert len(setup) == 1
+          subprocess.run(["bash", "-c", setup[0]], check=True)
+          PY
+          bash -n "$RUNNER_TEMP/port-root-env.sh"
           printf '#!/usr/bin/env bash\nexec /usr/bin/env -i "$@"\n' > "$temp_dir/sudo"
           chmod +x "$temp_dir/sudo"
           PATH="$temp_dir:$PATH" RCLONE_REMOTE_NAME=fixture RCLONE_UPLOAD_DIR='folder with spaces' DEADZONE_CONTROLLED_BUILD=1 DEADZONE_REQUEST_ID=port_xiaomi_12345678 \
-            bash scripts/port-root-env.sh bash -c '[[ "$RCLONE_REMOTE_NAME" == fixture && "$RCLONE_UPLOAD_DIR" == "folder with spaces" && "$DEADZONE_CONTROLLED_BUILD" == 1 && "$DEADZONE_REQUEST_ID" == port_xiaomi_12345678 ]]'
+            bash "$RUNNER_TEMP/port-root-env.sh" bash -c '[[ "$RCLONE_REMOTE_NAME" == fixture && "$RCLONE_UPLOAD_DIR" == "folder with spaces" && "$DEADZONE_CONTROLLED_BUILD" == 1 && "$DEADZONE_REQUEST_ID" == port_xiaomi_12345678 ]]'
 
       - name: "Checkout current private Port engine test sources"
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

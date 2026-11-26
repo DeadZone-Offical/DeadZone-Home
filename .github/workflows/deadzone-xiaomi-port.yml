@@ -236,6 +236,41 @@ jobs:
         working-directory: toolbuild
         run: sudo chmod 777 -R *
 
+      - name: "Prepare privileged Port runtime"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          cat > "$RUNNER_TEMP/port-root-env.sh" <<'PORT_ROOT_ENV'
+          #!/usr/bin/env bash
+          # sudo -E is ignored by sudo-rs on current hosted runners.
+          # Forward only the Port build contract; never dump or forward the whole environment.
+          set -Eeuo pipefail
+          (( $# > 0 )) || { echo "Usage: port-root-env.sh command [args...]" >&2; exit 2; }
+          names=(
+              PATH JAVA_HOME JAVA_HOME_17_X64
+              GITHUB_ENV GITHUB_WORKSPACE GITHUB_REPOSITORY GITHUB_SERVER_URL
+              GITHUB_RUN_ID GITHUB_RUN_ATTEMPT GITHUB_ACTIONS CI RUNNER_TEMP
+              RCLONE_REMOTE_NAME RCLONE_UPLOAD_DIR
+              DEADZONE_REQUEST_ID DEADZONE_CALLBACK_URL DEADZONE_EVENT_SECRET
+              DEADZONE_PROJECT DEADZONE_CONTROLLED_BUILD DEADZONE_CENTRAL_CONFIG
+              DEADZONE_PRESENTATION_OWNER DEADZONE_SOURCE_REPOSITORY
+              DEADZONE_STOCK_ROM_URL DEADZONE_PORT_ROM_URL
+              DEADZONE_BUILDER_NAME DEADZONE_BUILDER_ID DEADZONE_BUILDER_USERNAME
+              DEADZONE_ENABLE_SECONDARY_MIRRORS DEADZONE_UPLOAD_MAX_ATTEMPTS
+              DEADZONE_UPLOAD_BASE_DELAY_SECONDS
+              MEZO_CONTACT_LINK UPDATES_GROUP_LINK CHAT_GROUP_LINK
+          )
+          env_args=()
+          for name in "${names[@]}"; do
+              if [[ -v "$name" ]]; then
+                  env_args+=("$name=${!name}")
+              fi
+          done
+          exec sudo env "${env_args[@]}" "$@"
+          PORT_ROOT_ENV
+          bash -n "$RUNNER_TEMP/port-root-env.sh"
+
       - name: "☁️ Install central Rclone configuration"
         working-directory: toolbuild
         run: |
@@ -253,7 +288,7 @@ jobs:
           fi
           rclone version
           # Fail before the expensive build if sudo drops required runtime values.
-          bash "$GITHUB_WORKSPACE/scripts/port-root-env.sh" bash -c '
+          bash "$RUNNER_TEMP/port-root-env.sh" bash -c '
             set -euo pipefail
             for name in RCLONE_REMOTE_NAME RCLONE_UPLOAD_DIR DEADZONE_REQUEST_ID DEADZONE_CALLBACK_URL DEADZONE_EVENT_SECRET GITHUB_ENV; do
               [[ -n "${!name:-}" ]] || { echo "::error::Missing privileged Port runtime value: $name"; exit 1; }
@@ -267,7 +302,7 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
         run: |
           set -Eeuo pipefail
-          bash "$GITHUB_WORKSPACE/scripts/port-root-env.sh" bash build.sh \
+          bash "$RUNNER_TEMP/port-root-env.sh" bash build.sh \
             "$DEADZONE_STOCK_ROM_URL" \
             "$DEADZONE_PORT_ROM_URL" \
             "$DEADZONE_SOURCE_REPOSITORY" \
@@ -330,7 +365,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
-          bash "$GITHUB_WORKSPACE/scripts/port-root-env.sh" bash packROM.sh 2>&1 | tee -a build_action.log
+          bash "$RUNNER_TEMP/port-root-env.sh" bash packROM.sh 2>&1 | tee -a build_action.log
 
       - name: "📡 Report packaging completion to bot"
         if: success()
@@ -359,7 +394,7 @@ jobs:
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || \
             echo "::warning::Upload notification could not be delivered; continuing with the upload."
           set +e
-          bash "$GITHUB_WORKSPACE/scripts/port-root-env.sh" bash bin/port/uploadROM.sh 2>&1 | tee -a build_action.log
+          bash "$RUNNER_TEMP/port-root-env.sh" bash bin/port/uploadROM.sh 2>&1 | tee -a build_action.log
           google_status=${PIPESTATUS[0]}
           set -e
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
