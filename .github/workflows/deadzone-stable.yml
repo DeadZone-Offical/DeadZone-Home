@@ -1365,7 +1365,7 @@ jobs:
               else
                 rc=$?
               fi
-              if [[ "$rc" != 124 ]] && ! grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 503|googleapi: Error 503|backendError)' "$errors"; then
+              if [[ "$rc" != 124 ]] && ! grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 503|googleapi: Error 503|backendError|i/o timeout|context deadline exceeded|TLS handshake timeout|connection reset by peer|connection timed out)' "$errors"; then
                 return 1
               fi
               if (( attempt >= 4 )); then
