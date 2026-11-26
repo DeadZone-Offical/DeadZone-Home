@@ -29,6 +29,69 @@ jobs:
           python3 -c "import yaml; yaml.safe_load(open('.github/workflows/deadzone-stable.yml'))"
           echo "YAML parses OK"
 
+      - name: "🛡️ Fastboot ROM download is resumable, observable and bounded"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          p = Path(".github/workflows/deadzone-fastboot.yml")
+          flow = yaml.safe_load(p.read_text(encoding="utf-8"))
+          steps = flow["jobs"]["build-fastboot-inspector"]["steps"]
+          download = [step for step in steps if step.get("name") == "📥 Download ROM"]
+          assert len(download) == 1, "Fastboot ROM must have one download step"
+          step = download[0]
+          assert step["shell"] == "pwsh"
+          script = step["run"]
+          for required in (
+              "curl.exe",
+              "--continue-at",
+              "--connect-timeout",
+              "--speed-limit",
+              "--speed-time",
+              "--max-time",
+              "--max-redirs",
+              "--proto-redir",
+              "[System.Diagnostics.ProcessStartInfo]::new()",
+              "ArgumentList.Add",
+              "WaitForExit(20000)",
+              "Get-FileHash",
+              "ROM_SHA256=$sha",
+              "ROM_PATH=$dest",
+              "ROM_SIZE=$size",
+              "ROM_URL=$url",
+              "::add-mask::$url",
+          ):
+              assert required in script, f"Fastboot downloader missing {required}"
+          assert "Invoke-WebRequest -Uri $url -OutFile $dest" not in script
+          assert script.index("::add-mask::$url") < script.index("Process]::Start(")
+          assert "throw" in script and "$maxAttempts = 6" in script
+          Path("/tmp/deadzone-fastboot-download.ps1").write_text(script, encoding="utf-8")
+          print("Fastboot ROM downloader: resume, bounded retries, live metrics and URL masking OK")
+          PY
+          # Parse the exact PowerShell block used on the Windows runner.
+          # pwsh is installed on GitHub's Ubuntu hosted runners.
+          if command -v pwsh >/dev/null 2>&1; then
+            pwsh -NoProfile -Command '
+              $tokens = $null
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                "/tmp/deadzone-fastboot-download.ps1",
+                [ref]$tokens,
+                [ref]$errors
+              ) | Out-Null
+              if ($errors.Count -gt 0) {
+                $errors | ForEach-Object { Write-Error $_ }
+                exit 1
+              }
+              Write-Host "PowerShell ROM download syntax: OK"
+            '
+          else
+            echo "pwsh not available for optional PowerShell parse; static contract passed."
+          fi
+
       - name: "🛡️ Every DeadZone build runs independently"
         shell: bash
         run: |
