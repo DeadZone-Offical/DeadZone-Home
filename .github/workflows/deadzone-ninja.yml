@@ -7,26 +7,16 @@
 # run; Ninja is NOT routed through any generic dispatcher.
 #
 # Concurrency model
-# ----------------
-# Each `workflow_dispatch` invocation creates a fresh GitHub Actions
-# run with its own runner, its own workspace, its own `toolbuild/`
-# checkout, and its own log/artifact uploads. The request-id-scoped
-# key cancels a previous Ninja build for the SAME Telegram request
-# but does NOT serialize across different requests. The same user
-# re-pressing Build for the same request_id cancels their previous
-# run, which is the only safe semantic.
+# -----------------
+# Every workflow_dispatch starts an independent run, with its own runner,
+# workspace and output. No other request can replace a pending build.
+# GitHub queues requests when runner capacity is exhausted.
 
 name: 🥷 DeadZone Ninja
 
 run-name: "🥷 DeadZone-Ninja · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}"
 
-concurrency:
-  # Per-request concurrency key: two different users can dispatch Ninja
-  # at the same time and they run in parallel. The same user re-pressing
-  # Build for the same request_id cancels their previous run, which is
-  # the only safe semantic.
-  group: deadzone-home-ninja-${{ inputs.request_id }}
-  cancel-in-progress: false
+# No concurrency group: keep every build independent, even when requests overlap.
 
 on:
   workflow_dispatch:
