@@ -191,7 +191,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          for script in build.sh packROM.sh bin/port/uploadROM.sh bin/package/patchpackage.sh bin/package/Ninja/apply.sh bin/package/RefreshRate/1hz.sh; do
+          for script in build.sh packROM.sh bin/port/uploadROM.sh bin/package/patchpackage.sh bin/package/RefreshRate/1hz.sh; do
             bash -n "$script"
           done
           python3 -m unittest discover -s tests -p test_runtime_regressions.py

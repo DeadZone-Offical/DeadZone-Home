@@ -190,7 +190,6 @@ jobs:
             /notify.py
             /tests/test_runtime_regressions.py
             /bin/package/RefreshRate/1hz.sh
-            /bin/package/Ninja/patch_framework.py
 
       - name: "Run Port engine runtime regression tests"
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
