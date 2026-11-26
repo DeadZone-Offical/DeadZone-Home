@@ -1645,14 +1645,33 @@ jobs:
           # We probe exactly that path, so the link we surface is
           # always the link we actually uploaded to.
           drive_url=""
+          upload_verified=0
+          device_name=""
+          if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "refactored" && -s build/.deadzone/rom_metadata.json ]]; then
+            device_name="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(str((d.get("device",{}) or {}).get("name",""))[:120])' build/.deadzone/rom_metadata.json 2>/dev/null | tr -d '\r\n' || true)"
+          elif [[ -s bin/ddevice/name_devices.txt ]]; then
+            device_name="$(tr -d '\r\n' < bin/ddevice/name_devices.txt | cut -c1-120)"
+          fi
           if [[ -n "$final_name" && -n "$codename" && -n "$os_folder" \
                 && -n "${RCLONE_REMOTE_NAME:-}" && -n "${RCLONE_UPLOAD_DIR:-}" \
                 && -s rclone.conf ]]; then
             drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}"
-            drive_url="$(rclone --config=rclone.conf link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+            # Verify the canonical uploaded object again for BOTH engine
+            # layouts; do not publish a success link for a missing/partial ZIP.
+            if rclone --config=rclone.conf lsjson --stat "$drive_remote" 2>/dev/null | \
+                python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(0 if isinstance(d,dict) and not d.get("IsDir",True) and d.get("Size")==int(sys.argv[1]) else 1)' "$final_size_bytes"; then
+              upload_verified=1
+              drive_url="$(rclone --config=rclone.conf link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+            else
+              echo "::warning::Stable release announcement suppressed: uploaded ZIP could not be verified."
+            fi
           fi
+          printf 'DEADZONE_UPLOAD_VERIFIED=%s\nDEADZONE_RELEASE_CODENAME=%s\nDEADZONE_RELEASE_OS=%s\nDEADZONE_RELEASE_DEVICE_NAME=%s\nDEADZONE_RELEASE_ROM_VERSION=%s\n' \
+            "$upload_verified" "$codename" "$os_folder" "$device_name" "$rom_version" >> "$GITHUB_ENV"
           if [[ -n "$drive_url" ]]; then
             printf 'DEADZONE_GOOGLE_DRIVE_URL=%s\nDEADZONE_RESULT_URL=%s\n' "$drive_url" "$drive_url" >> "$GITHUB_ENV"
+          else
+            printf 'DEADZONE_GOOGLE_DRIVE_URL=\nDEADZONE_RESULT_URL=\n' >> "$GITHUB_ENV"
           fi
 
           echo "::group::Stable artifact metadata"
@@ -1674,6 +1693,10 @@ jobs:
           DEADZONE_INTEGRITY_SHA256: ${{ env.DEADZONE_INTEGRITY_SHA256 }}
           DEADZONE_GOOGLE_DRIVE_URL: ${{ env.DEADZONE_GOOGLE_DRIVE_URL }}
           DEADZONE_UPLOAD_VERIFIED: ${{ env.DEADZONE_UPLOAD_VERIFIED }}
+          DEADZONE_RELEASE_CODENAME: ${{ env.DEADZONE_RELEASE_CODENAME }}
+          DEADZONE_RELEASE_OS: ${{ env.DEADZONE_RELEASE_OS }}
+          DEADZONE_RELEASE_DEVICE_NAME: ${{ env.DEADZONE_RELEASE_DEVICE_NAME }}
+          DEADZONE_RELEASE_ROM_VERSION: ${{ env.DEADZONE_RELEASE_ROM_VERSION }}
         run: |
           set -euo pipefail
           # Terminal succeeded event. This is the source of
