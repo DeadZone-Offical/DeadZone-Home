@@ -264,23 +264,123 @@ jobs:
           if ($safeName.Length -gt 96) { $safeName = $safeName.Substring(0, 96) }
           $dest = Join-Path $romDir $safeName
 
-          Write-Host "::notice::Downloading ROM from $($parsed.Host) (length masked)"
-          $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest -Uri $url -OutFile $dest -MaximumRedirection 5 -ErrorAction Stop
-
-          if (-not (Test-Path $dest -PathType Leaf)) {
-            throw "ROM download did not produce a file at $dest"
-          }
-          $size = (Get-Item $dest).Length
-          if ($size -le 0) {
-            throw "Downloaded ROM is empty (0 bytes)"
-          }
-          Write-Host "::notice::ROM downloaded: $safeName ($size bytes)"
-
-          # Mask the URL anywhere it might appear in subsequent step
-          # output, and publish only the on-disk path + a fingerprint
-          # the engine can consume.
+          # Signed query strings may contain credentials: mask BEFORE invoking
+          # the downloader, never log the URL or HTTP response headers.
           Write-Host "::add-mask::$url"
+          $curl = (Get-Command curl.exe -ErrorAction Stop).Source
+          Write-Host "::notice::Downloading ROM from $($parsed.Host) (resumable, with progress and retries)"
+          $maxAttempts = 6
+          $canResume = $true
+          $downloaded = $false
+
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            if (-not $canResume -and (Test-Path -LiteralPath $dest)) {
+              # A server that ignores Range cannot safely append to an existing file.
+              Remove-Item -LiteralPath $dest -Force
+            }
+            $existing = 0L
+            if (Test-Path -LiteralPath $dest) {
+              $existing = (Get-Item -LiteralPath $dest).Length
+            }
+
+            # A hard connection timeout and low-speed cutoff prevent a hung
+            # host from consuming the entire 80-minute job without progress.
+            # Keep partial bytes on transient failures; -C - resumes by Range.
+            $curlArgs = @(
+              '--location', '--fail', '--silent', '--show-error',
+              '--max-redirs', '5', '--connect-timeout', '30',
+              '--speed-limit', '2048', '--speed-time', '120',
+              '--max-time', '1800', '--proto', '=https',
+              '--proto-redir', '=https'
+            )
+            if ($canResume -and $existing -gt 0) {
+              $curlArgs += @('--continue-at', '-')
+            }
+            $curlArgs += @(
+              '--output', $dest,
+              '--write-out', 'http=%{http_code} downloaded=%{size_download} speed=%{speed_download}',
+              '--', $url
+            )
+
+            # Use ArgumentList, never a shell command string: "&", query
+            # parameters and signed URLs must survive as ONE argument.
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $curl
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            foreach ($arg in $curlArgs) {
+              [void]$psi.ArgumentList.Add([string]$arg)
+            }
+            $process = [System.Diagnostics.Process]::Start($psi)
+            if ($null -eq $process) { throw 'Unable to start curl.exe downloader' }
+
+            $lastBytes = $existing
+            $lastSample = [DateTime]::UtcNow
+            try {
+              # A 20-second heartbeat exposes real bytes and transfer speed.
+              # We cannot safely claim a percentage when the server does not
+              # provide a trustworthy Content-Length for a signed URL.
+              while (-not $process.WaitForExit(20000)) {
+                $currentBytes = 0L
+                if (Test-Path -LiteralPath $dest) {
+                  $currentBytes = (Get-Item -LiteralPath $dest).Length
+                }
+                $now = [DateTime]::UtcNow
+                $seconds = [Math]::Max(1, ($now - $lastSample).TotalSeconds)
+                $mib = $currentBytes / 1MB
+                $mibPerSec = [Math]::Max(0, $currentBytes - $lastBytes) / $seconds / 1MB
+                Write-Host ("ROM transfer {0}/{1}: {2:N1} MiB saved, {3:N2} MiB/s over the last {4:N0}s" -f $attempt, $maxAttempts, $mib, $mibPerSec, $seconds)
+                $lastBytes = $currentBytes
+                $lastSample = $now
+              }
+              $exitCode = $process.ExitCode
+              $result = $process.StandardOutput.ReadToEnd().Trim()
+              $failure = $process.StandardError.ReadToEnd().Trim()
+            } finally {
+              $process.Dispose()
+            }
+
+            $total = 0L
+            if (Test-Path -LiteralPath $dest) {
+              $total = (Get-Item -LiteralPath $dest).Length
+            }
+            if ($exitCode -eq 0 -and $total -gt 0) {
+              Write-Host "::notice::ROM downloaded successfully on attempt $attempt ($total bytes; $result)"
+              $downloaded = $true
+              break
+            }
+
+            # HTTP 416 or curl 33 means that the existing bytes are not
+            # safely resumable. Restart from zero instead of corrupting ZIP.
+            if ($exitCode -eq 33 -or ($exitCode -eq 22 -and $result -match 'http=416')) {
+              $canResume = $false
+              Write-Host '::warning::Source does not accept resume; next attempt will restart cleanly.'
+            }
+            # Persistent invalid links are not network interruptions.
+            if ($exitCode -eq 22 -and $result -match 'http=(400|401|403|404|410)') {
+              throw "ROM source rejected the request (HTTP $($Matches[1])); provide a valid accessible download link."
+            }
+            Write-Host "::warning::Download attempt $attempt/$maxAttempts interrupted (curl exit $exitCode; $total bytes saved)."
+            if ($failure) {
+              # Avoid disclosing a signed URL from an unexpected curl diagnostic.
+              Write-Host "::warning::curl: $($failure.Replace($url, '[masked ROM URL]'))"
+            }
+            if ($attempt -lt $maxAttempts) {
+              Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 30))
+            }
+          }
+
+          if (-not $downloaded) {
+            throw "ROM download failed after $maxAttempts attempts; the source may be too slow or unavailable."
+          }
+
+          if (-not (Test-Path -LiteralPath $dest -PathType Leaf)) {
+            throw "ROM download did not produce a file."
+          }
+          $size = (Get-Item -LiteralPath $dest).Length
+          if ($size -le 0) { throw "Downloaded ROM is empty (0 bytes)" }
+          Write-Host "::notice::ROM downloaded: $safeName ($size bytes)"
           $sha = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
           "ROM_PATH=$dest"          | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "ROM_FILENAME=$safeName"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
