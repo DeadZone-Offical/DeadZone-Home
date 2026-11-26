@@ -1313,6 +1313,7 @@ jobs:
 
       - name: "☁️ Upload Stable ROM to Google Drive"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
+        timeout-minutes: 50
         working-directory: toolbuild
         env:
           DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
@@ -1352,36 +1353,40 @@ jobs:
           # Respect Google API throttling. Keep the same local ZIP and remote
           # path across retries; never restart the ROM build or publish a failure.
           rclone_flags=(--config="$PWD/rclone.conf" --retries 1 --low-level-retries 3
-                        --tpslimit 2 --tpslimit-burst 1)
+                        --tpslimit 2 --tpslimit-burst 1 --contimeout 30s --timeout 2m)
           drive_retry() {
-            local output="$1" errors="$2" attempt=1 delay=60 wait_seconds
-            shift 2
+            local output="$1" errors="$2" mode="$3" attempt=1 delay=60 wait_seconds rc
+            shift 3
             while true; do
-              if rclone "${rclone_flags[@]}" "$@" >"$output" 2>"$errors"; then
+              echo "Google Drive ${mode}: attempt ${attempt}/4"
+              if python3 "$GITHUB_WORKSPACE/.github/scripts/stable_upload_watchdog.py" \
+                  "$mode" "$output" "$errors" -- rclone "${rclone_flags[@]}" "$@"; then
                 return 0
+              else
+                rc=$?
               fi
-              if ! grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 503|googleapi: Error 503|backendError)' "$errors"; then
+              if [[ "$rc" != 124 ]] && ! grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 503|googleapi: Error 503|backendError)' "$errors"; then
                 return 1
               fi
               if (( attempt >= 4 )); then
-                echo "::error::Google Drive is still throttling requests after four attempts." >&2
+                echo "::error::Google Drive did not respond successfully after four attempts." >&2
                 return 1
               fi
               wait_seconds=$((delay + RANDOM % 16))
-              echo "::warning::Google Drive temporarily throttled the request. Retrying in ${wait_seconds}s."
+              echo "::warning::Google Drive temporarily unavailable or transfer stalled. Retrying in ${wait_seconds}s."
               sleep "$wait_seconds"
               attempt=$((attempt + 1))
               delay=$((delay * 2))
             done
           }
-          if ! drive_retry /tmp/rclone-upload.stdout /tmp/rclone-upload.log \
-              copyto --checksum --transfers 1 --checkers 1 --stats 30s --stats-one-line \
+          if ! drive_retry /tmp/rclone-upload.stdout /tmp/rclone-upload.log upload \
+              copyto --checksum --transfers 1 --checkers 1 --stats 30s --stats-log-level NOTICE --use-json-log \
               "$final_zip" "$drive_remote"; then
             echo "::error::Google Drive upload failed; the ROM build itself completed." >&2
             exit 1
           fi
           # Apply the same bounded retry to the remote metadata request.
-          if ! drive_retry /tmp/rclone-verify.json /tmp/rclone-verify.log lsjson "$drive_remote"; then
+          if ! drive_retry /tmp/rclone-verify.json /tmp/rclone-verify.log metadata lsjson "$drive_remote"; then
             echo "::error::Unable to confirm the uploaded Google Drive object." >&2
             exit 1
           fi
@@ -1412,7 +1417,6 @@ jobs:
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=0\n' >> "$GITHUB_ENV"
           printf 'DEADZONE_UPLOAD_VERIFIED=1\n' >> "$GITHUB_ENV"
           printf '::group::Upload\n'
-          printf '  remote: %s\n' "$drive_remote"
           printf '  bytes:  %s\n' "$local_size"
           printf '  verified by: %s\n' "$_verified_by"
           printf '::endgroup::'
