@@ -10,9 +10,7 @@ name: DeadZone-Xiaomi-Port
 
 run-name: "🔂 DeadZone-Xiaomi-Port · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}"
 
-concurrency:
-  group: deadzone-home-port-xiaomi-${{ inputs.request_id }}
-  cancel-in-progress: false
+# No concurrency group: preserve independent builds and queued requests.
 
 on:
   workflow_dispatch:
