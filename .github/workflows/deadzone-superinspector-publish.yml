@@ -37,9 +37,7 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: deadzone-home-inspector-publisher-${{ github.actor }}
-  cancel-in-progress: false
+# No concurrency group: every Inspector dispatch is preserved.
 
 jobs:
   dispatch:
