@@ -53,7 +53,7 @@ jobs:
   build:
     name: "🔂 Build DeadZone Xiaomi Port"
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     env:
       DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
       DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
@@ -139,7 +139,7 @@ jobs:
           # actually shipped its uploader. Validate the file up front so a
           # missing mirror is a clear configuration error rather than a late
           # "No such file" in the middle of the upload step.
-          for runtime_file in build_stage.py upload-mirrors.sh; do
+          for runtime_file in build_stage.py report_build_event.py upload-mirrors.sh; do
             [[ -s "runtime/${runtime_file}" ]] || {
               echo "::error::Central runtime file is missing or empty: ${runtime_file}"
               echo "::error::The Port fallback mirror cannot run without it. Re-run after DeadZone-File@main provides it."
@@ -202,7 +202,7 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
-          python3 runtime/build_stage.py starting \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" starting \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Runner allocated, fetching engine sources" || true
@@ -242,6 +242,14 @@ jobs:
             exit 1
           fi
           rclone version
+          # Fail before the expensive build if sudo drops required runtime values.
+          bash "$GITHUB_WORKSPACE/scripts/port-root-env.sh" bash -c '
+            set -euo pipefail
+            for name in RCLONE_REMOTE_NAME RCLONE_UPLOAD_DIR DEADZONE_REQUEST_ID DEADZONE_CALLBACK_URL DEADZONE_EVENT_SECRET GITHUB_ENV; do
+              [[ -n "${!name:-}" ]] || { echo "::error::Missing privileged Port runtime value: $name"; exit 1; }
+            done
+            [[ "$DEADZONE_CONTROLLED_BUILD" == 1 && -w "$GITHUB_ENV" ]]
+          '
 
       - name: "🔂 Build Stock + Port ROM"
         working-directory: toolbuild
@@ -249,7 +257,7 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
         run: |
           set -Eeuo pipefail
-          sudo -E bash build.sh \
+          bash "$GITHUB_WORKSPACE/scripts/port-root-env.sh" bash build.sh \
             "$DEADZONE_STOCK_ROM_URL" \
             "$DEADZONE_PORT_ROM_URL" \
             "$DEADZONE_SOURCE_REPOSITORY" \
@@ -273,19 +281,19 @@ jobs:
           # progress number. We emit stage transitions with no
           # percentage so the live panel still surfaces them
           # without a fake percent.
-          python3 runtime/build_stage.py downloading_stock \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" downloading_stock \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Stock ROM download finished" || true
-          python3 runtime/build_stage.py downloading_port \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" downloading_port \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Port ROM download finished" || true
-          python3 runtime/build_stage.py building_stock \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" building_stock \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Stock engine build finished" || true
-          python3 runtime/build_stage.py building_port \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" building_port \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Port engine build finished" || true
@@ -317,7 +325,7 @@ jobs:
             [[ -n "$port_rom_version" ]] && port_args+=(--port-rom-version "$port_rom_version")
           fi
           if (( ${#stock_args[@]} + ${#port_args[@]} > 0 )); then
-            python3 runtime/build_stage.py reading_rom \
+            python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" reading_rom \
               --project port_xiaomi \
               --request-id "$DEADZONE_REQUEST_ID" \
               --message "Port dual identity captured" \
@@ -331,7 +339,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
-          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log
+          bash "$GITHUB_WORKSPACE/scripts/port-root-env.sh" bash packROM.sh 2>&1 | tee -a build_action.log
 
       - name: "📡 Report packaging completion to bot"
         if: success()
@@ -342,7 +350,7 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
-          python3 runtime/build_stage.py packaging \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" packaging \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Port Super packed" || true
@@ -360,7 +368,7 @@ jobs:
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || \
             echo "::warning::Upload notification could not be delivered; continuing with the upload."
           set +e
-          sudo -E bash bin/port/uploadROM.sh 2>&1 | tee -a build_action.log
+          bash "$GITHUB_WORKSPACE/scripts/port-root-env.sh" bash bin/port/uploadROM.sh 2>&1 | tee -a build_action.log
           google_status=${PIPESTATUS[0]}
           set -e
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
@@ -568,11 +576,11 @@ jobs:
           # Terminal succeeded event with the output metadata. The
           # helper is best-effort: a callback failure must not
           # fail a build that already produced a usable artifact.
-          python3 runtime/build_stage.py uploading \
+          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" uploading \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \
             --message "Upload complete" || true
-          python3 runtime/report_build_event.py succeeded \
+          python3 "$GITHUB_WORKSPACE/runtime/report_build_event.py" succeeded \
             --project port_xiaomi \
             --message "Port build complete." || true
 
@@ -592,7 +600,7 @@ jobs:
             echo '::error::Terminal Port event cannot be signed because the central event secret is unavailable.'
             exit 1
           }
-          python3 runtime/report_build_event.py failed \
+          python3 "$GITHUB_WORKSPACE/runtime/report_build_event.py" failed \
             --project port_xiaomi \
             --message "Port ROM build failed."
 
@@ -612,7 +620,7 @@ jobs:
             echo '::error::Terminal Port event cannot be signed because the central event secret is unavailable.'
             exit 1
           }
-          python3 runtime/report_build_event.py cancelled \
+          python3 "$GITHUB_WORKSPACE/runtime/report_build_event.py" cancelled \
             --project port_xiaomi \
             --message "Port ROM build cancelled."
 
@@ -625,9 +633,9 @@ jobs:
           # (this step previously reported "Permission denied" for tens of
           # thousands of files and turned every build red), so it escalates
           # through sudo and then downgrades to a warning.
-          sudo -E rm -rf toolbuild runtime 2>/dev/null || true
+          sudo rm -rf toolbuild runtime 2>/dev/null || true
           if [[ -e toolbuild/rclone.conf ]]; then
-            sudo -E rm -f toolbuild/rclone.conf 2>/dev/null || true
+            sudo rm -f toolbuild/rclone.conf 2>/dev/null || true
           fi
           if [[ -d toolbuild || -d runtime ]]; then
             echo "::warning::Port workspace cleanup was incomplete; the runner is ephemeral so no action is required."
