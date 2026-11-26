@@ -210,3 +210,24 @@ jobs:
           set -Eeuo pipefail
           bash -n bin/package/RefreshRate/1hz.sh
           python3 -m unittest discover -s tests -p test_runtime_regressions.py -v
+
+      - name: "Checkout central signed release reporter"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/checkout@v5
+        with:
+          repository: DeadZone-Offical/DeadZone-File
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          ref: main
+          path: stable-runtime-test
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /report_build_event.py
+
+      - name: "Test verified Stable terminal release contract"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 stable-runtime-test/report_build_event.py --self-test

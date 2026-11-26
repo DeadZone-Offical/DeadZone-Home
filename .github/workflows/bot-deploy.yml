@@ -66,6 +66,12 @@ run-name: 🚀 DeadZone-Bot · ${{ github.event.inputs.mode || 'auto' }} · ${{ 
 #   No write permissions are requested.
 
 on:
+  # Revalidate and deploy only when this deployment workflow itself changes.
+  # Ordinary ROM workflow changes do not cause a bot deployment.
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bot-deploy.yml'
   workflow_dispatch:
     inputs:
       mode:
