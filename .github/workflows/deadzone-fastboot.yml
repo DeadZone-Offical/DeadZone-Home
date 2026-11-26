@@ -533,7 +533,7 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
-          # Analysis is local/read-only. Stable publication is separately queued.
+          # Analysis is local/read-only. DeadZone-Devices publication is separately queued.
           mkdir -p fastboot-profile
           echo "::group::ROM analysis"
           echo "rom_path: $ROM_PATH"
@@ -574,7 +574,7 @@ jobs:
           echo "profile_dir: $(dirname "$device_json" 2>/dev/null || echo unknown)"
 
       # Preserve existing /fastboot inputs, Windows artifact and bot callbacks.
-      # Verified publication is exclusively SuperInspector -> Stable.
+      # Verified publication is exclusively SuperInspector -> DeadZone-Devices.
       - name: "🚀 Queue verified Stock publisher in SuperInspector"
         id: flash_manifest
         if: steps.publish_creds.outputs.rom_present == 'true'
@@ -650,7 +650,7 @@ jobs:
             echo "status=dispatch_failed" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: "📣 Report verified Stable publisher queue to bot"
+      - name: "📣 Report verified Devices publisher queue to bot"
         if: success()
         shell: bash
         env:
@@ -668,7 +668,7 @@ jobs:
           fi
           codename="${{ steps.analyze.outputs.codename }}"
           queue="${{ steps.flash_manifest.outputs.status }}"
-          msg="Inspector build finished; Stable profile publication ${queue:-not_queued} (not yet verified)"
+          msg="Inspector build finished; DeadZone-Devices profile publication ${queue:-not_queued} (not yet verified)"
           if [[ -n "$codename" ]]; then
             msg="$msg — $codename"
           fi
@@ -766,7 +766,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-      - name: "🔐 Confirm verified Stable publication"
+      - name: "🔐 Confirm verified DeadZone-Devices publication"
         if: success()
         id: stable_published
         shell: bash
@@ -780,8 +780,8 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$QUEUE_STATUS" != queued ]]; then
-            echo "::error::Fastboot Inspector was packaged, but Stable publication was not dispatched (status: ${QUEUE_STATUS:-unknown})."
-            echo "### Stable profile NOT published" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Fastboot Inspector was packaged, but DeadZone-Devices publication was not dispatched (status: ${QUEUE_STATUS:-unknown})."
+            echo "### DeadZone-Devices profile NOT published" >> "$GITHUB_STEP_SUMMARY"
             echo "Dispatch status: ${QUEUE_STATUS:-unknown}" >> "$GITHUB_STEP_SUMMARY"
             echo "HTTP 404 means the private Inspector is inaccessible or its workflow is unavailable to the supplied token. Give DEADZONE_INSPECTOR_DISPATCH_TOKEN Actions: read/write on SuperInspector." >> "$GITHUB_STEP_SUMMARY"
             exit 2
@@ -822,7 +822,7 @@ jobs:
             if [[ -n "$worker" ]]; then
               IFS='|' read -r worker_id state conclusion worker_url <<< "$worker"
               if [[ "$state" == completed ]]; then
-                echo "### Verified Stable publication" >> "$GITHUB_STEP_SUMMARY"
+                echo "### Verified DeadZone-Devices publication" >> "$GITHUB_STEP_SUMMARY"
                 echo "- Worker: $worker_url" >> "$GITHUB_STEP_SUMMARY"
                 echo "- Result: $conclusion" >> "$GITHUB_STEP_SUMMARY"
                 if [[ "$conclusion" == success ]]; then
@@ -842,7 +842,7 @@ jobs:
             fi
             sleep 30
           done
-          echo "::error::Stable publication was not confirmed before timeout; inspect the private Inspector workflow."
+          echo "::error::DeadZone-Devices publication was not confirmed before timeout; inspect the private Inspector workflow."
           exit 2
 
       - name: "✅ Report successful Fastboot build"
@@ -940,9 +940,9 @@ jobs:
             if [[ -n "${ROM_FILENAME:-}" ]]; then
               echo "- ROM: \`${ROM_FILENAME}\` (sha256: \`${ROM_SHA256:-unknown}\`)"
             fi
-            echo "- Stable target: bin/DeadZone-Devices/<codename>/<OS>/"
+            echo "- Devices target: <codename>/<OS>/"
             echo "- Verified publisher queue: ${STABLE_PUBLISH_STATUS:-not_queued} (queued is not published)"
-            echo "- Verified Stable publication: ${CONFIRMED_PUBLISH_STATUS:-not_confirmed}"
+            echo "- Verified DeadZone-Devices publication: ${CONFIRMED_PUBLISH_STATUS:-not_confirmed}"
             if [[ -n "${PUBLISH_RUN_URL:-}" ]]; then
               echo "- Publisher worker: ${PUBLISH_RUN_URL}"
             fi

@@ -1,6 +1,6 @@
 # Public DeadZone-Home launcher; no Stock images or write tokens are stored
 # here. The PRIVATE Inspector workflow performs all verified publication
-# using only DEADZONE_STABLE_REPO_TOKEN to publish to Stable.
+# using DEADZONE_DEVICES_TOKEN to publish to DeadZone-Devices.
 # This is additive; the existing Windows Fastboot bot workflow is preserved.
 name: DeadZone-SuperInspector · Verified Device Publisher
 run-name: "🧩 Inspect Stock · ${{ inputs.os_version }} · ${{ github.actor }}"
