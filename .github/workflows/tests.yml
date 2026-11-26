@@ -170,7 +170,33 @@ jobs:
           bash -n scripts/port-root-env.sh
           temp_dir="$(mktemp -d)"
           trap 'rm -rf "$temp_dir"' EXIT
-          printf '#!/usr/bin/env bash\nexec "$@"\n' > "$temp_dir/sudo"
+          printf '#!/usr/bin/env bash\nexec /usr/bin/env -i "$@"\n' > "$temp_dir/sudo"
           chmod +x "$temp_dir/sudo"
           PATH="$temp_dir:$PATH" RCLONE_REMOTE_NAME=fixture RCLONE_UPLOAD_DIR='folder with spaces' DEADZONE_CONTROLLED_BUILD=1 DEADZONE_REQUEST_ID=port_xiaomi_12345678 \
             bash scripts/port-root-env.sh bash -c '[[ "$RCLONE_REMOTE_NAME" == fixture && "$RCLONE_UPLOAD_DIR" == "folder with spaces" && "$DEADZONE_CONTROLLED_BUILD" == 1 && "$DEADZONE_REQUEST_ID" == port_xiaomi_12345678 ]]'
+
+      - name: "Checkout current private Port engine test sources"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/checkout@v5
+        with:
+          repository: DeadZone-Offical/DeadZone-xiaomi_Port
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          ref: main
+          path: port-runtime-test
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /notify.py
+            /tests/test_runtime_regressions.py
+            /bin/package/RefreshRate/1hz.sh
+            /bin/package/Ninja/patch_framework.py
+
+      - name: "Run Port engine runtime regression tests"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: port-runtime-test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n bin/package/RefreshRate/1hz.sh
+          python3 -m unittest discover -s tests -p test_runtime_regressions.py -v

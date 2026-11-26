@@ -186,6 +186,16 @@ jobs:
           lfs: true
           persist-credentials: false
 
+      - name: "Validate Port engine runtime regression tests"
+        working-directory: toolbuild
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for script in build.sh packROM.sh bin/port/uploadROM.sh bin/package/patchpackage.sh bin/package/Ninja/apply.sh bin/package/RefreshRate/1hz.sh; do
+            bash -n "$script"
+          done
+          python3 -m unittest discover -s tests -p test_runtime_regressions.py
+
       - name: "📡 Report queued Port build"
         working-directory: toolbuild
         env:
@@ -276,27 +286,8 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
-          # The Xiaomi Port engine's build.sh is opaque to the
-          # workflow layer, so we cannot emit a real per-ROM
-          # progress number. We emit stage transitions with no
-          # percentage so the live panel still surfaces them
-          # without a fake percent.
-          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" downloading_stock \
-            --project port_xiaomi \
-            --request-id "$DEADZONE_REQUEST_ID" \
-            --message "Stock ROM download finished" || true
-          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" downloading_port \
-            --project port_xiaomi \
-            --request-id "$DEADZONE_REQUEST_ID" \
-            --message "Port ROM download finished" || true
-          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" building_stock \
-            --project port_xiaomi \
-            --request-id "$DEADZONE_REQUEST_ID" \
-            --message "Stock engine build finished" || true
-          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" building_port \
-            --project port_xiaomi \
-            --request-id "$DEADZONE_REQUEST_ID" \
-            --message "Port engine build finished" || true
+          # The engine reports live progress through notify.py; do not replay
+          # completed download/build stages after the engine has already finished.
           # Port dual identity: the engine writes the sanitized
           # stock + port device codenames and base ROM versions
           # into `bin/port/`. We forward each non-empty value as
@@ -325,7 +316,7 @@ jobs:
             [[ -n "$port_rom_version" ]] && port_args+=(--port-rom-version "$port_rom_version")
           fi
           if (( ${#stock_args[@]} + ${#port_args[@]} > 0 )); then
-            python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" reading_rom \
+            python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" building_port \
               --project port_xiaomi \
               --request-id "$DEADZONE_REQUEST_ID" \
               --message "Port dual identity captured" \
@@ -572,14 +563,8 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
         run: |
           set -euo pipefail
-          python3 notify.py success "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
-          # Terminal succeeded event with the output metadata. The
-          # helper is best-effort: a callback failure must not
-          # fail a build that already produced a usable artifact.
-          python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" uploading \
-            --project port_xiaomi \
-            --request-id "$DEADZONE_REQUEST_ID" \
-            --message "Upload complete" || true
+          # Only the central reporter owns the terminal success event, so the
+          # bot receives the final ZIP name, size, checksum and result URL once.
           python3 "$GITHUB_WORKSPACE/runtime/report_build_event.py" succeeded \
             --project port_xiaomi \
             --message "Port build complete." || true
