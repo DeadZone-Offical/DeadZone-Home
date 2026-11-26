@@ -27,13 +27,7 @@ name: DeadZone-Fastboot
 
 run-name: "🩺 DeadZone-Fastboot · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}"
 
-concurrency:
-  # Per-request concurrency key: two different users can dispatch
-  # Fastboot at the same time and they run in parallel. The same user
-  # re-pressing Build for the same request_id cancels their previous
-  # run, which is the only safe semantic.
-  group: deadzone-home-fastboot-${{ inputs.request_id }}
-  cancel-in-progress: false
+# No concurrency group: keep every build independent, even when requests overlap.
 
 on:
   workflow_dispatch:
