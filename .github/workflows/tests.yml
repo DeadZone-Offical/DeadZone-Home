@@ -29,34 +29,28 @@ jobs:
           python3 -c "import yaml; yaml.safe_load(open('.github/workflows/deadzone-stable.yml'))"
           echo "YAML parses OK"
 
-      - name: "🛡️ Concurrency per-ref with cancel-in-progress"
+      - name: "🛡️ Every Stable build runs independently"
         shell: bash
         run: |
           set -euo pipefail
-          # The launcher must use per-ref concurrency with cancel-in-progress: true
-          # to prevent parallel runs on the same ref from racing on the LVM volume.
-          #
-          # GitHub Actions substitutes workflow expressions in `run:` blocks
-          # BEFORE bash sees the script, so we cannot write the markup
-          # directly in a single-quoted string — the substitution would
-          # collapse it. We build the expected substring by feeding each
-          # piece through printf so no run-time expression is formed.
-          expected=$(printf '%s' '$' '{{' ' github.workflow ' '}}' '-' '$' '{{' ' github.ref ' '}}')
-          if ! grep -Fq "$expected" .github/workflows/deadzone-stable.yml; then
-              echo "::error::deadzone-stable.yml: concurrency group key is not per-ref" >&2
-              exit 1
-          fi
-          if ! grep -q '^  group: deadzone-home-stable-' \
-              .github/workflows/deadzone-stable.yml; then
-              echo "::error::deadzone-stable.yml: concurrency group key is not under the deadzone-home-stable- namespace" >&2
-              exit 1
-          fi
-          if ! grep -q '^  cancel-in-progress: true' \
-              .github/workflows/deadzone-stable.yml; then
-              echo "::error::deadzone-stable.yml: concurrency does not have cancel-in-progress: true" >&2
-              exit 1
-          fi
-          echo "Concurrency: OK (per-ref, cancel-in-progress: true)"
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          path = Path(".github/workflows/deadzone-stable.yml")
+          workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+          assert isinstance(workflow, dict), "Stable workflow must be a mapping"
+          assert "concurrency" not in workflow, (
+              "Stable must not have a workflow-level concurrency group: it could cancel or replace other builds"
+          )
+          jobs = workflow.get("jobs", {})
+          assert isinstance(jobs, dict) and jobs, "Stable has no jobs"
+          for job_id, job in jobs.items():
+              assert isinstance(job, dict) and "concurrency" not in job, (
+                  f"Stable job {job_id} must not serialize or cancel other builds"
+              )
+          print("Stable concurrency: independent runs; no workflow/job cancellation or serialization")
+          PY
 
       - name: "🛡️ Only workflow_dispatch trigger"
         shell: bash

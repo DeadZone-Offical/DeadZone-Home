@@ -112,14 +112,13 @@
 #
 # Concurrency model
 # -----------------
-# Each `workflow_dispatch` invocation creates a fresh GitHub Actions
-# run with its own runner, its own workspace, its own `toolbuild/`
-# checkout, and its own log/artifact uploads. GitHub Actions is
-# responsible for scheduling; multiple simultaneous Stable dispatches
-# become parallel independent runs (subject to repo/org concurrency
-# limits). The request-id-scoped key cancels a previous Stable build
-# for the SAME Telegram request, but does NOT serialize across
-# different requests.
+# Every workflow_dispatch starts an independent Stable run, even when
+# another user dispatches a build for the same main branch or the same
+# request ID. There is NO workflow-level or job-level concurrency group:
+# one build must never cancel or replace another build.
+# Each GitHub-hosted runner has its own isolated workspace and LVM
+# volume. GitHub schedules excess runs according to account/org
+# runner capacity; queued requests remain eligible to run.
 #
 # Why a separate workflow (not a shared dispatcher)?
 # --------------------------------------------------
@@ -171,28 +170,7 @@ name: Deadzone-Stable
 
 run-name: "🚀 Deadzone-Stable · ${{ inputs.request_id }} · ${{ inputs.builder_name || github.actor }}"
 
-concurrency:
-  # Per-ref concurrency key: only one Stable build for the
-  # same `github.ref` is ever active. A newer manual dispatch on
-  # the same ref cancels the older queued or running build before
-  # it can reserve a runner, which is the only safe semantic for
-  # a "Stable pipeline that consumes the entire 100 GB LVM volume
-  # and ~3 GB RAM per run" workload. Without this, a fast
-  # double-tap on the bot would queue two parallel runs that
-  # each try to `easimon/maximize-build-space` the same root
-  # filesystem and race each other into a `pv.img` collision.
-  #
-  # We deliberately key on `github.ref` (not `inputs.request_id`)
-  # because the request_id is a per-build identity, not a
-  # run-level lock. Two distinct Telegram dispatches on the same
-  # ref would otherwise still be allowed to run in parallel under
-  # the request_id key, which is what the duplicate-download
-  # / duplicate-pack failures of runs 38604517142 and 38610249902
-  # were: separate dispatches on the same `main` ref, each
-  # grabbing its own runner, each burning 50+ minutes, and each
-  # hitting the runner's host-IO ENOSPC at the post-pack cp.
-  group: deadzone-home-stable-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# No concurrency group: all Stable requests run independently.
 
 on:
   workflow_dispatch:
