@@ -3,6 +3,7 @@ name: DeadZone-Bot Deploy
 run-name: 🚀 DeadZone-Bot · ${{ github.event.inputs.mode || 'auto' }} · ${{ github.actor }}
 
 # Public CI/CD entry point for the DeadZone-Bot Cloudflare Worker.
+# Deploy verified Devices/main post-push Telegram codename announcements.
 # Deploy the verified Bot/main public-build policy (all five engines) and
 # five-moderator-only /cancelbuild authorization; keep deploy behavior unchanged.
 #
