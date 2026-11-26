@@ -1348,22 +1348,41 @@ jobs:
             exit 1
           fi
           drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}"
-          echo "Uploading to ${drive_remote}"
-          # `copyto --checksum` is a resumable, idempotent copy that
-          # skips the transfer when the remote object already has
-          # the same checksum. The engine's own rclone call was
-          # commented out, so this is the only upload path.
-          if ! rclone --config="$PWD/rclone.conf" copyto --checksum --retries 3 --stats 30s --stats-one-line \
-              "$final_zip" "$drive_remote" > /tmp/rclone-upload.log 2>&1; then
-            echo "::error::rclone upload to ${drive_remote} failed." >&2
-            tail -n 30 /tmp/rclone-upload.log >&2
+          echo "Uploading Stable ROM to Google Drive..."
+          # Respect Google API throttling. Keep the same local ZIP and remote
+          # path across retries; never restart the ROM build or publish a failure.
+          rclone_flags=(--config="$PWD/rclone.conf" --retries 1 --low-level-retries 3
+                        --tpslimit 2 --tpslimit-burst 1)
+          drive_retry() {
+            local output="$1" errors="$2" attempt=1 delay=60 wait_seconds
+            shift 2
+            while true; do
+              if rclone "${rclone_flags[@]}" "$@" >"$output" 2>"$errors"; then
+                return 0
+              fi
+              if ! grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 503|googleapi: Error 503|backendError)' "$errors"; then
+                return 1
+              fi
+              if (( attempt >= 4 )); then
+                echo "::error::Google Drive is still throttling requests after four attempts." >&2
+                return 1
+              fi
+              wait_seconds=$((delay + RANDOM % 16))
+              echo "::warning::Google Drive temporarily throttled the request. Retrying in ${wait_seconds}s."
+              sleep "$wait_seconds"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+          if ! drive_retry /tmp/rclone-upload.stdout /tmp/rclone-upload.log \
+              copyto --checksum --transfers 1 --checkers 1 --stats 30s --stats-one-line \
+              "$final_zip" "$drive_remote"; then
+            echo "::error::Google Drive upload failed; the ROM build itself completed." >&2
             exit 1
           fi
-          # Verify the object actually landed on the remote. A
-          # successful `rclone copyto` return code is not proof that
-          # the destination is usable.
-          if ! rclone --config="$PWD/rclone.conf" lsjson "$drive_remote" > /tmp/rclone-verify.json 2>/dev/null; then
-            echo "::error::The uploaded object ${drive_remote} could not be verified on the remote." >&2
+          # Apply the same bounded retry to the remote metadata request.
+          if ! drive_retry /tmp/rclone-verify.json /tmp/rclone-verify.log lsjson "$drive_remote"; then
+            echo "::error::Unable to confirm the uploaded Google Drive object." >&2
             exit 1
           fi
           remote_size="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[0].get("Size",0) if d else 0)' /tmp/rclone-verify.json 2>/dev/null || echo 0)"
