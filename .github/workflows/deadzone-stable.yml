@@ -1313,7 +1313,7 @@ jobs:
 
       - name: "☁️ Upload Stable ROM to Google Drive"
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
-        timeout-minutes: 50
+        timeout-minutes: 70
         working-directory: toolbuild
         env:
           DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
@@ -1350,22 +1350,40 @@ jobs:
           fi
           drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}"
           echo "Uploading Stable ROM to Google Drive..."
+          local_size="$(stat -c '%s' "$final_zip")"
+          [[ "$local_size" != 0 ]] || { echo "::error::Empty ROM ZIP"; exit 1; }
+          local_md5="$(md5sum "$final_zip" | awk '{print $1}')"
+          watchdog="$GITHUB_WORKSPACE/.github/scripts/stable_upload_watchdog.py"
           # Respect Google API throttling. Keep the same local ZIP and remote
           # path across retries; never restart the ROM build or publish a failure.
           rclone_flags=(--config="$PWD/rclone.conf" --retries 1 --low-level-retries 3
                         --tpslimit 2 --tpslimit-burst 1 --contimeout 30s --timeout 2m)
+          # After an ambiguous failure, check whether Drive already committed
+          # this exact ZIP before starting another full transfer.
+          remote_matches() {
+            python3 "$watchdog" verify "$1" "$local_size" "$local_md5"
+          }
+          probe_uploaded() {
+            python3 "$watchdog" metadata /tmp/rclone-probe.json /tmp/rclone-probe.log -- \
+              rclone "${rclone_flags[@]}" lsjson --stat --hash "$drive_remote" &&
+              remote_matches /tmp/rclone-probe.json
+          }
           drive_retry() {
             local output="$1" errors="$2" mode="$3" attempt=1 delay=60 wait_seconds rc
             shift 3
             while true; do
               echo "Google Drive ${mode}: attempt ${attempt}/4"
-              if python3 "$GITHUB_WORKSPACE/.github/scripts/stable_upload_watchdog.py" \
+              if python3 "$watchdog" \
                   "$mode" "$output" "$errors" -- rclone "${rclone_flags[@]}" "$@"; then
                 return 0
               else
                 rc=$?
               fi
-              if [[ "$rc" != 124 ]] && ! grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 503|googleapi: Error 503|backendError|i/o timeout|context deadline exceeded|TLS handshake timeout|connection reset by peer|connection timed out)' "$errors"; then
+              if [[ "$mode" == upload ]] && probe_uploaded; then
+                echo "Google Drive: existing upload verified by size and MD5; no retransmission needed."
+                return 0
+              fi
+              if [[ "$rc" != 124 ]] && ! grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 50[0234]|googleapi: Error 50[0234]|backendError|i/o timeout|context deadline exceeded|TLS handshake timeout|connection reset by peer|connection timed out)' "$errors"; then
                 return 1
               fi
               if (( attempt >= 4 )); then
@@ -1380,38 +1398,23 @@ jobs:
             done
           }
           if ! drive_retry /tmp/rclone-upload.stdout /tmp/rclone-upload.log upload \
-              copyto --checksum --transfers 1 --checkers 1 --stats 30s --stats-log-level NOTICE --use-json-log \
+              copyto --checksum --drive-chunk-size 64M --low-level-retries 2 --transfers 1 --checkers 1 --stats 30s --stats-log-level NOTICE --use-json-log \
               "$final_zip" "$drive_remote"; then
             echo "::error::Google Drive upload failed; the ROM build itself completed." >&2
             exit 1
           fi
           # Apply the same bounded retry to the remote metadata request.
-          if ! drive_retry /tmp/rclone-verify.json /tmp/rclone-verify.log metadata lsjson "$drive_remote"; then
+          if ! drive_retry /tmp/rclone-verify.json /tmp/rclone-verify.log metadata lsjson --stat --hash "$drive_remote"; then
             echo "::error::Unable to confirm the uploaded Google Drive object." >&2
             exit 1
           fi
-          remote_size="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[0].get("Size",0) if d else 0)' /tmp/rclone-verify.json 2>/dev/null || echo 0)"
-          local_size="$(stat -c '%s' "$final_zip" 2>/dev/null || echo 0)"
-          if [[ "$remote_size" != "$local_size" || "$local_size" == "0" ]]; then
-            echo "::error::Uploaded object size mismatch: local=${local_size} remote=${remote_size}" >&2
+          # Google Drive provides MD5. Do not publish an unverified or
+          # same-sized-but-different ZIP, including after ambiguous failures.
+          if ! remote_matches /tmp/rclone-verify.json; then
+            echo "::error::Uploaded object failed size/MD5 verification." >&2
             exit 1
           fi
-          # Prefer a full checksum comparison when the remote exposes a
-          # hash (Drive does, via rclone's md5 support). A size match
-          # alone would accept a corrupted-but-same-length object.
-          local_md5="$(md5sum "$final_zip" 2>/dev/null | awk '{print $1}')"
-          remote_md5="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print((d[0].get("Hashes",{}) or {}).get("md5","") if d else "")' /tmp/rclone-verify.json 2>/dev/null || true)"
-          if [[ -n "$local_md5" && -n "$remote_md5" ]]; then
-            if [[ "$local_md5" != "$remote_md5" ]]; then
-              echo "::error::Uploaded object checksum mismatch: local_md5=${local_md5} remote_md5=${remote_md5}" >&2
-              exit 1
-            fi
-            _verified_by="md5"
-          else
-            # The remote does not expose a hash; the size check above
-            # is the strongest available proof.
-            _verified_by="size"
-          fi
+          _verified_by="md5"
           # Publish the verification result so the success notification
           # and the build summary can render the public Drive link.
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=0\n' >> "$GITHUB_ENV"

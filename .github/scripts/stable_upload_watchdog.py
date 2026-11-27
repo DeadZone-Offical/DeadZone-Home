@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -38,6 +39,49 @@ def stop(process):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+def verify(path, size, md5):
+    """Accept a single remote object only when its size and MD5 match."""
+    try:
+        with open(path, encoding="utf-8") as stream:
+            item = json.load(stream)
+        if isinstance(item, list):
+            if len(item) != 1:
+                return 1
+            item = item[0]
+        if not isinstance(item, dict) or item.get("IsDir"):
+            return 1
+        hashes = item.get("Hashes") or {}
+        remote_md5 = hashes.get("MD5") or hashes.get("md5") or ""
+        return 0 if (int(size) > 0 and item.get("Size") == int(size)
+                     and re.fullmatch(r"[0-9a-fA-F]{32}", md5)
+                     and isinstance(remote_md5, str)
+                     and remote_md5.lower() == md5.lower()) else 1
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 1
+
+
+def report_failure(errors, rc):
+    # Fixed diagnostic labels only: raw rclone messages may contain private paths.
+    categories = (
+        ("rate limit", r"rateLimitExceeded|userRateLimitExceeded|too many requests|(?:HTTP|Error) (?:response code )?429"),
+        ("storage or upload quota", r"storageQuotaExceeded|dailyLimitExceeded|quota exceeded|upload limit"),
+        ("authentication or permission", r"invalid_grant|unauthorized|insufficientPermissions|permission denied|(?:HTTP|Error) (?:response code )?40[13]"),
+        ("Google backend error", r"backendError|(?:HTTP|Error) (?:response code )?50[0234]"),
+        ("network timeout or disconnect", r"timeout|deadline exceeded|connection reset|connection timed out|unexpected EOF"),
+        ("object not found", r"not found|(?:HTTP|Error) (?:response code )?404"),
+    )
+    try:
+        with open(errors, encoding="utf-8", errors="replace") as stream:
+            content = stream.read()
+    except OSError:
+        content = ""
+    label = next((name for name, pattern in categories
+                  if re.search(pattern, content, re.I)), "unclassified error")
+    if rc == 124:
+        label = "watchdog timeout" if label == "unclassified error" else label
+    print(f"::warning::Google Drive {label} (exit {rc})", flush=True)
 
 
 def run(mode, output, errors, command):
@@ -90,7 +134,12 @@ def run(mode, output, errors, command):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 5 and sys.argv[1] == "verify":
+        sys.exit(verify(sys.argv[2], sys.argv[3], sys.argv[4]))
     if len(sys.argv) < 6 or sys.argv[1] not in ("upload", "metadata") or sys.argv[4] != "--":
         sys.exit("Invalid upload watchdog arguments")
     os.umask(0o077)
-    sys.exit(run(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[5:]))
+    rc = run(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[5:])
+    if rc:
+        report_failure(sys.argv[3], rc)
+    sys.exit(rc)
