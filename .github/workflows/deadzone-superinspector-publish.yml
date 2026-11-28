@@ -1,7 +1,5 @@
-# Public DeadZone-Home launcher; no Stock images or write tokens are stored
-# here. The PRIVATE Inspector workflow performs all verified publication
-# using DEADZONE_DEVICES_TOKEN to publish to DeadZone-Devices.
-# This is additive; the existing Windows Fastboot bot workflow is preserved.
+# Public execution: all inspection and publication steps run on DeadZone-Home.
+# SuperInspector is a read-only source checkout, never a dispatched workflow.
 name: DeadZone-SuperInspector · Verified Device Publisher
 run-name: "${{ inputs.request_id != '' && format('AutoDevices · {0}', inputs.request_id) || format('🧩 Inspect Stock · {0} · {1}', inputs.os_version, github.actor) }}"
 
@@ -10,176 +8,281 @@ on:
     inputs:
       request_id:
         description: "Optional AutoDevices correlation ID"
-        required: false
         type: string
+        required: false
         default: ""
       rom_url:
-        description: "Fastboot HTTPS archive URL from Xiaomi or direct mirror"
-        required: true
+        description: "Fastboot ROM direct HTTPS URL (official Xiaomi or external mirror)"
         type: string
+        required: true
       os_version:
-        description: "Optional OS generation assertion"
-        required: true
+        description: "Optional OS1 / OS2 / OS3 / OS4 assertion; auto-detected from stock build"
         type: choice
+        required: true
         default: auto
-        options:
-          - auto
-          - OS1
-          - OS2
-          - OS3
-          - OS4
+        options: [auto, OS1, OS2, OS3, OS4]
       build_id:
-        description: "Optional official Stock build ID override"
-        required: false
+        description: "Optional stock OS build ID"
         type: string
+        required: false
         default: ""
       dry_run:
-        description: "Validate only; no Stable write"
-        required: true
+        description: "Validate and preview; do not push to Devices"
         type: boolean
+        required: true
         default: true
 
 permissions:
   contents: read
 
-# No concurrency group: every Inspector dispatch is preserved.
+# Independent dispatches: no concurrency group replaces queued runs.
 
 jobs:
-  dispatch:
-    name: Inspect Stock and verify publication
+  publish:
+    name: Inspect stock ROM and update DeadZone-Devices profile only
     runs-on: ubuntu-latest
-    timeout-minutes: 110
+    timeout-minutes: 90
     env:
-      REQUEST_ID: ${{ inputs.request_id }}
       ROM_URL: ${{ inputs.rom_url }}
       OS_VERSION: ${{ inputs.os_version }}
       BUILD_ID: ${{ inputs.build_id }}
       DRY_RUN: ${{ inputs.dry_run }}
-      INSPECTOR_DISPATCH_TOKEN: ${{ secrets.DEADZONE_INSPECTOR_DISPATCH_TOKEN || secrets.GH_TOKEN }}
-    steps:
-      - name: Validate public HTTPS Fastboot source and Inspector dispatch credentials
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ -n "${INSPECTOR_DISPATCH_TOKEN:-}" ]] || {
-            echo "::error::Configure DEADZONE_INSPECTOR_DISPATCH_TOKEN in DeadZone-Home with Actions: read/write on private DeadZone-SuperInspector."
-            exit 2
-          }
-          python3 - <<'PY'
-          import os
-          import ipaddress
-          import re
-          from pathlib import PurePosixPath
-          from urllib.parse import unquote, urlsplit
-          request_id = os.environ["REQUEST_ID"]
-          if request_id and not re.fullmatch(r"auto_home_[a-f0-9]{32}", request_id):
-              raise SystemExit("Invalid AutoDevices correlation ID")
-          u = urlsplit(os.environ["ROM_URL"])
-          host = (u.hostname or "").lower().rstrip(".")
-          name = PurePosixPath(unquote(u.path)).name
-          forbidden = (".local", ".localhost", ".lan", ".internal", ".onion", ".invalid", ".test", ".example")
-          if (u.scheme != "https" or not host or u.username or u.password or u.fragment
-                  or u.port not in (None, 443)
-                  or "." not in host or host == "localhost"
-                  or any(host.endswith(x) for x in forbidden)
-                  or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", x)
-                             for x in host.split("."))
-                  or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name)
-                  or not name.lower().endswith((".tgz", ".tar.gz", ".tar", ".zip"))):
-              raise SystemExit("Expected direct public HTTPS Fastboot archive URL")
-          try:
-              ip = ipaddress.ip_address(host)
-          except ValueError:
-              pass
-          else:
-              if not ip.is_global:
-                  raise SystemExit("Private/reserved download IP forbidden")
-          PY
+      DEVICES_TOKEN: ${{ secrets.DEADZONE_DEVICES_TOKEN || secrets.DEADZONE_STABLE_REPO_TOKEN }}
+      COMMIT_AUTHOR_EMAIL: ${{ vars.DEADZONE_AUTHOR_EMAIL || 'MEZO@users.noreply.github.com' }}
 
-      - name: Dispatch the existing verified SuperInspector publisher on main
+    steps:
+      - name: Validate credentials and controlled request
+        shell: bash
+        env:
+          READ_TOKEN: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          set -euo pipefail
+          [[ -n "$READ_TOKEN" ]] || { echo "::error::Set DEADZONE_PRIVATE_READ_TOKEN in DeadZone-Home (Contents: read on SuperInspector and Stable)."; exit 2; }
+          [[ -z "$REQUEST_ID" || "$REQUEST_ID" =~ ^auto_home_(direct_)?[a-f0-9]{32}$ ]] || { echo "::error::Invalid automatic request ID."; exit 2; }
+          if [[ "$DRY_RUN" == "false" && -z "$DEVICES_TOKEN" ]]; then
+            echo "::error::Set DEADZONE_DEVICES_TOKEN in DeadZone-Home (Contents: write on DeadZone-Devices)."
+            exit 2
+          fi
+
+      - name: Checkout private SuperInspector tools (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-SuperInspector
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout Stable verification tools (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Xiaomi-Stable
+          ref: main
+          path: stable
+          fetch-depth: 1
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Checkout DeadZone-Devices/main (only publication target)
+        uses: actions/checkout@v4
+        with:
+          repository: DeadZone-Offical/DeadZone-Devices
+          ref: main
+          path: registry
+          fetch-depth: 1
+          token: ${{ secrets.DEADZONE_DEVICES_TOKEN || secrets.DEADZONE_STABLE_REPO_TOKEN || secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install and test the device verifier
+        run: |
+          set -euo pipefail
+          python -m pip install -e ".[dev]"
+          python -m pytest -q tests/test_devices_registry_merge.py tests/test_prepare_stable_contract.py tests/test_publish_stable_only.py tests/test_push_stable_profile.py tests/test_push_device_registry.py tests/test_streaming_stock_inspect.py
+          dz-inspector --version
+
+      - name: Reserve disk space for stock archive
         shell: bash
         run: |
           set -euo pipefail
-          # Only dispatch. The PRIVATE workflow independently checks archive metadata,
-          # Fastboot targets, format, physical LP Super size and repository rights.
-          payload="$(python3 - <<'PY'
+          echo "Disk before cleanup:"
+          df -h .
+          # This workflow only needs Python and Git. Remove unused preinstalled
+          # SDKs, never the checked-out repositories or Python tool cache.
+          for sdk in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup; do
+            if [[ -d "$sdk" ]]; then
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+          echo "Disk available for stock ROM:"
+          df -h .
+
+      - name: Download HTTPS Fastboot ROM
+        id: stock
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p roms
+          ROM_FILENAME=$(python - <<'PY'
+          import os
+          from scripts.source_url_policy import validate_source_url
+          name, origin = validate_source_url(os.environ["ROM_URL"])
+          print(name)
+          PY
+          )
+          ROM_PATH="roms/$ROM_FILENAME"
+          curl --fail --show-error --silent --location --retry 3 \
+            --proto '=https' --proto-redir '=https' --max-redirs 5 \
+            --connect-timeout 20 --output "$ROM_PATH" "$ROM_URL"
+          test -s "$ROM_PATH"
+          sha256sum "$ROM_PATH"
+          df -h .
+          echo "rom_path=$ROM_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect real stock flash targets and LP metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Metadata-only path: stream a large .tgz exactly once. Never
+          # extract the full Super image or any multi-gigabyte partition.
+          python -m scripts.inspect_stock_streaming \
+            "${{ steps.stock.outputs.rom_path }}" \
+            --output stock-manifest.json
+          python -m json.tool stock-manifest.json > /dev/null
+
+      - name: Build verified OS contract without any remote registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m scripts.publish_stable_only \
+            --manifest stock-manifest.json \
+            --rom "${{ steps.stock.outputs.rom_path }}" \
+            --source-url "$ROM_URL" \
+            --build-id "$BUILD_ID" \
+            --os-version "$OS_VERSION" \
+            --out-dir stable-contract
+          python -m json.tool stable-contract/device-contract.json >/dev/null
+          python -m json.tool stable-contract/flash-manifest.json >/dev/null
+          python -m json.tool stable-contract/flash-targets.json >/dev/null
+          # The contract already carries the source SHA-256 and metadata.
+          rm -f -- "${{ steps.stock.outputs.rom_path }}"
+          df -h .
+
+      - name: Validate source with Stable's production importer (read-only Stable checkout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python stable/bin/packaging/import_verified_contract.py \
+            --artifact stable-contract \
+            --root stable/bin/DeadZone-Devices \
+            --replace
+          python stable/bin/packaging/import_verified_contract.py \
+            --check-all --root stable/bin/DeadZone-Devices
+
+      - name: Stage verified four-file contract into Devices only
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          CODE=$(python -c 'import json; print(json.load(open("stable-contract/device-contract.json"))["codename"])')
+          OS=$(python -c 'import json; print(json.load(open("stable-contract/device-contract.json"))["os_version"])')
+          PREFIX="$CODE/$OS"
+          mkdir -p "registry/$PREFIX"
+          for name in flash.json super.json format.json source.json; do
+            cmp "stable/bin/DeadZone-Devices/$PREFIX/$name" "registry/$PREFIX/$name" 2>/dev/null ||
+              cp "stable/bin/DeadZone-Devices/$PREFIX/$name" "registry/$PREFIX/$name"
+          done
+          git -C registry add -- "$PREFIX/"
+          mapfile -t STAGED < <(git -C registry diff --cached --name-only)
+          for path in "${STAGED[@]}"; do
+            case "$path" in
+              "$PREFIX/flash.json"|"$PREFIX/super.json"|"$PREFIX/format.json"|"$PREFIX/source.json") ;;
+              *) echo "::error::Out-of-scope staged path: $path"; exit 2 ;;
+            esac
+          done
+          git -C registry diff --cached --check
+          git -C registry diff --cached --stat
+          echo "codename=$CODE" >> "$GITHUB_OUTPUT"
+          echo "os_version=$OS" >> "$GITHUB_OUTPUT"
+
+      - name: Preview or publish to DeadZone-Devices/main as MEZO
+        id: published
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "published=false" >> "$GITHUB_OUTPUT"
+          if git -C registry diff --cached --quiet; then
+            echo "Verified profile already exists; nothing to publish."
+            exit 0
+          fi
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry run: profile validated, no push."
+            exit 0
+          fi
+          python -m scripts.push_device_registry \
+            --registry-dir registry \
+            --codename "${{ steps.scope.outputs.codename }}" \
+            --os-version "${{ steps.scope.outputs.os_version }}" \
+            --author-email "$COMMIT_AUTHOR_EMAIL" \
+            --max-attempts 5
+          # This runs only after push_device_registry returns successfully.
+          # The bot independently verifies this commit is on Devices/main
+          # and that all four files are new, before posting in the group.
+          echo "published=true" >> "$GITHUB_OUTPUT"
+          echo "revision=$(git -C registry rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Announce newly supported codename in DeadZoneDiscussion
+        if: ${{ !inputs.dry_run && steps.published.outputs.published == 'true' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CODE: ${{ steps.scope.outputs.codename }}
+          OS_VERSION: ${{ steps.scope.outputs.os_version }}
+          REVISION: ${{ steps.published.outputs.revision }}
+        run: |
+          set -euo pipefail
+          # DEVICES_TOKEN already checked out and pushed the PRIVATE registry.
+          # No Telegram token is exposed to GitHub Actions.
+          python3 - <<'PY' > "$RUNNER_TEMP/deadzone-device-notice.json"
           import json, os
           print(json.dumps({
-            "ref": "main",
-            "inputs": {
-              "request_id": os.environ["REQUEST_ID"],
-              "rom_url": os.environ["ROM_URL"],
-              "os_version": os.environ["OS_VERSION"],
-              "build_id": os.environ["BUILD_ID"],
-              "dry_run": os.environ["DRY_RUN"].lower()
-            }
+            "codename": os.environ["CODE"],
+            "os_version": os.environ["OS_VERSION"],
+            "revision": os.environ["REVISION"],
           }))
           PY
-          )"
-          status="$(curl --silent --show-error --max-time 35 \
-            --request POST \
-            --output "$RUNNER_TEMP/inspector-dispatch-response.json" \
+          status="$(curl --silent --show-error --location --max-time 35 \
+            --retry 2 --retry-delay 2 --retry-all-errors \
+            --output "$RUNNER_TEMP/deadzone-device-notice-response.json" \
             --write-out '%{http_code}' \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            -H "Authorization: Bearer $INSPECTOR_DISPATCH_TOKEN" \
+            -X POST \
+            -H "Authorization: Bearer $DEVICES_TOKEN" \
             -H 'Content-Type: application/json' \
-            --data "$payload" \
-            'https://api.github.com/repos/DeadZone-Offical/DeadZone-SuperInspector/actions/workflows/publish-devices.yml/dispatches')" || status="000"
-          [[ "$status" == "204" || "$status" == "200" ]] || {
-            echo "::error::Inspector workflow dispatch failed (HTTP $status). Verify the Home token has Actions: read/write on the private Inspector repo."
-            exit 2
-          }
-          echo "Verified SuperInspector publisher queued successfully."
-          {
-            echo '### Verified SuperInspector publisher queued'
-            echo ''
-            echo '- Private worker: DeadZone-Offical/DeadZone-SuperInspector'
-            echo '- Workflow: publish-devices.yml on main'
-            echo "- Dry run: $DRY_RUN"
-            echo '- 204 only means queued, **not** that validation/publication has succeeded.'
-            echo '- The private engine validates and publishes the device profile.'
-          } >> "$GITHUB_STEP_SUMMARY"
+            --data-binary "@$RUNNER_TEMP/deadzone-device-notice.json" \
+            'https://deadzone-bot.mezom8446.workers.dev/devices/published')" || status="000"
+          if [[ "$status" != "200" ]]; then
+            echo "::warning::Device profile was published, but Telegram announcement returned HTTP $status. Check Bot Worker diagnostics."
+            exit 1
+          fi
+          echo "DeadZone Bot accepted verified device announcement (or deduplicated an existing notification)."
 
-      - name: Follow verified publication to completion
-        if: inputs.request_id != ''
+      - name: Public result summary
+        if: always()
         shell: bash
+        env:
+          CODE: ${{ steps.scope.outputs.codename }}
+          OS: ${{ steps.scope.outputs.os_version }}
+          PUBLISHED: ${{ steps.published.outputs.published }}
         run: |
-          set -euo pipefail
-          base='https://api.github.com/repos/DeadZone-Offical/DeadZone-SuperInspector/actions'
-          api_get() {
-            curl --fail --silent --show-error --max-time 25 \
-              -H "Authorization: Bearer $INSPECTOR_DISPATCH_TOKEN" \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' "$1"
-          }
-          child=""
-          last=""
-          # Exact request-id matching prevents adopting a manual or unrelated run.
-          for ((attempt=1; attempt<=400; attempt++)); do
-            if [[ -z "$child" ]]; then
-              if body="$(api_get "$base/workflows/publish-devices.yml/runs?event=workflow_dispatch&per_page=100")"; then
-                child="$(jq -r --arg title "Publish Devices device · $REQUEST_ID" '[.workflow_runs[] | select(.display_title == $title)] | if length == 1 then .[0].id else empty end' <<<"$body")"
-              fi
-            fi
-            if [[ "$child" =~ ^[0-9]+$ ]]; then
-              if body="$(api_get "$base/runs/$child")"; then
-                title="$(jq -r '.display_title' <<<"$body")"
-                [[ "$title" == "Publish Devices device · $REQUEST_ID" ]] || exit 2
-                status="$(jq -r '.status' <<<"$body")"
-                conclusion="$(jq -r '.conclusion // ""' <<<"$body")"
-                if [[ "$status/$conclusion" != "$last" ]]; then
-                  echo "Inspector status: $status ${conclusion:+($conclusion)}"
-                  last="$status/$conclusion"
-                fi
-                if [[ "$status" == completed ]]; then
-                  printf '### Verified device publication\n\n- Result: **%s**\n' "$conclusion" >> "$GITHUB_STEP_SUMMARY"
-                  [[ "$conclusion" == success ]]
-                  exit
-                fi
-              fi
-            fi
-            sleep 15
-          done
-          echo "::error::Timed out waiting for the matching Inspector publication."
-          exit 2
+          {
+            echo "### DeadZone verified device publisher"
+            echo "- Execution: DeadZone-Home"
+            echo "- Codename: ${CODE:-not verified}"
+            echo "- HyperOS: ${OS:-not verified}"
+            echo "- Published: ${PUBLISHED:-false}"
+            echo "- Job status: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
