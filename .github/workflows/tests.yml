@@ -279,7 +279,7 @@ jobs:
           fi
           echo "No dispatch gate step: OK"
 
-      - name: "🩺 Verify SuperInspector bridge and legacy Fastboot remain compatible"
+      - name: "🩺 Verify direct Home publishing and legacy Fastboot compatibility"
         shell: bash
         run: |
           set -euo pipefail
@@ -314,16 +314,26 @@ jobs:
           assert "publish-central" not in fastboot_text
           assert "publish-rom-repo" not in fastboot_text
           assert "super-inspector" in fastboot_text and "ref: main" in fastboot_text
-          pub_job = publish["jobs"]["dispatch"]
+          pub_job = publish["jobs"]["publish"]
           assert pub_job["runs-on"] == "ubuntu-latest"
           assert "workflow_dispatch" in publish_text
-          assert "publish-devices.yml/dispatches" in publish_text
-          assert "DEADZONE_INSPECTOR_DISPATCH_TOKEN" in publish_text
-          assert "GH_TOKEN" in publish_text
+          assert "/dispatches" not in publish_text
+          assert "DEADZONE_INSPECTOR_DISPATCH_TOKEN" not in publish_text
+          assert "secrets.DEADZONE_PRIVATE_READ_TOKEN" in publish_text
+          assert "secrets.DEADZONE_DEVICES_TOKEN" in publish_text
           assert '"sync_stable"' not in publish_text
-          assert "secrets.DEADZONE_DEVICES_TOKEN" not in publish_text
-          assert "secrets.DEADZONE_STABLE_REPO_TOKEN" not in publish_text
-          print("Fastboot bot and DeadZone-Devices stock publishing compatibility: OK")
+          pub_steps = pub_job["steps"]
+          checks = [s["with"] for s in pub_steps if s.get("uses", "").startswith("actions/checkout@")]
+          assert {s["repository"] for s in checks} == {"DeadZone-Offical/DeadZone-SuperInspector", "DeadZone-Offical/DeadZone-Xiaomi-Stable", "DeadZone-Offical/DeadZone-Devices"}
+          assert all(s["ref"] == "main" for s in checks)
+          assert all(s.get("persist-credentials") is False for s in checks if s["repository"] != "DeadZone-Offical/DeadZone-Devices")
+          assert "scripts.inspect_stock_streaming" in publish_text
+          assert "scripts.publish_stable_only" in publish_text
+          assert "import_verified_contract.py" in publish_text
+          assert "scripts.push_device_registry" in publish_text
+          assert "actions/upload-artifact" not in publish_text
+          assert "concurrency:" not in publish_text
+          print("Legacy Fastboot preserved; verified device publishing runs entirely in Home: OK")
           PY
 
       - name: "Validate Port workflow runtime contract"
