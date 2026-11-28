@@ -1,0 +1,74 @@
+name: Replay verified Stable release 46086951168
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/replay-stable-release-46086951168.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: replay-stable-release-46086951168
+  cancel-in-progress: false
+jobs:
+  replay:
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'Replay verified zorn Stable announcement by MEZO'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm original successful build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/DeadZone-Offical/DeadZone-Home/actions/runs/46086951168 --jq '.conclusion' | grep -qx success
+      - name: Checkout central signed event reporter
+        uses: actions/checkout@v5
+        with:
+          repository: DeadZone-Offical/DeadZone-File
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: runtime
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /build.env
+            /report_build_event.py
+      - name: Verify and provision Stable release storage
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$CF_API_TOKEN"
+          # Only the additive, idempotent release table migration; never reset claims.
+          endpoint="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database/3e133a6a-edfc-4ab7-8bbc-14652e50931a/query"
+          query() {
+            local sql="$1"
+            jq -nc --arg sql "$sql" '{sql:$sql}' | curl -fsS --max-time 30 -H "Authorization: Bearer $CF_API_TOKEN" -H 'Content-Type: application/json' --data-binary @- "$endpoint"
+          }
+          query 'CREATE TABLE IF NOT EXISTS stable_public_releases (release_key TEXT PRIMARY KEY, codename TEXT NOT NULL, os TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, url TEXT NOT NULL, device_name TEXT, published_at TEXT NOT NULL, catalog_seen INTEGER NOT NULL DEFAULT 0, announcement_claimed INTEGER NOT NULL DEFAULT 0)' | jq -e '.success == true and all(.result[]; .success == true)' >/dev/null
+          query 'CREATE INDEX IF NOT EXISTS idx_stable_public_releases_device ON stable_public_releases (codename, published_at)' | jq -e '.success == true and all(.result[]; .success == true)' >/dev/null
+          query 'PRAGMA table_info(stable_public_releases)' | jq -e '[.result[].results[].name] as $cols | (["release_key","codename","os","name","size","url","device_name","published_at","catalog_seen","announcement_claimed"] - $cols) as $missing | if ($missing|length)==0 then "Stable release storage ready" else error("Missing columns: " + ($missing|join(","))) end'
+      - name: Replay the original verified release without rebuilding
+        env:
+          DEADZONE_REQUEST_ID: stable_8f8eb65a2c2245c8
+          DEADZONE_RUN_ID_OVERRIDE: '46086951168'
+          DEADZONE_RUN_URL_OVERRIDE: https://github.com/DeadZone-Offical/DeadZone-Home/actions/runs/46086951168
+          DEADZONE_CALLBACK_URL: https://deadzone-bot.mezom8446.workers.dev/build/events
+          DEADZONE_RESULT_NAME: DeadZone_Stable_V2.08_ZORN_OS4.0.3.0.XOKCNXM_ChinaStable-A17.zip
+          DEADZONE_FILE_SIZE: '6889289672'
+          DEADZONE_INTEGRITY_SHA256: d814d095764e3c1d0eca79c6b2bb257dae9f18430e22d116fb071518449a1c1f
+          DEADZONE_UPLOAD_VERIFIED: '1'
+          DEADZONE_RELEASE_CODENAME: zorn
+          DEADZONE_RELEASE_OS: OS4
+          DEADZONE_RELEASE_DEVICE_NAME: REDMI K80
+          DEADZONE_RELEASE_ROM_VERSION: OS4.0.3.0.XOKCNXM
+          DEADZONE_GOOGLE_DRIVE_URL: https://drive.google.com/open?id=1f3kP-0ShXsfI29BvGV6gWzCcfECJB09T
+        run: |
+          set -euo pipefail
+          source runtime/build.env
+          export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:?Central build signing secret unavailable}"
+          printf '::add-mask::%s\n' "$DEADZONE_EVENT_SECRET"
+          export GITHUB_RUN_NUMBER=235
+          python3 runtime/report_build_event.py succeeded --project stable --message "DeadZone Stable build complete. Verified release announcement replay."
