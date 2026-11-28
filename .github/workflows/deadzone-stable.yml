@@ -964,6 +964,15 @@ jobs:
             echo "::error::Central rclone.conf does not define expected remote: ${RCLONE_REMOTE_NAME}"
             exit 1
           fi
+          # Validate the exact retry/progress options before spending time building a ROM.
+          if ! rclone copyto --checksum --drive-chunk-size 64M --buffer-size 16M \
+              --retries 5 --low-level-retries 10 --retries-sleep 60s \
+              --transfers 1 --checkers 1 --stats 15s --stats-log-level NOTICE --use-json-log \
+              --contimeout 30s --timeout 10m --help > /tmp/rclone-flag-check.log 2>&1; then
+            echo "::error::Installed rclone does not support the Stable transfer options."
+            grep -Eo -- 'unknown (flag|shorthand flag): --[A-Za-z0-9-]+' /tmp/rclone-flag-check.log || true
+            exit 1
+          fi
           printf '::group::Rclone\n'
           rclone version | head -3
           printf '::endgroup::'
@@ -1421,7 +1430,7 @@ jobs:
           if python3 "$watchdog" upload /tmp/rclone-upload.stdout /tmp/rclone-upload.log -- \
               rclone "${rclone_flags[@]}" copyto --checksum \
               --drive-chunk-size "$chunk_size" --buffer-size "$buffer_size" \
-              --retries 5 --low-level-retries 10 --retries-sleep-time 60s \
+              --retries 5 --low-level-retries 10 --retries-sleep 60s \
               --transfers 1 --checkers 1 --stats 15s --stats-log-level NOTICE --use-json-log \
               "$final_zip" "$drive_remote"; then
             echo "[Drive] Transfer complete | awaiting confirmation"
@@ -1429,7 +1438,7 @@ jobs:
           else
             # A lost final response can still leave a complete remote object.
             # Hard quota/auth errors must not trigger more upload attempts.
-            if ! grep -Eiq 'storageQuotaExceeded|dailyLimitExceeded|uploadLimitExceeded|invalid_grant|insufficientFilePermissions|permissionDenied' /tmp/rclone-upload.log; then
+            if ! grep -Eiq 'storageQuotaExceeded|dailyLimitExceeded|uploadLimitExceeded|invalid_grant|insufficientFilePermissions|permissionDenied|unknown flag|unknown shorthand flag|invalid argument|unknown command' /tmp/rclone-upload.log; then
               echo "[Drive] Transfer ended without confirmation | checking remote after cooldown"
               sleep 60
               if verify_uploaded; then upload_verified=1; fi
@@ -1693,12 +1702,12 @@ jobs:
               if [[ "${DEADZONE_UPLOAD_VERIFIED:-0}" == 1 && "${DEADZONE_GOOGLE_UPLOAD_STATUS:-1}" == 0 ]]; then
                 upload_verified=1
               fi
-            elif rclone --config=rclone.conf --retries 3 --low-level-retries 10 --retries-sleep-time 30s lsjson --stat "$drive_remote" 2>/dev/null | \
+            elif rclone --config=rclone.conf --retries 3 --low-level-retries 10 --retries-sleep 30s lsjson --stat "$drive_remote" 2>/dev/null | \
                 python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(0 if isinstance(d,dict) and not d.get("IsDir",True) and d.get("Size")==int(sys.argv[1]) else 1)' "$final_size_bytes"; then
               upload_verified=1
             fi
             if (( upload_verified == 1 )); then
-              drive_url="$(rclone --config=rclone.conf --retries 3 --low-level-retries 10 --retries-sleep-time 30s link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+              drive_url="$(rclone --config=rclone.conf --retries 3 --low-level-retries 10 --retries-sleep 30s link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
             else
               echo "::warning::Stable release announcement suppressed: uploaded ZIP could not be verified."
             fi

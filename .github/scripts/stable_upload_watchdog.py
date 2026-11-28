@@ -89,6 +89,7 @@ def verify(path, size, md5, filename=None):
 def report_failure(errors, rc):
     # Fixed diagnostic labels only: raw rclone messages may contain private paths.
     categories = (
+        ("invalid rclone command or option", r"unknown flag|unknown shorthand flag|unknown command|invalid argument"),
         ("storage or upload quota", r"storageQuotaExceeded|dailyLimitExceeded|uploadLimitExceeded|quota exceeded|upload limit"),
         ("user rate limit", r"userRateLimitExceeded"),
         ("API rate limit", r"rateLimitExceeded|too many requests|(?:HTTP|Error) (?:response code )?429"),
@@ -106,7 +107,10 @@ def report_failure(errors, rc):
                   if re.search(pattern, content, re.I)), "unclassified error")
     if rc == 124:
         label = "watchdog timeout" if label == "unclassified error" else label
-    print(f"::warning::Google Drive {label} (exit {rc})", flush=True)
+    # CLI option names are safe and actionable; never reveal raw config or paths.
+    flag = re.search(r"unknown (?:shorthand )?flag:\s*(--[A-Za-z0-9-]+)\b", content, re.I)
+    detail = f" | unsupported option: {flag.group(1)}" if flag else ""
+    print(f"::warning::Google Drive {label} (exit {rc}){detail}", flush=True)
 
 
 def run(mode, output, errors, command):

@@ -115,12 +115,16 @@ jobs:
           body = step["run"]
           subprocess.run(["bash", "-n"], input=body, text=True, check=True)
           for flag in ('--drive-chunk-size "$chunk_size"', '--buffer-size "$buffer_size"',
-                       "--retries 5 --low-level-retries 10 --retries-sleep-time 60s",
+                       "--retries 5 --low-level-retries 10 --retries-sleep 60s",
                        "--timeout 10m", "lsjson --stat --hash", "probe_uploaded",
                        "remote_matches", "verify_uploaded", "lsjson --files-only --hash",
                        "chunk_size=256M", "chunk_size=128M", "chunk_size=64M"):
               assert flag in body, flag
           assert body.count("copyto --checksum") == 1
+          assert "--retries-sleep-time" not in pathlib.Path(".github/workflows/deadzone-stable.yml").read_text()
+          preflight = next(s["run"] for j in workflow["jobs"].values() for s in j["steps"] if s.get("name") == "☁️ Install central Rclone configuration")
+          assert "rclone copyto --checksum" in preflight and "--retries-sleep 60s" in preflight and "--help" in preflight
+          subprocess.run(["bash", "-n"], input=preflight, text=True, check=True)
           assert "--tpslimit" not in body
           assert "STALL_SECONDS" not in script.read_text()
           import contextlib, io, os
