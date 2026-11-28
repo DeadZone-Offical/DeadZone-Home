@@ -128,6 +128,36 @@ def summary():
         output.write("\n".join(out)+"\n")
     print("[DeadZone] Build summary published")
 
+# Preserve actionable diagnostics while keeping routine tool chatter compact.
+ERROR_LINE = re.compile(
+    r"\[(?:ERROR|FATAL)\]|\b(?:ERROR|FATAL|[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\s*:"
+    r"|^fatal\s*:|^Traceback \(most recent call last\):|(?:^|\s)error(?:\s+[^:\s]+)?\s*:"
+    r"|No space left on device|Permission denied|command not found|undefined reference"
+    r"|(?:failed|failure)\s+(?:to|at|with)\b|^##\[error\]", re.I)
+
+def error_detail(line):
+    # Patch engines emit JSON failures, including class/method and DEX details.
+    if line.startswith("{"):
+        try:
+            payload = json.loads(line)
+            if isinstance(payload, dict) and str(payload.get("status", "")).upper() in ("FAILED", "ERROR", "FAILED_CRITICAL"):
+                detail = payload.get("error") or payload.get("message") or payload.get("reason")
+                if detail:
+                    return str(detail)
+        except (ValueError, TypeError):
+            pass
+    if ERROR_LINE.search(line):
+        return line
+    return ""
+
+def safe_diagnostic(detail):
+    # Keep log messages single-line and prevent accidental runner commands.
+    detail = ANSI.sub("", str(detail))
+    detail = re.sub(r"[\x00-\x1f\x7f]", " ", detail)
+    detail = re.sub(r"(?i)\b(Bearer)\s+\S+", r"\1 [REDACTED]", detail)
+    detail = re.sub(r"(?i)\b((?:access_token|refresh_token|client_secret|password|api_key|authorization|token)[\"']?\s*[:=]\s*[\"']?)[^\s,\"'&}]+", r"\1[REDACTED]", detail)
+    return detail[:2400]
+
 def stream(stage):
     # Keep the display pipe alive even when a native tool emits invalid UTF-8.
     sys.stdin.reconfigure(errors="replace")
@@ -135,6 +165,7 @@ def stream(stage):
     live = LiveReporter(stage)
     seen = set()
     hidden = 0
+    active_patch = ""
     last = time.monotonic()
     for raw in sys.stdin:
         line = ANSI.sub("",raw).strip()
@@ -163,15 +194,17 @@ def stream(stage):
         elif (m:=re.search(r"ROM: File ("+SAFE_ID+r")\.img extracted\.",line)):
             msg = f"Extracted | {m[1]}"
         elif (m:=re.search(r"MODS: UpdateFile: ("+SAFE_ID+r")/("+SAFE_ID+r")$",line)):
-            msg = f"Applying | {m[1]} / {m[2]}"
+            active_patch = f"{m[1]} / {m[2]}"
+            msg = f"Applying | {active_patch}"
         elif (m:=re.search(r"\[PERF\] ZIP create: (\d+(?:\.\d+)?)s",line)):
             msg = f"Archive creation | {m[1]}s"
         elif re.search(r"storageQuotaExceeded|dailyLimitExceeded|uploadLimitExceeded",line,re.I):
             msg = "Google Drive | storage or upload quota reported"
         elif re.search(r"rateLimitExceeded|userRateLimitExceeded|too many requests",line,re.I):
             msg = "Google Drive | rate limit reported"
-        elif re.search(r"\[ERROR\]|\[FATAL\]|^fatal:|^Error:",line,re.I):
-            msg = "Engine reported an error; see stage outcome"
+        elif (detail := error_detail(line)):
+            context = stage + (f" | {active_patch}" if active_patch else "")
+            msg = f"ERROR | {context} | {safe_diagnostic(detail)}"
         elif (m:=re.search(r"Transferred:\s*([0-9.]+\s*[kMGT]?i?B)\s*/\s*([0-9.]+\s*[kMGT]?i?B),\s*(\d+)%",line)):
             msg = f"Transfer | {m[3]}% | {m[1]} / {m[2]}"
         if msg and msg not in seen:
