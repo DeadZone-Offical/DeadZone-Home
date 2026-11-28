@@ -36,6 +36,11 @@ jobs:
           python3 - <<'PY'
           import importlib.util, pathlib, yaml, subprocess, os, tempfile, re
           p = pathlib.Path(".github/scripts/deadzone_build_display.py")
+          import sys
+          sys.path.insert(0, str(p.parent.resolve()))
+          from deadzone_live_reporter import size_bytes, eta_seconds
+          assert size_bytes("1","GiB") == 1073741824
+          assert eta_seconds("1m24s") == 84
           spec = importlib.util.spec_from_file_location("display", p)
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
@@ -78,6 +83,8 @@ jobs:
           import yaml
 
           script = pathlib.Path(".github/scripts/stable_upload_watchdog.py")
+          import sys
+          sys.path.insert(0, str(script.parent.resolve()))
           spec = importlib.util.spec_from_file_location("watchdog", script)
           watchdog = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(watchdog)

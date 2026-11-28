@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from deadzone_live_reporter import LiveReporter
 
 ENV = os.environ
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -131,11 +132,13 @@ def stream(stage):
     # Keep the display pipe alive even when a native tool emits invalid UTF-8.
     sys.stdin.reconfigure(errors="replace")
     print(f"[DeadZone] {stage} | started", flush=True)
+    live = LiveReporter(stage)
     seen = set()
     hidden = 0
     last = time.monotonic()
     for raw in sys.stdin:
         line = ANSI.sub("",raw).strip()
+        live.line(line)
         msg = ""
         if (m:=re.search(r"\[Payload\] Complete \| (\d+) partitions extracted",line)):
             msg = f"Extraction | {m[1]} partitions extracted"
@@ -180,6 +183,7 @@ def stream(stage):
         if now-last>=30:
             print(f"[DeadZone] {stage} | processing",flush=True)
             last = now
+    live.close()
     print(f"[DeadZone] {stage} | output closed ({hidden} technical lines omitted from live view)",flush=True)
 
 if __name__ == "__main__":

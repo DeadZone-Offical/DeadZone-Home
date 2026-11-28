@@ -358,7 +358,7 @@ jobs:
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
-          sudo -E bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "ninja" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" 2>&1 | tee build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM engine"
+          sudo -E bash build.sh "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "ninja" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" 2>&1 | tee build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM preparation"
 
       - name: "📡 Report downloading + reading to bot"
         if: success()
@@ -426,7 +426,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "ninja" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
-          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM engine"
+          sudo -E bash packROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "Partition & super rebuild"
 
       - name: "📡 Report packaging completion to bot"
         if: success()
@@ -449,7 +449,7 @@ jobs:
           set -Eeuo pipefail
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_INPUT_URL" "ninja" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || true
           set +e
-          sudo -E bash uploadROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM engine"
+          sudo -E bash uploadROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM packaging"
           google_status=${PIPESTATUS[0]}
           set -e
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"

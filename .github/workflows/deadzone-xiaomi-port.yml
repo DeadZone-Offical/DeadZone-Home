@@ -368,7 +368,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
-          bash "$RUNNER_TEMP/port-root-env.sh" bash packROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM engine"
+          bash "$RUNNER_TEMP/port-root-env.sh" bash packROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "Partition & super rebuild"
 
       - name: "📡 Report packaging completion to bot"
         if: success()
@@ -398,7 +398,7 @@ jobs:
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || \
             echo "::warning::Upload notification could not be delivered; continuing with the upload."
           set +e
-          bash "$RUNNER_TEMP/port-root-env.sh" bash bin/port/uploadROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM engine"
+          bash "$RUNNER_TEMP/port-root-env.sh" bash bin/port/uploadROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM packaging"
           google_status=${PIPESTATUS[0]}
           set -e
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"

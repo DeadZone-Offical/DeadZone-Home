@@ -823,7 +823,7 @@ jobs:
           # `working-directory: toolbuild` and silently miss).
           runtime_dir="$GITHUB_WORKSPACE/runtime"
           if [[ -s "$runtime_dir/build_stage.py" ]]; then
-            python3 "$runtime_dir/build_stage.py" start \
+            python3 "$runtime_dir/build_stage.py" starting \
               --project stable \
               --request-id "$DEADZONE_REQUEST_ID" \
               --message "Stable build started" || true
@@ -1421,7 +1421,7 @@ jobs:
               rclone "${rclone_flags[@]}" copyto --checksum \
               --drive-chunk-size "$chunk_size" --buffer-size "$buffer_size" \
               --retries 5 --low-level-retries 10 --retries-sleep-time 60s \
-              --transfers 1 --checkers 1 --stats 30s --stats-log-level NOTICE --use-json-log \
+              --transfers 1 --checkers 1 --stats 15s --stats-log-level NOTICE --use-json-log \
               "$final_zip" "$drive_remote"; then
             echo "[Drive] Transfer complete | awaiting confirmation"
             if verify_uploaded; then upload_verified=1; fi

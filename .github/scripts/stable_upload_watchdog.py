@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import time
+from deadzone_live_reporter import LiveReporter
 
 METADATA_SECONDS = 180
 HEARTBEAT_SECONDS = 30
@@ -18,7 +19,7 @@ def number(value, default=0):
     return default
 
 
-def display(stats):
+def display(stats, live=None):
     aggregate = number(stats.get("bytes"))
     active = stats.get("transferring")
     transfer = active[0] if isinstance(active, list) and len(active) == 1 and isinstance(active[0], dict) else None
@@ -40,6 +41,11 @@ def display(stats):
     percent = f"{100 * ratio:5.1f}%" if total else "   -- "
     eta_text = f"{int(eta)}s" if eta is not None else "--"
     done = min(done, total)
+    if live is not None:
+        metrics = {"processedBytes": int(done), "totalBytes": int(total), "bytesPerSecond": int(speed), "artifactSize": int(total)}
+        if eta is not None:
+            metrics["etaSeconds"] = int(eta)
+        live.update("uploading", "uploading", "Uploading to Google Drive", **metrics)
     status = " | awaiting server response" if total and done >= total else f" | ETA {eta_text}"
     print(f"[Drive] {label} [{bar}] {percent} | {done / 1073741824:.2f}/{total / 1073741824:.2f} GiB"
           f" | {speed / 1048576:.1f} MiB/s{status}", flush=True)
@@ -106,6 +112,7 @@ def report_failure(errors, rc):
 def run(mode, output, errors, command):
     start = last_progress = last_report = time.monotonic()
     last_bytes = 0
+    live = LiveReporter('Cloud upload' if mode == 'upload' else 'Cloud verification')
     # Logs contain potentially private error details; do not stream them.
     with open(output, "wb") as out, open(errors, "wb") as err:
         process = subprocess.Popen(command, stdout=out, stderr=err)
@@ -122,7 +129,7 @@ def run(mode, output, errors, command):
                                 continue
                             stats = record.get("stats") if isinstance(record, dict) else None
                             if isinstance(stats, dict):
-                                transferred = display(stats)
+                                transferred = display(stats, live)
                                 now = time.monotonic()
                                 if transferred > last_bytes:
                                     last_progress = now
@@ -147,6 +154,7 @@ def run(mode, output, errors, command):
                     time.sleep(1)
         finally:
             stop(process)
+            live.close()
 
 
 if __name__ == "__main__":
