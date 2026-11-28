@@ -158,20 +158,83 @@ def safe_diagnostic(detail):
     detail = re.sub(r"(?i)\b((?:access_token|refresh_token|client_secret|password|api_key|authorization|token)[\"']?\s*[:=]\s*[\"']?)[^\s,\"'&}]+", r"\1[REDACTED]", detail)
     return detail[:2400]
 
+# Show useful engine information, not per-file or per-instruction noise.
+BUILD_INFO = re.compile(r"^-\s*(Device Name|Codename|BuildRegion|Android|Xiaomi Version|BuildTool Version|OS Type):\s*(.+)$")
+PROGRESS_SIZE = r"(\d+(?:\.\d+)?\s*[KMGT]?i?B)"
+
+def patch_result(line):
+    if line.startswith("{"):
+        try:
+            data = json.loads(line)
+            if isinstance(data, dict):
+                status = str(data.get("status", "")).upper()
+                if status in ("APPLIED", "ALREADY_APPLIED", "PARTIAL", "SKIPPED", "NOT_APPLICABLE", "UNSUPPORTED", "ROLLED_BACK", "DRY_RUN"):
+                    count = data.get("changed")
+                    suffix = f" | {len(count)} changes" if isinstance(count, list) and count else ""
+                    reason = data.get("reason") or data.get("message")
+                    if reason:
+                        suffix += " | " + safe_diagnostic(reason)[:240]
+                    return status.replace("_", " ").title() + suffix
+        except (ValueError, TypeError):
+            pass
+    m = re.match(r"^\[DeadZone[^\]]*\]\s*(SKIPPED|APPLIED|ALREADY_APPLIED|PARTIAL|NOT_APPLICABLE|UNSUPPORTED|ROLLED_BACK)\s*:?\s*(.*)$", line, re.I)
+    if m:
+        status, detail = m.groups()
+        return status.replace("_", " ").title() + (" | " + safe_diagnostic(detail)[:240] if detail else "")
+    return ""
+
 def stream(stage):
     # Keep the display pipe alive even when a native tool emits invalid UTF-8.
     sys.stdin.reconfigure(errors="replace")
     print(f"[DeadZone] {stage} | started", flush=True)
     live = LiveReporter(stage)
     seen = set()
-    hidden = 0
     active_patch = ""
+    metadata = {}
+    progress = {}
     last = time.monotonic()
+
+    def emit(msg):
+        nonlocal last
+        if msg and msg not in seen:
+            seen.add(msg)
+            print("[DeadZone] " + msg, flush=True)
+            last = time.monotonic()
+
+    def show_metadata():
+        if metadata:
+            fields = [("Device Name", "Device"), ("Codename", "Codename"),
+                      ("Xiaomi Version", "ROM"), ("BuildRegion", "Region"),
+                      ("Android", "Android"), ("BuildTool Version", "DeadZone"),
+                      ("OS Type", "Filesystem")]
+            emit("ROM details | " + " | ".join(f"{label}: {metadata[key]}" for key, label in fields if key in metadata))
+            metadata.clear()
+
+    def show_progress(kind, percent, detail):
+        bucket = min(100, percent) // 10
+        if bucket > progress.get(kind, -1):
+            progress[kind] = bucket
+            emit(f"{kind} | {percent}% | {detail}")
     for raw in sys.stdin:
         line = ANSI.sub("",raw).strip()
         live.line(line)
         msg = ""
-        if (m:=re.search(r"\[Payload\] Complete \| (\d+) partitions extracted",line)):
+        if (m := BUILD_INFO.match(line)):
+            key, value = m.groups()
+            if re.fullmatch(r"[A-Za-z0-9 ._()+-]{1,120}", value):
+                if key != "Xiaomi Version" or key not in metadata or len(value) >= len(metadata[key]):
+                    metadata[key] = value
+            continue
+        if metadata:
+            show_metadata()
+        if (m := re.search(r"\[#\w+\s+" + PROGRESS_SIZE + r"/" + PROGRESS_SIZE + r"\((\d+)%\).*?\bDL:" + PROGRESS_SIZE, line)):
+            done, total, percent, speed = m.groups()
+            show_progress("Download", int(percent), f"{done} / {total} | {speed}/s")
+        elif "starting a download" in line or re.search(r"Downloading \d+ item", line):
+            msg = "Downloading source ROM"
+        elif "Gathering Devices Infomations" in line or "Gathering Device Information" in line:
+            msg = "Reading device information"
+        elif (m:=re.search(r"\[Payload\] Complete \| (\d+) partitions extracted",line)):
             msg = f"Extraction | {m[1]} partitions extracted"
         elif re.search(r"\[Payload\] Extracting partitions|ROM: Unpacking payload",line):
             msg = "Extracting ROM partitions"
@@ -185,6 +248,16 @@ def stream(stage):
             msg = "Applying partition modifications"
         elif re.search(r"MODS: .*Space: installing partition apps and permissions",line):
             msg = "Installing project apps and permissions"
+        elif "Update File Done" in line:
+            active_patch = ""
+            msg = "Partition modifications completed"
+        elif (m := re.search(r"MODS: (ThemeManager|MIUISystemUIPlugin|MIUIScreenshot|MIUISecurityCenter|MiuiHome|MIUIAod):\s*([A-Za-z0-9._+-]+)$", line)):
+            active_patch = m[1]
+            msg = f"Applying | {active_patch} | {m[2]}"
+        elif (m := re.search(r"Packing \[(" + SAFE_ID + r"\.img)\] success", line)):
+            msg = f"Packed | {m[1]}"
+        elif "Successfully packed super.img" in line:
+            msg = "Super image created"
         elif "ZIP package built successfully" in line:
             msg = "ROM archive created"
         elif (m:=re.search(r"Package size: (\d+(?:\.\d+)?) (GiB|MiB|GB|MB)",line)):
@@ -205,19 +278,21 @@ def stream(stage):
         elif (detail := error_detail(line)):
             context = stage + (f" | {active_patch}" if active_patch else "")
             msg = f"ERROR | {context} | {safe_diagnostic(detail)}"
+        elif (result := patch_result(line)):
+            msg = (active_patch or stage) + " | " + result
+        elif re.match(r"^\[(?:WARN|WARNING)\]", line, re.I):
+            msg = "WARNING | " + (active_patch + " | " if active_patch else "") + safe_diagnostic(line)[:400]
         elif (m:=re.search(r"Transferred:\s*([0-9.]+\s*[kMGT]?i?B)\s*/\s*([0-9.]+\s*[kMGT]?i?B),\s*(\d+)%",line)):
-            msg = f"Transfer | {m[3]}% | {m[1]} / {m[2]}"
-        if msg and msg not in seen:
-            seen.add(msg)
-            print("[DeadZone] "+msg, flush=True)
-        else:
-            hidden += 1
+            show_progress("Transfer", int(m[3]), f"{m[1]} / {m[2]}")
+        emit(msg)
         now = time.monotonic()
-        if now-last>=30:
-            print(f"[DeadZone] {stage} | processing",flush=True)
+        if now-last>=60:
+            context = active_patch or stage
+            print(f"[DeadZone] {context} | working", flush=True)
             last = now
+    show_metadata()
     live.close()
-    print(f"[DeadZone] {stage} | output closed ({hidden} technical lines omitted from live view)",flush=True)
+    print(f"[DeadZone] {stage} | output closed", flush=True)
 
 if __name__ == "__main__":
     if len(sys.argv)>1 and sys.argv[1]=="summary":
