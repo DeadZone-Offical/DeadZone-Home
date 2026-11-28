@@ -1354,26 +1354,36 @@ jobs:
           [[ "$local_size" != 0 ]] || { echo "::error::Empty ROM ZIP"; exit 1; }
           local_md5="$(md5sum "$final_zip" | awk '{print $1}')"
           watchdog="$GITHUB_WORKSPACE/.github/scripts/stable_upload_watchdog.py"
-          # Respect Google API throttling. Keep the same local ZIP and remote
-          # path across retries; never restart the ROM build or publish a failure.
-          rclone_flags=(--config="$PWD/rclone.conf" --retries 1 --low-level-retries 3
-                        --tpslimit 2 --tpslimit-burst 1 --contimeout 30s --timeout 2m)
-          # Verify the exact remote file, not merely successful transfer bytes.
-          # Older rclone/Drive path lookups may temporarily miss a new object.
+          # Restore Lite transport tuning; rclone owns retries and chunk recovery.
+          # Python reports progress only. The workflow timeout remains the outer bound.
+          ram_avail_mb="$(free -m | awk '/^Mem:/ {print int($7)}')"
+          if (( ram_avail_mb >= 8192 )); then
+            chunk_size=256M; buffer_size=64M
+          elif (( ram_avail_mb >= 4096 )); then
+            chunk_size=128M; buffer_size=32M
+          else
+            chunk_size=64M; buffer_size=16M
+          fi
+          rclone_flags=(--config="$PWD/rclone.conf" --contimeout 30s --timeout 10m)
+          metadata_flags=(--retries 1 --low-level-retries 5)
+          echo "[Drive] Transfer settings | chunk ${chunk_size} | buffer ${buffer_size}"
           remote_matches() {
             python3 "$watchdog" verify "$1" "$local_size" "$local_md5" "$final_name"
           }
-          # Directory listing is an independent fallback for --stat lookup.
-          # The verifier requires one exact filename, size and MD5.
           probe_uploaded() {
-            local output="$1"
+            local output="$1" rc
             if python3 "$watchdog" metadata "$output" /tmp/rclone-probe.log -- \
-                rclone "${rclone_flags[@]}" lsjson --stat --hash "$drive_remote" &&
-                remote_matches "$output"; then
-              return 0
+                rclone "${rclone_flags[@]}" "${metadata_flags[@]}" lsjson --stat --hash "$drive_remote"; then
+              remote_matches "$output"
+              return $?
+            else
+              rc=$?
             fi
+            # Do not double API traffic on a quota/network failure.
+            # Fall back to a filtered listing only for a missing object.
+            if [[ "$rc" != 3 && "$rc" != 4 ]]; then return 1; fi
             if python3 "$watchdog" metadata "$output" /tmp/rclone-list.log -- \
-                rclone "${rclone_flags[@]}" lsjson --files-only --hash \
+                rclone "${rclone_flags[@]}" "${metadata_flags[@]}" lsjson --files-only --hash \
                 --include "/$final_name" "${drive_remote%/*}"; then
               remote_matches "$output"
               return $?
@@ -1382,59 +1392,38 @@ jobs:
           }
           verify_uploaded() {
             local attempt pause
-            # Bounded metadata-only polling: do not resend gigabytes after a
-            # successful copy or a lost response while Drive indexes the object.
             for attempt in 1 2 3 4; do
               echo "[Drive] Verifying file integrity | check ${attempt}/4"
-              if probe_uploaded /tmp/rclone-verify.json; then
-                return 0
-              fi
+              if probe_uploaded /tmp/rclone-verify.json; then return 0; fi
               if (( attempt < 4 )); then
-                pause=$((15 * 2 ** (attempt - 1)))
-                echo "[Drive] File not yet verified | checking again in ${pause}s"
+                pause=$((30 * 2 ** (attempt - 1) + RANDOM % 10))
+                echo "[Drive] Confirmation pending | retry in ${pause}s"
                 sleep "$pause"
               fi
             done
             return 1
           }
-          retryable_upload() {
-            local rc="$1" errors="$2"
-            if grep -Eiq '(storageQuotaExceeded|dailyLimitExceeded|uploadLimitExceeded|invalid_grant|insufficientFilePermissions)' "$errors"; then
-              return 1
-            fi
-            [[ "$rc" == 124 ]] || grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 50[0234]|googleapi: Error 50[0234]|backendError|i/o timeout|context deadline exceeded|TLS handshake timeout|connection reset by peer|connection timed out|unexpected EOF)' "$errors"
-          }
+          # --checksum skips an identical existing object without a separate probe.
+          # Keep one rclone process; never launch a second full copy from the shell.
           upload_verified=0
-          if probe_uploaded /tmp/rclone-verify.json; then
-            echo "[Drive] Identical file already verified | upload skipped"
-            upload_verified=1
+          export DEADZONE_UPLOAD_BYTES="$local_size"
+          echo "[Drive] Uploading ROM"
+          if python3 "$watchdog" upload /tmp/rclone-upload.stdout /tmp/rclone-upload.log -- \
+              rclone "${rclone_flags[@]}" copyto --checksum \
+              --drive-chunk-size "$chunk_size" --buffer-size "$buffer_size" \
+              --retries 5 --low-level-retries 10 --retries-sleep-time 60s \
+              --transfers 1 --checkers 1 --stats 30s --stats-log-level NOTICE --use-json-log \
+              "$final_zip" "$drive_remote"; then
+            echo "[Drive] Transfer complete | awaiting confirmation"
+            if verify_uploaded; then upload_verified=1; fi
           else
-            for attempt in 1 2 3; do
-              echo "[Drive] Uploading ROM | attempt ${attempt}/3"
-              if python3 "$watchdog" upload /tmp/rclone-upload.stdout /tmp/rclone-upload.log -- \
-                  rclone "${rclone_flags[@]}" copyto --checksum --drive-chunk-size 64M --low-level-retries 2 \
-                  --transfers 1 --checkers 1 --stats 30s --stats-log-level NOTICE --use-json-log \
-                  "$final_zip" "$drive_remote"; then
-                echo "[Drive] Transfer complete | awaiting confirmation"
-                if verify_uploaded; then upload_verified=1; fi
-                # Never retransmit after a successful copy merely because
-                # the independent metadata check has not caught up.
-                break
-              else
-                rc=$?
-              fi
-              if verify_uploaded; then
-                echo "[Drive] Recovered completed upload | checksum matched"
-                upload_verified=1
-                break
-              fi
-              if (( attempt == 3 )) || ! retryable_upload "$rc" /tmp/rclone-upload.log; then
-                break
-              fi
-              wait_seconds=$((60 * 2 ** (attempt - 1) + RANDOM % 16))
-              echo "::warning::[Drive] Temporary transfer error | retry in ${wait_seconds}s"
-              sleep "$wait_seconds"
-            done
+            # A lost final response can still leave a complete remote object.
+            # Hard quota/auth errors must not trigger more upload attempts.
+            if ! grep -Eiq 'storageQuotaExceeded|dailyLimitExceeded|uploadLimitExceeded|invalid_grant|insufficientFilePermissions|permissionDenied' /tmp/rclone-upload.log; then
+              echo "[Drive] Transfer ended without confirmation | checking remote after cooldown"
+              sleep 60
+              if verify_uploaded; then upload_verified=1; fi
+            fi
           fi
           if (( upload_verified != 1 )); then
             echo "::error::[Drive] ROM built successfully, but remote file integrity could not be confirmed." >&2
@@ -1687,12 +1676,18 @@ jobs:
                 && -n "${RCLONE_REMOTE_NAME:-}" && -n "${RCLONE_UPLOAD_DIR:-}" \
                 && -s rclone.conf ]]; then
             drive_remote="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${codename}/${os_folder}/${final_name}"
-            # Verify the canonical uploaded object again for BOTH engine
-            # layouts; do not publish a success link for a missing/partial ZIP.
-            if rclone --config=rclone.conf lsjson --stat "$drive_remote" 2>/dev/null | \
+            # Reuse the stronger size + MD5 result from the pre-refactor upload step.
+            # A second unpaced lookup must not invalidate that verified result.
+            if [[ "${DEADZONE_ENGINE_LAYOUT:-}" == "pre_refactor" ]]; then
+              if [[ "${DEADZONE_UPLOAD_VERIFIED:-0}" == 1 && "${DEADZONE_GOOGLE_UPLOAD_STATUS:-1}" == 0 ]]; then
+                upload_verified=1
+              fi
+            elif rclone --config=rclone.conf --retries 3 --low-level-retries 10 --retries-sleep-time 30s lsjson --stat "$drive_remote" 2>/dev/null | \
                 python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(0 if isinstance(d,dict) and not d.get("IsDir",True) and d.get("Size")==int(sys.argv[1]) else 1)' "$final_size_bytes"; then
               upload_verified=1
-              drive_url="$(rclone --config=rclone.conf link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+            fi
+            if (( upload_verified == 1 )); then
+              drive_url="$(rclone --config=rclone.conf --retries 3 --low-level-retries 10 --retries-sleep-time 30s link "$drive_remote" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
             else
               echo "::warning::Stable release announcement suppressed: uploaded ZIP could not be verified."
             fi

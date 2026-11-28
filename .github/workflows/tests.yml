@@ -71,8 +71,26 @@ jobs:
                       if s.get("name") == "☁️ Upload Stable ROM to Google Drive")
           body = step["run"]
           subprocess.run(["bash", "-n"], input=body, text=True, check=True)
-          for flag in ("--drive-chunk-size 64M", "lsjson --stat --hash", "probe_uploaded", "remote_matches", "verify_uploaded", "lsjson --files-only --hash"):
+          for flag in ('--drive-chunk-size "$chunk_size"', '--buffer-size "$buffer_size"',
+                       "--retries 5 --low-level-retries 10 --retries-sleep-time 60s",
+                       "--timeout 10m", "lsjson --stat --hash", "probe_uploaded",
+                       "remote_matches", "verify_uploaded", "lsjson --files-only --hash",
+                       "chunk_size=256M", "chunk_size=128M", "chunk_size=64M"):
               assert flag in body, flag
+          assert body.count("copyto --checksum") == 1
+          assert "--tpslimit" not in body
+          assert "STALL_SECONDS" not in script.read_text()
+          import contextlib, io, os
+          os.environ["DEADZONE_UPLOAD_BYTES"] = "1000"
+          captured = io.StringIO()
+          with contextlib.redirect_stdout(captured):
+              watchdog.display({"bytes": 500, "totalBytes": 500})
+          assert "100.0%" not in captured.getvalue()
+          captured = io.StringIO()
+          with contextlib.redirect_stdout(captured):
+              watchdog.display({"bytes": 500, "transferring": [{"bytes": 500, "size": 1000}]})
+          assert "50.0%" in captured.getvalue()
+          del os.environ["DEADZONE_UPLOAD_BYTES"]
           print("Stable upload recovery and integrity checks passed")
           PY
 

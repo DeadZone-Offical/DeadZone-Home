@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Expose only numeric rclone transfer stats; stop stalled transfers."""
+"""Expose safe numeric rclone stats without interrupting upload retries."""
 import json
 import math
 import os
@@ -8,8 +8,7 @@ import subprocess
 import sys
 import time
 
-STALL_SECONDS = 300
-METADATA_SECONDS = 120
+METADATA_SECONDS = 180
 HEARTBEAT_SECONDS = 30
 
 
@@ -23,24 +22,25 @@ def display(stats):
     aggregate = number(stats.get("bytes"))
     active = stats.get("transferring")
     transfer = active[0] if isinstance(active, list) and len(active) == 1 and isinstance(active[0], dict) else None
-    if transfer and number(transfer.get("size")):
+    expected = int(os.environ.get("DEADZONE_UPLOAD_BYTES", "0") or 0)
+    if transfer and number(transfer.get("size")) and (not expected or transfer["size"] == expected):
         done = number(transfer.get("bytes"))
         total = number(transfer.get("size"))
         speed = number(transfer.get("speedAvg"), number(transfer.get("speed")))
         eta = number(transfer.get("eta"), None)
         label = "Upload"
     else:
-        done = aggregate
-        total = number(stats.get("totalBytes"))
-        speed = number(stats.get("speed"))
-        eta = number(stats.get("eta"), None)
-        label = "Transfer"
+        # Aggregate totals can reset after an error or span several retries.
+        # Never turn these into a misleading percentage for the ROM.
+        print("[Drive] Waiting for transfer or server confirmation", flush=True)
+        return aggregate
     ratio = min(1, done / total) if total else 0
     filled = int(ratio * 20)
     bar = "=" * filled + "-" * (20 - filled)
     percent = f"{100 * ratio:5.1f}%" if total else "   -- "
     eta_text = f"{int(eta)}s" if eta is not None else "--"
-    status = " | verifying next" if total and done >= total else f" | ETA {eta_text}"
+    done = min(done, total)
+    status = " | awaiting server response" if total and done >= total else f" | ETA {eta_text}"
     print(f"[Drive] {label} [{bar}] {percent} | {done / 1073741824:.2f}/{total / 1073741824:.2f} GiB"
           f" | {speed / 1048576:.1f} MiB/s{status}", flush=True)
     return aggregate
@@ -83,8 +83,9 @@ def verify(path, size, md5, filename=None):
 def report_failure(errors, rc):
     # Fixed diagnostic labels only: raw rclone messages may contain private paths.
     categories = (
-        ("rate limit", r"rateLimitExceeded|userRateLimitExceeded|too many requests|(?:HTTP|Error) (?:response code )?429"),
-        ("storage or upload quota", r"storageQuotaExceeded|dailyLimitExceeded|quota exceeded|upload limit"),
+        ("storage or upload quota", r"storageQuotaExceeded|dailyLimitExceeded|uploadLimitExceeded|quota exceeded|upload limit"),
+        ("user rate limit", r"userRateLimitExceeded"),
+        ("API rate limit", r"rateLimitExceeded|too many requests|(?:HTTP|Error) (?:response code )?429"),
         ("authentication or permission", r"invalid_grant|unauthorized|insufficientPermissions|permission denied|(?:HTTP|Error) (?:response code )?40[13]"),
         ("Google backend error", r"backendError|(?:HTTP|Error) (?:response code )?50[0234]"),
         ("network timeout or disconnect", r"timeout|deadline exceeded|connection reset|connection timed out|unexpected EOF"),
@@ -134,13 +135,10 @@ def run(mode, output, errors, command):
                     if rc is not None:
                         return rc if rc >= 0 else 128 - rc
                     now = time.monotonic()
-                    expired = (now - start >= METADATA_SECONDS if mode == "metadata"
-                               else now - last_progress >= STALL_SECONDS)
-                    if expired:
-                        print("::warning::Google Drive request timed out"
-                              if mode == "metadata" else
-                              "::warning::No upload progress for 5 minutes; stopping attempt.",
-                              flush=True)
+                    # Only metadata requests have a local deadline. Uploads use
+                    # rclone's own timeout/backoff and the workflow time limit.
+                    if mode == "metadata" and now - start >= METADATA_SECONDS:
+                        print("::warning::Google Drive metadata request timed out", flush=True)
                         return 124
                     if now - last_report >= HEARTBEAT_SECONDS:
                         elapsed = int(now - (start if mode == "metadata" else last_progress))
