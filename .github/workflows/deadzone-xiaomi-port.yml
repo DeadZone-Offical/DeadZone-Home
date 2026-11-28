@@ -46,6 +46,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # Read this run's step timings for the public summary
 
 jobs:
   build:
@@ -67,6 +68,7 @@ jobs:
 
     steps:
       - name: "🔐 Validate Port request"
+        id: request
         shell: python
         env:
           STOCK_ROM_URL: ${{ inputs.stock_rom_url }}
@@ -225,6 +227,7 @@ jobs:
           java-version: "17"
 
       - name: "🧰 Install Port dependencies"
+        id: deps
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
@@ -295,6 +298,7 @@ jobs:
           '
 
       - name: "🔂 Build Stock + Port ROM"
+        id: build_rom
         working-directory: toolbuild
         env:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
@@ -307,7 +311,7 @@ jobs:
             port \
             "$DEADZONE_BUILDER_NAME" \
             "$DEADZONE_BUILDER_ID" \
-            2>&1 | tee build_action.log
+            2>&1 | tee build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM preparation"
 
       - name: "📡 Report per-ROM stage progress to bot"
         if: success()
@@ -357,13 +361,14 @@ jobs:
           fi
 
       - name: "📦 Pack Port ROM"
+        id: pack_rom
         working-directory: toolbuild
         env:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
         run: |
           set -Eeuo pipefail
           python3 notify.py pack "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID"
-          bash "$RUNNER_TEMP/port-root-env.sh" bash packROM.sh 2>&1 | tee -a build_action.log
+          bash "$RUNNER_TEMP/port-root-env.sh" bash packROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM engine"
 
       - name: "📡 Report packaging completion to bot"
         if: success()
@@ -380,6 +385,7 @@ jobs:
             --message "Port Super packed" || true
 
       - name: "🗜️ Package and upload Google Drive"
+        id: upload_rom
         working-directory: toolbuild
         env:
           DEADZONE_EVENT_SECRET: ${{ env.BUILD_PROGRESS_SECRET }}
@@ -392,7 +398,7 @@ jobs:
           python3 notify.py upload "$DEADZONE_SOURCE_REPOSITORY" "$DEADZONE_STOCK_ROM_URL" "port" "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" || \
             echo "::warning::Upload notification could not be delivered; continuing with the upload."
           set +e
-          bash "$RUNNER_TEMP/port-root-env.sh" bash bin/port/uploadROM.sh 2>&1 | tee -a build_action.log
+          bash "$RUNNER_TEMP/port-root-env.sh" bash bin/port/uploadROM.sh 2>&1 | tee -a build_action.log | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM engine"
           google_status=${PIPESTATUS[0]}
           set -e
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
@@ -590,6 +596,7 @@ jobs:
           fi
 
       - name: "✅ Report successful Port build"
+        id: release
         if: success()
         working-directory: toolbuild
         env:
@@ -663,42 +670,19 @@ jobs:
         if: always()
         shell: bash
         env:
-          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
-          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
-          DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
-          DEADZONE_GOOGLE_UPLOAD_STATUS: ${{ env.DEADZONE_GOOGLE_UPLOAD_STATUS }}
-          DEADZONE_GOOGLE_DRIVE_URL: ${{ env.DEADZONE_GOOGLE_DRIVE_URL }}
-          DEADZONE_RESULT_URL: ${{ env.DEADZONE_RESULT_URL }}
+          DZ_SUMMARY_PROJECT: "Port"
+          DZ_JOB_STATUS: ${{ job.status }}
+          DZ_TIMING_TOKEN: ${{ github.token }}
+          DZ_SUMMARY_STAGES: |
+            Request validation|🔐 Validate Port request|${{ steps.request.outcome }}
+            Toolchain preparation|🧰 Install Port dependencies|${{ steps.deps.outcome }}
+            Stock & port preparation|🔂 Build Stock + Port ROM|${{ steps.build_rom.outcome }}
+            Partition & super rebuild|📦 Pack Port ROM|${{ steps.pack_rom.outcome }}
+            ROM packaging & cloud upload|🗜️ Package and upload Google Drive|${{ steps.upload_rom.outcome }}
+            Release notification|✅ Report successful Port build|${{ steps.release.outcome }}
         run: |
-          {
-            echo "## 🔂 DeadZone-Xiaomi-Port build"
-            echo
-            echo "- Project: \`DeadZone-Xiaomi-Port\`"
-            echo "- Engine repository: \`DeadZone-Offical/DeadZone-xiaomi_Port\`"
-            echo "- Request ID: \`${DEADZONE_REQUEST_ID}\`"
-            echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
-            [[ -n "${DEADZONE_RESULT_NAME:-}" ]] && echo "- Final ZIP: \`${DEADZONE_RESULT_NAME}\`"
-            [[ -n "${DEADZONE_GOOGLE_UPLOAD_STATUS:-}" ]] && echo "- Google Drive status: \`${DEADZONE_GOOGLE_UPLOAD_STATUS}\`"
-            # Re-validate here as well. The summary is generated in a later step
-            # from the exported environment, so it is the last place a malformed
-            # value could still be shown to users, and it must not print secret
-            # query material even if a mirror ever returns a signed URL.
-            redact_summary_url() {
-              sed -E 's#([?&](token|access_token|id_token|refresh_token|signature|key|secret|auth|password)=)[^&[:space:]]*#\1REDACTED#gI'
-            }
-            if [[ -n "${DEADZONE_GOOGLE_DRIVE_URL:-}" ]]; then
-              if [[ "${DEADZONE_GOOGLE_DRIVE_URL}" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/|\?|$) ]]; then
-                echo "- Drive URL: $(printf '%s' "$DEADZONE_GOOGLE_DRIVE_URL" | redact_summary_url)"
-              else
-                echo "- Drive URL: _(unusable URL was produced and withheld)_"
-              fi
-            fi
-            if [[ -n "${DEADZONE_RESULT_URL:-}" ]]; then
-              if [[ "${DEADZONE_RESULT_URL}" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/|\?|$) ]]; then
-                echo "- Download URL: $(printf '%s' "$DEADZONE_RESULT_URL" | redact_summary_url)"
-              else
-                echo "- Download URL: _(unusable URL was produced and withheld)_"
-              fi
-            fi
-            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" ]]; then
+            python "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" summary || echo "::warning::Build summary unavailable."
+          else
+            printf "## DeadZone Build System\n\nBuild status: %s\n" "$DZ_JOB_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          fi

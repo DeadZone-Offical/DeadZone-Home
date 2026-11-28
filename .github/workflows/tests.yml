@@ -29,6 +29,42 @@ jobs:
           python3 -c "import yaml; yaml.safe_load(open('.github/workflows/deadzone-stable.yml'))"
           echo "YAML parses OK"
 
+      - name: "Validate public build presentation"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import importlib.util, pathlib, yaml, subprocess, os, tempfile, re
+          p = pathlib.Path(".github/scripts/deadzone_build_display.py")
+          spec = importlib.util.spec_from_file_location("display", p)
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          assert mod.drive_link("https://drive.google.com/open?id=abcdef123456&token=secret") == "https://drive.google.com/open?id=abcdef123456"
+          assert not mod.drive_link("https://evil.example/open?id=abcdef123456")
+          assert mod.duration("2026-11-28T00:00:00Z", "2026-11-28T00:01:30Z") == "01m 30s"
+          result = subprocess.run(["python3", str(p), "stream", "Test"], input="[INFO] Removing directory: /private/path\n[Payload] Complete | 41 partitions extracted\n", text=True, capture_output=True, check=True)
+          assert "41 partitions extracted" in result.stdout and "/private/path" not in result.stdout
+          for name in ("stable", "lite", "ninja", "xiaomi-port", "fastboot"):
+              workflow = yaml.safe_load(pathlib.Path(f".github/workflows/deadzone-{name}.yml").read_text())
+              for job in workflow["jobs"].values():
+                  steps = job["steps"]
+                  summary = next(s for s in steps if s.get("name") == "📣 Build summary")
+                  assert summary["if"] == "always()"
+                  explicit_ids = [s["id"] for s in steps if "id" in s]
+                  assert len(explicit_ids) == len(set(explicit_ids)), name
+                  ids = set(explicit_ids)
+                  for step_id in re.findall(r"steps\.([a-z_]+)\.outcome", summary["env"]["DZ_SUMMARY_STAGES"]):
+                      assert step_id in ids, step_id
+                  subprocess.run(["bash", "-n"], input=summary["run"], text=True, check=True)
+          with tempfile.TemporaryDirectory() as temp:
+              target = pathlib.Path(temp) / "summary.md"
+              env = dict(os.environ, GITHUB_STEP_SUMMARY=str(target), DZ_JOB_STATUS="failure", DZ_SUMMARY_PROJECT="Stable", DEADZONE_RESULT_NAME="rom.zip", DEADZONE_RESULT_SIZE="123", DEADZONE_GOOGLE_UPLOAD_STATUS="1", DEADZONE_GOOGLE_DRIVE_URL="https://drive.google.com/open?id=abcdef123456")
+              env.pop("DZ_TIMING_TOKEN", None)
+              subprocess.run(["python3", str(p), "summary"], env=env, check=True)
+              content = target.read_text(encoding="utf-8")
+              assert "Build did not complete" in content and "Ready" in content and "Download ROM" not in content
+          PY
+
       - name: "Verify Stable upload recovery and integrity"
         shell: bash
         run: |

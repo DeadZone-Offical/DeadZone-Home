@@ -59,6 +59,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # Read this run's step timings for the public summary
 
 jobs:
   build-fastboot-inspector:
@@ -82,6 +83,7 @@ jobs:
 
     steps:
       - name: "🧾 Validate controlled request"
+        id: request
         shell: python
         env:
           INPUT_URL: ${{ inputs.input_url }}
@@ -232,6 +234,7 @@ jobs:
           persist-credentials: false
 
       - name: "📥 Download ROM"
+        id: download_rom
         shell: pwsh
         env:
           ROM_URL: ${{ inputs.input_url }}
@@ -439,6 +442,7 @@ jobs:
           python-version: "3.12"
 
       - name: "📦 Install build dependencies"
+        id: deps
         shell: pwsh
         env:
           ROM_PATH: ${{ env.ROM_PATH }}
@@ -519,6 +523,7 @@ jobs:
           }
 
       - name: "🛠️ Build Inspector distribution"
+        id: build_rom
         shell: bash
         env:
           ROM_PATH: ${{ env.ROM_PATH }}
@@ -787,6 +792,7 @@ jobs:
           fi
 
       - name: "🗜️ Package artifact"
+        id: package_rom
         shell: pwsh
         env:
           ROM_URL: ${{ env.ROM_URL }}
@@ -844,6 +850,7 @@ jobs:
             --message "Inspector packaged" || true
 
       - name: "⬆️ Upload Windows artifact"
+        id: upload_rom
         uses: actions/upload-artifact@v4
         with:
           name: DeadZoneFastbootInspector-Windows
@@ -940,6 +947,7 @@ jobs:
           exit 2
 
       - name: "✅ Report successful Fastboot build"
+        id: release
         if: success()
         shell: bash
         env:
@@ -1014,31 +1022,26 @@ jobs:
         if: always()
         shell: bash
         env:
-          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
-          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
-          ROM_FILENAME: ${{ env.ROM_FILENAME }}
-          ROM_SHA256: ${{ env.ROM_SHA256 }}
-          ROM_URL: ${{ env.ROM_URL }}
+          DZ_SUMMARY_PROJECT: "Fastboot / SuperInspector"
+          DZ_JOB_STATUS: ${{ job.status }}
+          DZ_TIMING_TOKEN: ${{ github.token }}
+          DZ_SUMMARY_STAGES: |
+            Request validation|🧾 Validate controlled request|${{ steps.request.outcome }}
+            Stock ROM download|📥 Download ROM|${{ steps.download_rom.outcome }}
+            Toolchain preparation|📦 Install build dependencies|${{ steps.deps.outcome }}
+            Inspector distribution|🛠️ Build Inspector distribution|${{ steps.build_rom.outcome }}
+            Device profile analysis|📊 Analyze ROM and emit device profile|${{ steps.analyze.outcome }}
+            Publisher dispatch|🚀 Queue verified Stock publisher in SuperInspector|${{ steps.flash_manifest.outcome }}
+            Artifact packaging|🗜️ Package artifact|${{ steps.package_rom.outcome }}
+            Windows artifact upload|⬆️ Upload Windows artifact|${{ steps.upload_rom.outcome }}
+            Device publication confirmation|🔐 Confirm verified DeadZone-Devices publication|${{ steps.stable_published.outcome }}
+            Release notification|✅ Report successful Fastboot build|${{ steps.release.outcome }}
           PUBLISH_CODENAME: ${{ steps.analyze.outputs.codename }}
           STABLE_PUBLISH_STATUS: ${{ steps.flash_manifest.outputs.status }}
           CONFIRMED_PUBLISH_STATUS: ${{ steps.stable_published.outputs.status }}
-          PUBLISH_RUN_URL: ${{ steps.stable_published.outputs.run_url }}
         run: |
-          {
-            echo "## 🩺 DeadZone-Fastboot build"
-            echo
-            echo "- Project: \`DeadZone-Fastboot\`"
-            echo "- Engine repository: \`DeadZone-Offical/DeadZone-SuperInspector\` (ref: \`main\`)"
-            echo "- Request ID: \`${DEADZONE_REQUEST_ID}\`"
-            echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
-            if [[ -n "${ROM_FILENAME:-}" ]]; then
-              echo "- ROM: \`${ROM_FILENAME}\` (sha256: \`${ROM_SHA256:-unknown}\`)"
-            fi
-            echo "- Devices target: <codename>/<OS>/"
-            echo "- Verified publisher queue: ${STABLE_PUBLISH_STATUS:-not_queued} (queued is not published)"
-            echo "- Verified DeadZone-Devices publication: ${CONFIRMED_PUBLISH_STATUS:-not_confirmed}"
-            if [[ -n "${PUBLISH_RUN_URL:-}" ]]; then
-              echo "- Publisher worker: ${PUBLISH_RUN_URL}"
-            fi
-            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" ]]; then
+            python "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" summary || echo "::warning::Build summary unavailable."
+          else
+            printf "## DeadZone Build System\n\nBuild status: %s\n" "$DZ_JOB_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          fi

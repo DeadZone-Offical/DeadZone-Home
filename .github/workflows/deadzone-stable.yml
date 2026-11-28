@@ -202,6 +202,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # Read this run's step timings for the public summary
 
 jobs:
   build:
@@ -227,6 +228,7 @@ jobs:
     steps:
 
       - name: "🧾 Validate controlled request"
+        id: request
         shell: python
         env:
           INPUT_URL: ${{ inputs.input_url }}
@@ -856,6 +858,7 @@ jobs:
           java-version: "17"
 
       - name: "🧰 Install Stable dependencies"
+        id: deps
         working-directory: toolbuild
         run: |
           set -Eeuo pipefail
@@ -965,6 +968,7 @@ jobs:
           printf '::endgroup::'
 
       - name: "🚀 Build, release, and upload Stable ROM (refactored layout)"
+        id: combined_rom
         if: env.DEADZONE_ENGINE_LAYOUT == 'refactored'
         working-directory: toolbuild
         env:
@@ -1043,7 +1047,7 @@ jobs:
           # wrapper) disappears, which prevents a zombie `tail`
           # from blocking the step on the SIGPIPE of the old
           # `tee`-based pipeline.
-          tail -n +1 -F --pid="$build_pid" "$log_path" || true
+          tail -n +1 -F --pid="$build_pid" "$log_path" | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM preparation" || true
           wait "$build_pid"
           google_status=$?
           printf 'DEADZONE_GOOGLE_UPLOAD_STATUS=%s\n' "$google_status" >> "$GITHUB_ENV"
@@ -1054,6 +1058,7 @@ jobs:
           exit "$google_status"
 
       - name: "🚀 Build Stable ROM (pre-refactor layout)"
+        id: build_rom
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor'
         working-directory: toolbuild
         env:
@@ -1099,13 +1104,14 @@ jobs:
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" \
             > "$log_path" 2>&1 &
           build_pid=$!
-          tail -n +1 -F --pid="$build_pid" "$log_path" || true
+          tail -n +1 -F --pid="$build_pid" "$log_path" | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM preparation" || true
           wait "$build_pid"
           build_status=$?
           printf 'DEADZONE_BUILD_STATUS=%s\n' "$build_status" >> "$GITHUB_ENV"
           exit "$build_status"
 
       - name: "📦 Pack Stable ROM (pre-refactor layout)"
+        id: pack_rom
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
         working-directory: toolbuild
         env:
@@ -1149,7 +1155,7 @@ jobs:
           log_path="$PWD/build_action.log"
           sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" stdbuf -oL -eL bash packROM.sh > "$log_path" 2>&1 &
           pack_pid=$!
-          tail -n +1 -F --pid="$pack_pid" "$log_path" || true
+          tail -n +1 -F --pid="$pack_pid" "$log_path" | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "Partition & super rebuild" || true
           wait "$pack_pid"
           pack_status=$?
           if (( pack_status != 0 )); then
@@ -1169,6 +1175,7 @@ jobs:
           printf '::endgroup::'
 
       - name: "📦 Stage and ZIP Stable ROM (pre-refactor layout)"
+        id: package_rom
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
         working-directory: toolbuild
         env:
@@ -1238,7 +1245,7 @@ jobs:
           set +e
           sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" stdbuf -oL -eL bash uploadROM.sh > "$log_path" 2>&1 &
           upload_pid=$!
-          tail -n +1 -F --pid="$upload_pid" "$log_path" || true
+          tail -n +1 -F --pid="$upload_pid" "$log_path" | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM packaging" || true
           wait "$upload_pid"
           upload_status=$?
           set -e
@@ -1263,6 +1270,7 @@ jobs:
           printf 'DEADZONE_RESULT_NAME=%s\n' "$final_name" >> "$GITHUB_ENV"
 
       - name: "🗂️ Capture Stable artifact"
+        id: capture_rom
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
         working-directory: toolbuild
         env:
@@ -1312,6 +1320,7 @@ jobs:
           echo "Captured Stable ZIP: ${final_name} (${_zip_bytes} bytes, SHA-256=${_dst_sha})"
 
       - name: "☁️ Upload Stable ROM to Google Drive"
+        id: upload_rom
         if: env.DEADZONE_ENGINE_LAYOUT == 'pre_refactor' && success()
         timeout-minutes: 70
         working-directory: toolbuild
@@ -1552,6 +1561,7 @@ jobs:
             --message "Upload complete" || true
 
       - name: "🗂️ Collect Stable artifact metadata"
+        id: metadata
         if: success()
         working-directory: toolbuild
         env:
@@ -1708,6 +1718,7 @@ jobs:
           echo "::endgroup::"
 
       - name: "✅ Send success notification"
+        id: release
         if: success()
         working-directory: toolbuild
         env:
@@ -2102,20 +2113,23 @@ jobs:
         if: always()
         shell: bash
         env:
-          DEADZONE_REQUEST_ID: ${{ inputs.request_id }}
-          DEADZONE_BUILDER_NAME: ${{ inputs.builder_name }}
-          DEADZONE_RESULT_NAME: ${{ env.DEADZONE_RESULT_NAME }}
-          DEADZONE_GOOGLE_DRIVE_URL: ${{ env.DEADZONE_GOOGLE_DRIVE_URL }}
+          DZ_SUMMARY_PROJECT: "Stable"
+          DZ_JOB_STATUS: ${{ job.status }}
+          DZ_TIMING_TOKEN: ${{ github.token }}
+          DZ_SUMMARY_STAGES: |
+            Request validation|🧾 Validate controlled request|${{ steps.request.outcome }}
+            Toolchain preparation|🧰 Install Stable dependencies|${{ steps.deps.outcome }}
+            ROM preparation & modifications|🚀 Build Stable ROM (pre-refactor layout)|${{ steps.build_rom.outcome }}
+            Partition & super rebuild|📦 Pack Stable ROM (pre-refactor layout)|${{ steps.pack_rom.outcome }}
+            ROM packaging|📦 Stage and ZIP Stable ROM (pre-refactor layout)|${{ steps.package_rom.outcome }}
+            Artifact capture|🗂️ Capture Stable artifact|${{ steps.capture_rom.outcome }}
+            Google Drive upload & verification|☁️ Upload Stable ROM to Google Drive|${{ steps.upload_rom.outcome }}
+            Build, package & upload (integrated)|🚀 Build, release, and upload Stable ROM (refactored layout)|${{ steps.combined_rom.outcome }}
+            Release metadata|🗂️ Collect Stable artifact metadata|${{ steps.metadata.outcome }}
+            Release notification|✅ Send success notification|${{ steps.release.outcome }}
         run: |
-          {
-            echo "## 🚀 Deadzone-Stable build"
-            echo
-            echo "- Project: \`Deadzone-Stable\`"
-            echo "- Engine repository: \`DeadZone-Offical/DeadZone-Xiaomi-Stable\`"
-            echo "- Device configuration source: \`DeadZone-Offical/DeadZone-SuperInspector\` → \`bin/DeviceConfig/<codename>/<codename>.json\`"
-            echo "- Request ID: \`${DEADZONE_REQUEST_ID}\`"
-            echo "- Builder: \`${DEADZONE_BUILDER_NAME:-anonymous}\`"
-            [[ -n "${DEADZONE_RESULT_NAME:-}" ]] && echo "- Final ZIP: \`${DEADZONE_RESULT_NAME}\`"
-            [[ -n "${DEADZONE_GOOGLE_DRIVE_URL:-}" ]] && echo "- Drive URL: ${DEADZONE_GOOGLE_DRIVE_URL}"
-            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" ]]; then
+            python "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" summary || echo "::warning::Build summary unavailable."
+          else
+            printf "## DeadZone Build System\n\nBuild status: %s\n" "$DZ_JOB_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          fi
