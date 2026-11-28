@@ -1109,14 +1109,14 @@ jobs:
           export PATH="$PWD/${DEADZONE_TOOLCHAIN_DIR:-bin/Linux/x86_64}:$PATH"
           log_path="$PWD/build_action.log"
           : > "$log_path"
-          sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" stdbuf -oL -eL bash build.sh \
+          sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" "DEADZONE_DEVICE_REGISTRY=$DEADZONE_DEVICE_REGISTRY" stdbuf -oL -eL bash build.sh \
             "$DEADZONE_INPUT_URL" "$DEADZONE_SOURCE_REPOSITORY" "stable" \
             "$DEADZONE_BUILDER_NAME" "$DEADZONE_BUILDER_ID" \
             > "$log_path" 2>&1 &
           build_pid=$!
           tail -n +1 -F --pid="$build_pid" "$log_path" | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM preparation" || true
-          wait "$build_pid"
-          build_status=$?
+          build_status=0
+          wait "$build_pid" || build_status=$?
           printf 'DEADZONE_BUILD_STATUS=%s\n' "$build_status" >> "$GITHUB_ENV"
           exit "$build_status"
 
@@ -1157,17 +1157,25 @@ jobs:
           # `lpmake: command not found` after the 20-minute
           # partition repack.
           export PATH="$PWD/${DEADZONE_TOOLCHAIN_DIR:-bin/Linux/x86_64}:$PATH"
+          # Never construct a super image using guessed hardware capacity.
+          profile_codename="$(tr -d '\r\n' < bin/ddevice/device_f.txt)"
+          profile_version="$(tr -d '\r\n' < bin/ddevice/base_rom_code.txt)"
+          if ! python3 bin/packaging/deadzone_device_profile.py --root "$PWD" \
+              --codename "$profile_codename" --rom-version "$profile_version" >/tmp/stable-profile.json; then
+            echo "::error::Missing or invalid verified device profile for $profile_codename / $profile_version. Run SuperInspector before rebuilding."
+            exit 2
+          fi
           # `tail --pid` mirrors the durable log to stdout and
           # exits as soon as the engine exits. `tee` is avoided
           # because it dies on SIGPIPE when the engine exits
           # early, which truncates `build_action.log` and hides
           # the real exit status.
           log_path="$PWD/build_action.log"
-          sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" stdbuf -oL -eL bash packROM.sh > "$log_path" 2>&1 &
+          sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" "DEADZONE_DEVICE_REGISTRY=$DEADZONE_DEVICE_REGISTRY" stdbuf -oL -eL bash packROM.sh > "$log_path" 2>&1 &
           pack_pid=$!
           tail -n +1 -F --pid="$pack_pid" "$log_path" | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "Partition & super rebuild" || true
-          wait "$pack_pid"
-          pack_status=$?
+          pack_status=0
+          wait "$pack_pid" || pack_status=$?
           if (( pack_status != 0 )); then
             echo "::error::packROM.sh failed with status ${pack_status}." >&2
             exit "$pack_status"
@@ -1253,7 +1261,7 @@ jobs:
           fi
           log_path="$PWD/build_action.log"
           set +e
-          sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" stdbuf -oL -eL bash uploadROM.sh > "$log_path" 2>&1 &
+          sudo env "PATH=$PATH" "DEADZONE_CONTROLLED_BUILD=1" "DEADZONE_DEVICE_REGISTRY=$DEADZONE_DEVICE_REGISTRY" stdbuf -oL -eL bash uploadROM.sh > "$log_path" 2>&1 &
           upload_pid=$!
           tail -n +1 -F --pid="$upload_pid" "$log_path" | python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_build_display.py" stream "ROM packaging" || true
           wait "$upload_pid"

@@ -130,7 +130,7 @@ def summary():
 
 # Preserve actionable diagnostics while keeping routine tool chatter compact.
 ERROR_LINE = re.compile(
-    r"\[(?:ERROR|FATAL)\]|\b(?:ERROR|FATAL|[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\s*:"
+    r"\[(?:ERROR|FATAL|BLOCKER)\]|\b(?:ERROR|FATAL|FAILED|BLOCKER|[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\s*:"
     r"|^fatal\s*:|^Traceback \(most recent call last\):|(?:^|\s)error(?:\s+[^:\s]+)?\s*:"
     r"|No space left on device|Permission denied|command not found|undefined reference"
     r"|(?:failed|failure)\s+(?:to|at|with)\b|^##\[error\]", re.I)

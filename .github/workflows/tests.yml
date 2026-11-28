@@ -49,6 +49,8 @@ jobs:
           assert mod.duration("2026-11-28T00:00:00Z", "2026-11-28T00:01:30Z") == "01m 30s"
           result = subprocess.run(["python3", str(p), "stream", "Test"], input="[INFO] Removing directory: /private/path\n[Payload] Complete | 41 partitions extracted\n", text=True, capture_output=True, check=True)
           assert "41 partitions extracted" in result.stdout and "/private/path" not in result.stdout
+          assert mod.error_detail("[BLOCKER] Missing verified flourite/OS4 flash.json")
+          assert mod.error_detail("[DeadZone Settings] FAILED: APK rebuild failed")
           for name in ("stable", "lite", "ninja", "xiaomi-port", "fastboot"):
               workflow = yaml.safe_load(pathlib.Path(f".github/workflows/deadzone-{name}.yml").read_text())
               for job in workflow["jobs"].values():
