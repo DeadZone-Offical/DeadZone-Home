@@ -1,0 +1,58 @@
+name: Replay verified Stable release 46139846417
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/replay-stable-release-46139846417.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: replay-stable-release-46139846417
+  cancel-in-progress: false
+jobs:
+  replay:
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'Replay verified zircon Stable announcement by MEZO'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm original successful build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/DeadZone-Offical/DeadZone-Home/actions/runs/46139846417 --jq '.conclusion' | grep -qx success
+      - name: Checkout central signed event reporter
+        uses: actions/checkout@v5
+        with:
+          repository: DeadZone-Offical/DeadZone-File
+          ref: main
+          token: ${{ secrets.DEADZONE_PRIVATE_READ_TOKEN }}
+          path: runtime
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /build.env
+            /report_build_event.py
+      - name: Replay the original verified release without rebuilding
+        env:
+          DEADZONE_REQUEST_ID: stable_2b014acae4b546d1
+          DEADZONE_RUN_ID_OVERRIDE: '46139846417'
+          DEADZONE_RUN_URL_OVERRIDE: https://github.com/DeadZone-Offical/DeadZone-Home/actions/runs/46139846417
+          DEADZONE_CALLBACK_URL: https://deadzone-bot.mezom8446.workers.dev/build/events
+          DEADZONE_RESULT_NAME: DeadZone_Stable_V2.08_ZIRCON_OS3.0.301.0.WNOMIXM_GlobalStable-A16.zip
+          DEADZONE_FILE_SIZE: '5672924665'
+          DEADZONE_INTEGRITY_SHA256: 1cd79e8d5793973db1432c0354bf0a9b0ff210803f51c4a3c7f0d69965fadfb1
+          DEADZONE_UPLOAD_VERIFIED: '1'
+          DEADZONE_RELEASE_CODENAME: zircon
+          DEADZONE_RELEASE_OS: OS3
+          DEADZONE_RELEASE_DEVICE_NAME: Redmi Note 13 Pro+
+          DEADZONE_RELEASE_ROM_VERSION: OS3.0.301.0.WNOMIXM
+          DEADZONE_GOOGLE_DRIVE_URL: https://drive.google.com/open?id=17ct1iDSZAU5BY1XEWF9EbR5NBIefLex_
+        run: |
+          set -euo pipefail
+          source runtime/build.env
+          export DEADZONE_EVENT_SECRET="${BUILD_PROGRESS_SECRET:?Central build signing secret unavailable}"
+          printf '::add-mask::%s\n' "$DEADZONE_EVENT_SECRET"
+          export GITHUB_RUN_NUMBER=247
+          python3 runtime/report_build_event.py succeeded --project stable --message "DeadZone Stable build complete. Verified release announcement replay."
