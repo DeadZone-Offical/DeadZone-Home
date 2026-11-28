@@ -248,6 +248,10 @@ def stream(stage):
             msg = "Applying partition modifications"
         elif re.search(r"MODS: .*Space: installing partition apps and permissions",line):
             msg = "Installing project apps and permissions"
+        elif (m := re.search(r"(Device profile \| (?:Exact OS[1-4]|Fallback OS[1-4] -> OS[1-4])(?: \| OTA layout checked)?)$", line)):
+            msg = m[1]
+        elif (m := re.search(r"(Fallback Super \| rebuilt \d+ bytes / \d+ bytes)$", line)):
+            msg = m[1]
         elif "Update File Done" in line:
             active_patch = ""
             msg = "Partition modifications completed"
