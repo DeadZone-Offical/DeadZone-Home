@@ -29,7 +29,9 @@ class LiveReporter:
         self.snapshot = None
         self.meta = {}
         self.pending_meta = {}
-        self.artifact = 0
+        self.static_metrics = {}
+        raw_artifact = self.env.get("DEADZONE_UPLOAD_BYTES", "")
+        self.artifact = int(raw_artifact) if raw_artifact.isdigit() else 0
         self.worker = None
         root = self.env.get("GITHUB_WORKSPACE")
         if not root or not self.project or not self.request or not self.env.get("DEADZONE_CALLBACK_URL"):
@@ -58,6 +60,10 @@ class LiveReporter:
         if not self.worker:
             return
         with self.condition:
+            for key in ("deadzoneVersion","filesystem"):
+                if key in metrics:
+                    self.static_metrics[key]=metrics[key]
+            metrics={**self.static_metrics,**metrics}
             if self.artifact:
                 metrics.setdefault("artifactSize",self.artifact)
             self.snapshot = (stage,kind,title,dict(metrics),dict(self.meta),self.artifact)
@@ -104,12 +110,12 @@ class LiveReporter:
             if self.closed:
                 return
 
-    def close(self):
+    def close(self, timeout=2):
         if self.worker:
             with self.condition:
                 self.closed=True
                 self.condition.notify_all()
-            self.worker.join(timeout=2)
+            self.worker.join(timeout=timeout)
 
     def line(self, line):
         # Only parse known fields and numerical progress, never forward raw log lines.
@@ -171,3 +177,9 @@ class LiveReporter:
             total=size_bytes(t,tu)
             if total:
                 self.update("uploading","uploading","Uploading to Google Drive",processedBytes=min(size_bytes(d,du),total),totalBytes=total)
+
+
+if __name__ == "__main__" and len(sys.argv) == 5 and sys.argv[1] == "checkpoint":
+    reporter = LiveReporter("Preparing build")
+    reporter.update(sys.argv[2], sys.argv[3], sys.argv[4])
+    reporter.close(timeout=4)
