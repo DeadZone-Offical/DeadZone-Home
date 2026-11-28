@@ -210,15 +210,30 @@ jobs:
                   link = old_links.get(cache_key)
                   if not isinstance(link, str) or not safe_link(link):
                       destination = f"{REMOTE}/{candidate['path']}"
-                      result = subprocess.run(
-                          ["rclone", "--config", str(config_path), "link", destination],
-                          check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                          text=True, timeout=45,
-                      )
-                      link = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
-                  if not safe_link(link):
-                      raise ValueError("Drive returned a URL that is not a supported public download link")
+                      link = ""
+                      # A transient sharing/API error for one ZIP must not
+                      # prevent every other verified ROM from being indexed.
+                      for attempt in range(2):
+                          try:
+                              result = subprocess.run(
+                                  ["rclone", "--config", str(config_path),
+                                   "--contimeout", "15s", "--timeout", "40s",
+                                   "--retries", "2", "--low-level-retries", "2",
+                                   "link", destination],
+                                  check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, timeout=90,
+                              )
+                              link = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+                              if safe_link(link):
+                                  break
+                          except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                              print(f"::warning::Drive link retry {attempt + 1}/2 for {candidate['codename']} ({candidate['id']})")
+                      if not safe_link(link):
+                          print(f"::warning::Skipping unavailable public link for {candidate['codename']} ({candidate['id']}); next sync will retry")
+                          continue
                   artifacts.append({**candidate, "url": link})
+              if candidates and not artifacts:
+                  raise ValueError("No public links could be verified; refusing to publish an empty catalog")
               artifacts.sort(key=lambda a: (a["modifiedAt"], a["name"]), reverse=True)
               now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
               timestamp = old.get("generatedAt") if old.get("artifacts") == artifacts else now
