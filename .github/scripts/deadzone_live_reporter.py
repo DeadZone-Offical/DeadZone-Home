@@ -27,6 +27,7 @@ class LiveReporter:
         self.condition = threading.Condition()
         self.closed = False
         self.snapshot = None
+        self.last_update = time.monotonic()
         self.meta = {}
         self.pending_meta = {}
         self.static_metrics = {}
@@ -47,6 +48,8 @@ class LiveReporter:
             return
         self.worker = threading.Thread(target=self.send_loop,daemon=True)
         self.worker.start()
+        if phase is None:
+            return
         stage, kind, title = {
             "ROM preparation":("starting","preparing","Preparing ROM"),
             "Partition & super rebuild":("building","repacking","Rebuilding partitions"),
@@ -67,6 +70,7 @@ class LiveReporter:
             if self.artifact:
                 metrics.setdefault("artifactSize",self.artifact)
             self.snapshot = (stage,kind,title,dict(metrics),dict(self.meta),self.artifact)
+            self.last_update=time.monotonic()
             self.condition.notify_all()
 
     def send_loop(self):
@@ -87,6 +91,10 @@ class LiveReporter:
                 if self.closed and snap == previous:
                     return
             stage,kind,title,metrics,meta,artifact = snap
+            metrics=dict(metrics)
+            if time.monotonic()-self.last_update>30:
+                metrics.pop('bytesPerSecond',None)
+                metrics.pop('etaSeconds',None)
             try:
                 payload = self.make(stage,project=self.project,request_id=self.request,
                                     run_id=self.env.get("GITHUB_RUN_ID",""),env=self.env)
@@ -179,7 +187,10 @@ class LiveReporter:
                 self.update("uploading","uploading","Uploading to Google Drive",processedBytes=min(size_bytes(d,du),total),totalBytes=total)
 
 
-if __name__ == "__main__" and len(sys.argv) == 5 and sys.argv[1] == "checkpoint":
-    reporter = LiveReporter("Preparing build")
-    reporter.update(sys.argv[2], sys.argv[3], sys.argv[4])
+if __name__ == "__main__" and len(sys.argv) in (5,7) and sys.argv[1] == "checkpoint":
+    reporter = LiveReporter(None)
+    metrics = {}
+    if len(sys.argv)==7 and all(v.isdigit() for v in sys.argv[5:]):
+        metrics={"processedBytes":int(sys.argv[5]),"bytesPerSecond":int(sys.argv[6])}
+    reporter.update(sys.argv[2], sys.argv[3], sys.argv[4], **metrics)
     reporter.close(timeout=4)

@@ -212,6 +212,7 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_live_reporter.py" checkpoint starting preparing "Preparing build environment" || true
           python3 "$GITHUB_WORKSPACE/runtime/build_stage.py" starting \
             --project port_xiaomi \
             --request-id "$DEADZONE_REQUEST_ID" \

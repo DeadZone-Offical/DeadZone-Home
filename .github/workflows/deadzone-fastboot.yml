@@ -243,6 +243,8 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $liveReporter = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/deadzone_live_reporter.py'
+          if (Get-Command python -ErrorAction SilentlyContinue) { & python $liveReporter checkpoint downloading downloading 'Downloading ROM' }
           $url = "$env:ROM_URL"
           if ([string]::IsNullOrWhiteSpace($url)) {
             throw "ROM_URL is empty"
@@ -334,6 +336,10 @@ jobs:
                 $mib = $currentBytes / 1MB
                 $mibPerSec = [Math]::Max(0, $currentBytes - $lastBytes) / $seconds / 1MB
                 Write-Host ("ROM transfer {0}/{1}: {2:N1} MiB saved, {3:N2} MiB/s over the last {4:N0}s" -f $attempt, $maxAttempts, $mib, $mibPerSec, $seconds)
+                if (Get-Command python -ErrorAction SilentlyContinue) {
+                  $speedBytes = [long]([Math]::Max(0, $currentBytes - $lastBytes) / $seconds)
+                  & python $liveReporter checkpoint downloading downloading "Downloading ROM" "$currentBytes" "$speedBytes"
+                }
                 $lastBytes = $currentBytes
                 $lastSample = $now
               }
@@ -632,6 +638,7 @@ jobs:
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
           set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_live_reporter.py" checkpoint reading_rom inspecting "Reading device information" || true
           # Analysis is local/read-only. DeadZone-Devices publication is separately queued.
           mkdir -p fastboot-profile
           echo "::group::ROM analysis"
@@ -800,6 +807,7 @@ jobs:
           DEADZONE_CALLBACK_URL: ${{ inputs.callback_url }}
           DEADZONE_EVENT_SECRET: ${{ env.DEADZONE_EVENT_SECRET }}
         run: |
+          if (Get-Command python -ErrorAction SilentlyContinue) { & python (Join-Path $env:GITHUB_WORKSPACE ".github/scripts/deadzone_live_reporter.py") checkpoint packaging packaging "Packaging Inspector" }
           $artifact = "super-inspector/dist/DeadZoneFastbootInspector-Windows.zip"
           $distRoot = "super-inspector/dist"
           if (-not (Test-Path $distRoot)) {
@@ -880,6 +888,7 @@ jobs:
           INSPECTOR_TOKEN_LEGACY: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_live_reporter.py" checkpoint uploading verifying "Confirming device profile publication" || true
           if [[ "$QUEUE_STATUS" != queued ]]; then
             echo "::error::Fastboot Inspector was packaged, but DeadZone-Devices publication was not dispatched (status: ${QUEUE_STATUS:-unknown})."
             echo "### DeadZone-Devices profile NOT published" >> "$GITHUB_STEP_SUMMARY"

@@ -843,6 +843,7 @@ jobs:
           # validated, before any heavy work. The live panel renders
           # the "Runner allocated, fetching engine sources" line so
           # the user sees the build start cleanly.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/deadzone_live_reporter.py" checkpoint starting preparing "Preparing build environment" || true
           python3 runtime/build_stage.py starting \
             --project stable \
             --request-id "$DEADZONE_REQUEST_ID" \
