@@ -1358,62 +1358,89 @@ jobs:
           # path across retries; never restart the ROM build or publish a failure.
           rclone_flags=(--config="$PWD/rclone.conf" --retries 1 --low-level-retries 3
                         --tpslimit 2 --tpslimit-burst 1 --contimeout 30s --timeout 2m)
-          # After an ambiguous failure, check whether Drive already committed
-          # this exact ZIP before starting another full transfer.
+          # Verify the exact remote file, not merely successful transfer bytes.
+          # Older rclone/Drive path lookups may temporarily miss a new object.
           remote_matches() {
-            python3 "$watchdog" verify "$1" "$local_size" "$local_md5"
+            python3 "$watchdog" verify "$1" "$local_size" "$local_md5" "$final_name"
           }
+          # Directory listing is an independent fallback for --stat lookup.
+          # The verifier requires one exact filename, size and MD5.
           probe_uploaded() {
-            python3 "$watchdog" metadata /tmp/rclone-probe.json /tmp/rclone-probe.log -- \
-              rclone "${rclone_flags[@]}" lsjson --stat --hash "$drive_remote" &&
-              remote_matches /tmp/rclone-probe.json
+            local output="$1"
+            if python3 "$watchdog" metadata "$output" /tmp/rclone-probe.log -- \
+                rclone "${rclone_flags[@]}" lsjson --stat --hash "$drive_remote" &&
+                remote_matches "$output"; then
+              return 0
+            fi
+            if python3 "$watchdog" metadata "$output" /tmp/rclone-list.log -- \
+                rclone "${rclone_flags[@]}" lsjson --files-only --hash \
+                --include "/$final_name" "${drive_remote%/*}"; then
+              remote_matches "$output"
+              return $?
+            fi
+            return 1
           }
-          drive_retry() {
-            local output="$1" errors="$2" mode="$3" attempt=1 delay=60 wait_seconds rc
-            shift 3
-            while true; do
-              echo "Google Drive ${mode}: attempt ${attempt}/4"
-              if python3 "$watchdog" \
-                  "$mode" "$output" "$errors" -- rclone "${rclone_flags[@]}" "$@"; then
+          verify_uploaded() {
+            local attempt pause
+            # Bounded metadata-only polling: do not resend gigabytes after a
+            # successful copy or a lost response while Drive indexes the object.
+            for attempt in 1 2 3 4; do
+              echo "[Drive] Verifying file integrity | check ${attempt}/4"
+              if probe_uploaded /tmp/rclone-verify.json; then
                 return 0
+              fi
+              if (( attempt < 4 )); then
+                pause=$((15 * 2 ** (attempt - 1)))
+                echo "[Drive] File not yet verified | checking again in ${pause}s"
+                sleep "$pause"
+              fi
+            done
+            return 1
+          }
+          retryable_upload() {
+            local rc="$1" errors="$2"
+            if grep -Eiq '(storageQuotaExceeded|dailyLimitExceeded|uploadLimitExceeded|invalid_grant|insufficientFilePermissions)' "$errors"; then
+              return 1
+            fi
+            [[ "$rc" == 124 ]] || grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 50[0234]|googleapi: Error 50[0234]|backendError|i/o timeout|context deadline exceeded|TLS handshake timeout|connection reset by peer|connection timed out|unexpected EOF)' "$errors"
+          }
+          upload_verified=0
+          if probe_uploaded /tmp/rclone-verify.json; then
+            echo "[Drive] Identical file already verified | upload skipped"
+            upload_verified=1
+          else
+            for attempt in 1 2 3; do
+              echo "[Drive] Uploading ROM | attempt ${attempt}/3"
+              if python3 "$watchdog" upload /tmp/rclone-upload.stdout /tmp/rclone-upload.log -- \
+                  rclone "${rclone_flags[@]}" copyto --checksum --drive-chunk-size 64M --low-level-retries 2 \
+                  --transfers 1 --checkers 1 --stats 30s --stats-log-level NOTICE --use-json-log \
+                  "$final_zip" "$drive_remote"; then
+                echo "[Drive] Transfer complete | awaiting confirmation"
+                if verify_uploaded; then upload_verified=1; fi
+                # Never retransmit after a successful copy merely because
+                # the independent metadata check has not caught up.
+                break
               else
                 rc=$?
               fi
-              if [[ "$mode" == upload ]] && probe_uploaded; then
-                echo "Google Drive: existing upload verified by size and MD5; no retransmission needed."
-                return 0
+              if verify_uploaded; then
+                echo "[Drive] Recovered completed upload | checksum matched"
+                upload_verified=1
+                break
               fi
-              if [[ "$rc" != 124 ]] && ! grep -Eiq '(HTTP response code 429|HTTP[^[:alnum:]]+429|googleapi: Error 429|too many requests|rateLimitExceeded|userRateLimitExceeded|HTTP response code 50[0234]|googleapi: Error 50[0234]|backendError|i/o timeout|context deadline exceeded|TLS handshake timeout|connection reset by peer|connection timed out)' "$errors"; then
-                return 1
+              if (( attempt == 3 )) || ! retryable_upload "$rc" /tmp/rclone-upload.log; then
+                break
               fi
-              if (( attempt >= 4 )); then
-                echo "::error::Google Drive did not respond successfully after four attempts." >&2
-                return 1
-              fi
-              wait_seconds=$((delay + RANDOM % 16))
-              echo "::warning::Google Drive temporarily unavailable or transfer stalled. Retrying in ${wait_seconds}s."
+              wait_seconds=$((60 * 2 ** (attempt - 1) + RANDOM % 16))
+              echo "::warning::[Drive] Temporary transfer error | retry in ${wait_seconds}s"
               sleep "$wait_seconds"
-              attempt=$((attempt + 1))
-              delay=$((delay * 2))
             done
-          }
-          if ! drive_retry /tmp/rclone-upload.stdout /tmp/rclone-upload.log upload \
-              copyto --checksum --drive-chunk-size 64M --low-level-retries 2 --transfers 1 --checkers 1 --stats 30s --stats-log-level NOTICE --use-json-log \
-              "$final_zip" "$drive_remote"; then
-            echo "::error::Google Drive upload failed; the ROM build itself completed." >&2
+          fi
+          if (( upload_verified != 1 )); then
+            echo "::error::[Drive] ROM built successfully, but remote file integrity could not be confirmed." >&2
             exit 1
           fi
-          # Apply the same bounded retry to the remote metadata request.
-          if ! drive_retry /tmp/rclone-verify.json /tmp/rclone-verify.log metadata lsjson --stat --hash "$drive_remote"; then
-            echo "::error::Unable to confirm the uploaded Google Drive object." >&2
-            exit 1
-          fi
-          # Google Drive provides MD5. Do not publish an unverified or
-          # same-sized-but-different ZIP, including after ambiguous failures.
-          if ! remote_matches /tmp/rclone-verify.json; then
-            echo "::error::Uploaded object failed size/MD5 verification." >&2
-            exit 1
-          fi
+          echo "[Drive] Verified | exact filename, size and MD5 matched"
           _verified_by="md5"
           # Publish the verification result so the success notification
           # and the build summary can render the public Drive link.

@@ -20,15 +20,31 @@ def number(value, default=0):
 
 
 def display(stats):
-    done = number(stats.get("bytes"))
-    total = number(stats.get("totalBytes"))
-    speed = number(stats.get("speed"))
-    eta = number(stats.get("eta"), None)
-    percent = f"{min(100, 100 * done / total):.1f}%" if total else "--"
+    aggregate = number(stats.get("bytes"))
+    active = stats.get("transferring")
+    transfer = active[0] if isinstance(active, list) and len(active) == 1 and isinstance(active[0], dict) else None
+    if transfer and number(transfer.get("size")):
+        done = number(transfer.get("bytes"))
+        total = number(transfer.get("size"))
+        speed = number(transfer.get("speedAvg"), number(transfer.get("speed")))
+        eta = number(transfer.get("eta"), None)
+        label = "Upload"
+    else:
+        done = aggregate
+        total = number(stats.get("totalBytes"))
+        speed = number(stats.get("speed"))
+        eta = number(stats.get("eta"), None)
+        label = "Transfer"
+    ratio = min(1, done / total) if total else 0
+    filled = int(ratio * 20)
+    bar = "=" * filled + "-" * (20 - filled)
+    percent = f"{100 * ratio:5.1f}%" if total else "   -- "
     eta_text = f"{int(eta)}s" if eta is not None else "--"
-    print(f"Upload: {percent} | {done / 1048576:.1f}/{total / 1048576:.1f} MiB"
-          f" | {speed / 1048576:.2f} MiB/s | ETA {eta_text}", flush=True)
-    return done
+    status = " | verifying next" if total and done >= total else f" | ETA {eta_text}"
+    print(f"[Drive] {label} [{bar}] {percent} | {done / 1073741824:.2f}/{total / 1073741824:.2f} GiB"
+          f" | {speed / 1048576:.1f} MiB/s{status}", flush=True)
+    return aggregate
+
 
 
 def stop(process):
@@ -41,7 +57,7 @@ def stop(process):
             process.wait()
 
 
-def verify(path, size, md5):
+def verify(path, size, md5, filename=None):
     """Accept a single remote object only when its size and MD5 match."""
     try:
         with open(path, encoding="utf-8") as stream:
@@ -51,6 +67,8 @@ def verify(path, size, md5):
                 return 1
             item = item[0]
         if not isinstance(item, dict) or item.get("IsDir"):
+            return 1
+        if filename is not None and item.get("Name") != filename:
             return 1
         hashes = item.get("Hashes") or {}
         remote_md5 = hashes.get("MD5") or hashes.get("md5") or ""
@@ -126,7 +144,7 @@ def run(mode, output, errors, command):
                         return 124
                     if now - last_report >= HEARTBEAT_SECONDS:
                         elapsed = int(now - (start if mode == "metadata" else last_progress))
-                        print(f"Google Drive {mode}: waiting for response/progress ({elapsed}s)", flush=True)
+                        print(f"[Drive] {'Waiting for file confirmation' if mode == 'metadata' else 'Waiting for transfer progress'} | {elapsed}s", flush=True)
                         last_report = now
                     time.sleep(1)
         finally:
@@ -134,8 +152,9 @@ def run(mode, output, errors, command):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5 and sys.argv[1] == "verify":
-        sys.exit(verify(sys.argv[2], sys.argv[3], sys.argv[4]))
+    if len(sys.argv) in (5, 6) and sys.argv[1] == "verify":
+        sys.exit(verify(sys.argv[2], sys.argv[3], sys.argv[4],
+                        sys.argv[5] if len(sys.argv) == 6 else None))
     if len(sys.argv) < 6 or sys.argv[1] not in ("upload", "metadata") or sys.argv[4] != "--":
         sys.exit("Invalid upload watchdog arguments")
     os.umask(0o077)
