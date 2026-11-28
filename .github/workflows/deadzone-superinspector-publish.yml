@@ -64,6 +64,14 @@ jobs:
             echo "::error::Set DEADZONE_DEVICES_TOKEN in DeadZone-Home (Contents: write on DeadZone-Devices)."
             exit 2
           fi
+          registry_token="${DEVICES_TOKEN:-$READ_TOKEN}"
+          status="$(curl --silent --show-error --max-time 20 --output /dev/null --write-out '%{http_code}' \
+            -H "Authorization: Bearer $registry_token" -H 'Accept: application/vnd.github+json' \
+            'https://api.github.com/repos/DeadZone-Offical/DeadZone-Devices/git/trees/main')" || status=000
+          if [[ "$status" != 200 ]]; then
+            echo "::error::DeadZone-Devices credential rejected (HTTP $status). Set DEADZONE_DEVICES_TOKEN in DeadZone-Home with access to DeadZone-Devices and Contents: read/write."
+            exit 2
+          fi
 
       - name: Checkout private SuperInspector tools (read-only)
         uses: actions/checkout@v4
